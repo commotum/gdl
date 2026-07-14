@@ -5,4 +5,9 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 profile="$repo_dir/state/firefox-x-profile"
 
 mkdir -p "$profile"
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    exec open -n -a Firefox --args --no-remote --profile "$profile" "https://x.com/login"
+fi
+
 exec firefox --no-remote --profile "$profile" "https://x.com/login"

@@ -10,14 +10,12 @@ if [[ "${VIRTUAL_ENV:-}" != "" && "${VIRTUAL_ENV:-}" != "$repo_dir/.venv" ]]; th
 fi
 
 unlock_keyring=0
-if [[ "${1:-}" == "--unlock-keyring" ]]; then
-    unlock_keyring=1
-    shift
-fi
 export GDL_UNLOCK_KEYRING="$unlock_keyring"
 
-exec uv run python - <<'PY'
+exec uv run python - "$@" <<'PY'
+import argparse
 import os
+import platform
 import sqlite3
 import stat
 import sys
@@ -36,7 +34,23 @@ from gallery_dl.cookies import load_cookies
 repo = Path.cwd()
 output = repo / "state" / "cookies" / "x.cookies.txt"
 output.parent.mkdir(parents=True, exist_ok=True)
-unlock_keyring = os.environ.get("GDL_UNLOCK_KEYRING") == "1"
+
+parser = argparse.ArgumentParser(
+    description="Export X cookies from Chrome or the repo's Firefox profile",
+)
+parser.add_argument(
+    "--browser",
+    choices=("firefox", "chrome"),
+    default="firefox",
+    help="source browser (default: firefox)",
+)
+parser.add_argument(
+    "--unlock-keyring",
+    action="store_true",
+    help="prompt to unlock GNOME Keyring before reading Chrome on Linux",
+)
+args = parser.parse_args()
+unlock_keyring = args.unlock_keyring
 
 wanted = {
     "auth_token",
@@ -51,6 +65,9 @@ wanted = {
 
 
 def maybe_unlock_gnome_keyring():
+    if platform.system() != "Linux":
+        return
+
     if unlock_keyring:
         password = getpass.getpass("GNOME keyring password: ")
         try:
@@ -89,21 +106,28 @@ def maybe_unlock_gnome_keyring():
 
 
 def raw_chrome_has_auth_token():
-    db = Path.home() / ".config" / "google-chrome" / "Default" / "Cookies"
-    if not db.exists():
-        return None
-    try:
-        con = sqlite3.connect("file:" + str(db) + "?mode=ro", uri=True)
+    if platform.system() == "Darwin":
+        root = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    else:
+        root = Path.home() / ".config" / "google-chrome"
+
+    found_database = False
+    for db in root.rglob("Cookies") if root.exists() else ():
         try:
-            row = con.execute(
-                "select count(*) from cookies "
-                "where host_key in ('.x.com', 'x.com') and name = 'auth_token'"
-            ).fetchone()
-            return bool(row and row[0])
-        finally:
-            con.close()
-    except Exception:
-        return None
+            con = sqlite3.connect("file:" + str(db) + "?mode=ro&immutable=1", uri=True)
+            try:
+                found_database = True
+                row = con.execute(
+                    "select count(*) from cookies "
+                    "where host_key in ('.x.com', 'x.com') and name = 'auth_token'"
+                ).fetchone()
+                if row and row[0]:
+                    return True
+            finally:
+                con.close()
+        except Exception:
+            continue
+    return False if found_database else None
 
 
 def load_spec(spec):
@@ -139,14 +163,20 @@ def netscape_line(cookie):
 
 maybe_unlock_gnome_keyring()
 
-specs = [
-    ("chrome", None, "gnomekeyring", None, ".x.com"),
-    ("chrome", None, "kwallet", None, ".x.com"),
-    ("chrome", None, None, None, ".x.com"),
-    ("chrome", None, "gnomekeyring", None, ".twitter.com"),
-    ("chrome", None, "kwallet", None, ".twitter.com"),
-    ("chrome", None, None, None, ".twitter.com"),
-]
+if args.browser == "firefox":
+    profile = str(repo / "state" / "firefox-x-profile")
+    specs = [
+        ("firefox", profile, None, None, ".x.com"),
+        ("firefox", profile, None, None, ".twitter.com"),
+    ]
+else:
+    keyrings = ("gnomekeyring", "kwallet", None) \
+        if platform.system() == "Linux" else (None,)
+    specs = [
+        ("chrome", None, keyring, None, domain)
+        for domain in (".x.com", ".twitter.com")
+        for keyring in keyrings
+    ]
 
 cookies_by_key = {}
 for spec in specs:
@@ -160,13 +190,16 @@ for spec in specs:
 names = sorted({cookie.name for cookie in cookies_by_key.values()})
 if "auth_token" not in names:
     print("")
-    print("Could not export a usable X auth_token from Chrome.")
-    raw_has_auth = raw_chrome_has_auth_token()
-    if raw_has_auth:
-        print("Chrome's raw cookie DB does contain auth_token, but it is still encrypted.")
-        print("Unlock the desktop keyring and rerun: scripts/save-x-cookies")
+    print(f"Could not export a usable X auth_token from {args.browser.title()}.")
+    if args.browser == "chrome":
+        raw_has_auth = raw_chrome_has_auth_token()
+        if raw_has_auth:
+            print("Chrome's raw cookie DB contains auth_token, but it could not be decrypted.")
+            print("Unlock the desktop keyring and rerun with --browser chrome.")
+        else:
+            print("Log into x.com in Chrome and rerun with --browser chrome.")
     else:
-        print("Chrome's raw cookie DB does not show auth_token; log into x.com in Chrome and rerun.")
+        print("Run scripts/open-x-firefox-login, log into X, close Firefox, and rerun.")
     sys.exit(1)
 
 lines = [
