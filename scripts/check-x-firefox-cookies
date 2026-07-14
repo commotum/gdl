@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_dir"
+
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
+
+if [[ "${VIRTUAL_ENV:-}" != "" && "${VIRTUAL_ENV:-}" != "$repo_dir/.venv" ]]; then
+    unset VIRTUAL_ENV
+fi
+
+exec uv run python - <<'PY'
+from pathlib import Path
+from gallery_dl.cookies import load_cookies
+
+profile = str(Path.cwd() / "state" / "firefox-x-profile")
+cookies = list(load_cookies(("firefox", profile, None, None, ".x.com")))
+names = sorted({cookie.name for cookie in cookies if cookie.value})
+
+print(f"{len(cookies)} cookies; names={names}")
+print(f"auth_token={'auth_token' in names} ct0={'ct0' in names}")
+raise SystemExit(0 if "auth_token" in names else 1)
+PY

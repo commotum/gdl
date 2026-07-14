@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+profile="$repo_dir/state/firefox-x-profile"
+
+mkdir -p "$profile"
+exec firefox --no-remote --profile "$profile" "https://x.com/login"

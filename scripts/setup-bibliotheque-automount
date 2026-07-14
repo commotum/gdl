@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+uuid="9fd7e521-ce10-4a77-bfe0-3566f7c69725"
+mountpoint="/mnt/Bibliotheque"
+fstab_entry="UUID=$uuid $mountpoint ext4 defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=10min 0 2"
+
+if [[ "${EUID}" -ne 0 ]]; then
+    exec sudo "$0" "$@"
+fi
+
+device="$(blkid -U "$uuid" || true)"
+if [[ -z "$device" ]]; then
+    printf 'Could not find Bibliotheque disk UUID %s.\n' "$uuid" >&2
+    exit 1
+fi
+
+install -d -m 755 "$mountpoint"
+
+tmp_fstab="$(mktemp)"
+cp /etc/fstab "$tmp_fstab"
+
+if ! grep -Eq "(^|[[:space:]])(UUID=$uuid|$mountpoint)([[:space:]]|$)" "$tmp_fstab"; then
+    {
+        printf '\n'
+        printf '# Bibliotheque media disk. Mounted on demand when %s is accessed.\n' "$mountpoint"
+        printf '%s\n' "$fstab_entry"
+    } >> "$tmp_fstab"
+fi
+
+findmnt --verify --tab-file "$tmp_fstab"
+
+backup="/etc/fstab.bak.$(date +%Y%m%d-%H%M%S)"
+cp /etc/fstab "$backup"
+install -m 644 "$tmp_fstab" /etc/fstab
+rm -f "$tmp_fstab"
+
+while IFS= read -r target; do
+    if [[ "$target" != "$mountpoint" ]]; then
+        printf 'Unmounting existing Bibliotheque mount at %s\n' "$target"
+        umount "$target"
+    fi
+done < <(findmnt -rn --source "$device" -o TARGET | sort -u)
+
+systemctl daemon-reload
+unit="$(systemd-escape -p --suffix=automount "$mountpoint")"
+systemctl restart "$unit"
+
+# Trigger the automount and show the resulting mount.
+ls "$mountpoint" >/dev/null
+findmnt "$mountpoint"
+printf 'Bibliotheque automount is configured. fstab backup: %s\n' "$backup"

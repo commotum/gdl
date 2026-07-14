@@ -1,7 +1,17 @@
 [project]
 name = "gdl"
 version = "0.1.0"
-description = "Add your description here"
+description = "Personal gallery-dl operations repo"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "curl-cffi>=0.14.0",
+    "ffmpeg>=1.4",
+    "gallery-dl>=1.32.4",
+    "instaloader>=4.15",
+    "pycryptodomex>=3.23.0",
+    "requests>=2.32.5",
+    "secretstorage>=3.5.0",
+    "youtube-dl>=2021.12.17",
+    "yt-dlp>=2026.2.4",
+]

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_dir"
+
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
+
+if [[ "${VIRTUAL_ENV:-}" != "" && "${VIRTUAL_ENV:-}" != "$repo_dir/.venv" ]]; then
+    unset VIRTUAL_ENV
+fi
+
+download_mount=""
+download_root=""
+
+for candidate in /mnt/Bibliotheque /tmp/Bibliotheque; do
+    candidate_root="$candidate/gdl/gallery-dl"
+    if [[ -d "$candidate_root" ]] && findmnt -rn --target "$candidate" >/dev/null; then
+        download_mount="$candidate"
+        download_root="$candidate_root"
+        break
+    fi
+done
+
+if [[ -z "$download_root" ]]; then
+    printf 'Bibliotheque is not mounted at /mnt/Bibliotheque or /tmp/Bibliotheque.\n' >&2
+    printf 'Run scripts/setup-bibliotheque-automount or mount it manually before downloading.\n' >&2
+    exit 1
+fi
+
+exec uv run gallery-dl -c gallery-dl.conf -o "base-directory=$download_root" "$@"

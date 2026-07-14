@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_dir"
+
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
+if [[ "${VIRTUAL_ENV:-}" != "" && "${VIRTUAL_ENV:-}" != "$repo_dir/.venv" ]]; then
+    unset VIRTUAL_ENV
+fi
+
+unlock_keyring=0
+if [[ "${1:-}" == "--unlock-keyring" ]]; then
+    unlock_keyring=1
+    shift
+fi
+export GDL_UNLOCK_KEYRING="$unlock_keyring"
+
+exec uv run python - <<'PY'
+import os
+import sqlite3
+import stat
+import sys
+import subprocess
+import getpass
+from pathlib import Path
+
+try:
+    import secretstorage
+except Exception:
+    secretstorage = None
+
+from gallery_dl.cookies import load_cookies
+
+
+repo = Path.cwd()
+output = repo / "state" / "cookies" / "x.cookies.txt"
+output.parent.mkdir(parents=True, exist_ok=True)
+unlock_keyring = os.environ.get("GDL_UNLOCK_KEYRING") == "1"
+
+wanted = {
+    "auth_token",
+    "ct0",
+    "kdt",
+    "twid",
+    "guest_id",
+    "guest_id_ads",
+    "guest_id_marketing",
+    "personalization_id",
+}
+
+
+def maybe_unlock_gnome_keyring():
+    if unlock_keyring:
+        password = getpass.getpass("GNOME keyring password: ")
+        try:
+            proc = subprocess.run(
+                ["gnome-keyring-daemon", "--unlock"],
+                input=password + "\n",
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if proc.returncode != 0:
+                print("gnome-keyring-daemon --unlock failed")
+                if proc.stderr:
+                    print(proc.stderr.strip())
+            else:
+                print("Submitted unlock request to gnome-keyring-daemon.")
+        finally:
+            password = None
+
+    if secretstorage is None:
+        return
+    try:
+        con = secretstorage.dbus_init()
+        try:
+            col = secretstorage.get_default_collection(con)
+            if col.is_locked():
+                print("GNOME keyring is locked; requesting unlock prompt...")
+                dismissed = col.unlock(timeout=60)
+                if dismissed or col.is_locked():
+                    print("GNOME keyring is still locked.")
+        finally:
+            con.close()
+    except Exception as exc:
+        print(f"GNOME keyring unlock check failed: {exc.__class__.__name__}: {exc}")
+
+
+def raw_chrome_has_auth_token():
+    db = Path.home() / ".config" / "google-chrome" / "Default" / "Cookies"
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect("file:" + str(db) + "?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "select count(*) from cookies "
+                "where host_key in ('.x.com', 'x.com') and name = 'auth_token'"
+            ).fetchone()
+            return bool(row and row[0])
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def load_spec(spec):
+    try:
+        return list(load_cookies(spec))
+    except Exception as exc:
+        print(f"{spec}: {exc.__class__.__name__}: {exc}")
+        return []
+
+
+def cookie_key(cookie):
+    return (cookie.domain, cookie.path, cookie.name)
+
+
+def netscape_line(cookie):
+    domain = cookie.domain or ""
+    if cookie.has_nonstandard_attr("HttpOnly") or cookie._rest.get("HttpOnly"):
+        domain = "#HttpOnly_" + domain
+    include_subdomains = "TRUE" if (cookie.domain or "").startswith(".") else "FALSE"
+    path = cookie.path or "/"
+    secure = "TRUE" if cookie.secure else "FALSE"
+    expires = int(cookie.expires or 0)
+    return "\t".join((
+        domain,
+        include_subdomains,
+        path,
+        secure,
+        str(expires),
+        cookie.name,
+        cookie.value,
+    ))
+
+
+maybe_unlock_gnome_keyring()
+
+specs = [
+    ("chrome", None, "gnomekeyring", None, ".x.com"),
+    ("chrome", None, "kwallet", None, ".x.com"),
+    ("chrome", None, None, None, ".x.com"),
+    ("chrome", None, "gnomekeyring", None, ".twitter.com"),
+    ("chrome", None, "kwallet", None, ".twitter.com"),
+    ("chrome", None, None, None, ".twitter.com"),
+]
+
+cookies_by_key = {}
+for spec in specs:
+    cookies = load_spec(spec)
+    names = sorted({cookie.name for cookie in cookies})
+    print(f"{spec}: {len(cookies)} cookies; names={names}")
+    for cookie in cookies:
+        if cookie.name in wanted and cookie.value:
+            cookies_by_key[cookie_key(cookie)] = cookie
+
+names = sorted({cookie.name for cookie in cookies_by_key.values()})
+if "auth_token" not in names:
+    print("")
+    print("Could not export a usable X auth_token from Chrome.")
+    raw_has_auth = raw_chrome_has_auth_token()
+    if raw_has_auth:
+        print("Chrome's raw cookie DB does contain auth_token, but it is still encrypted.")
+        print("Unlock the desktop keyring and rerun: scripts/save-x-cookies")
+    else:
+        print("Chrome's raw cookie DB does not show auth_token; log into x.com in Chrome and rerun.")
+    sys.exit(1)
+
+lines = [
+    "# Netscape HTTP Cookie File",
+    "# Generated by scripts/save-x-cookies. Keep this file private.",
+]
+for cookie in sorted(cookies_by_key.values(), key=lambda c: (c.domain, c.name)):
+    lines.append(netscape_line(cookie))
+lines.append("")
+
+tmp = output.with_suffix(".tmp")
+tmp.write_text("\n".join(lines))
+os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+tmp.replace(output)
+
+print("")
+print(f"Saved {len(cookies_by_key)} X cookies to {output}")
+print(f"Saved names: {names}")
+PY
