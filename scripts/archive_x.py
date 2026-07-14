@@ -231,9 +231,9 @@ def validate_cookie_file(path: Path) -> set[str]:
             f"run: chmod 600 {shlex.quote(str(path))}"
         )
 
-    names: set[str] = set()
+    present_names: set[str] = set()
+    usable_names: set[str] = set()
     now = time.time()
-    expired_auth = False
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as exc:
@@ -248,24 +248,32 @@ def validate_cookie_file(path: Path) -> set[str]:
             continue
         domain, _include, _cookie_path, _secure, expiry, name, value = fields[:7]
         domain = domain.lstrip(".").lower()
-        if domain not in {"x.com", "twitter.com"} or not value:
+        # gallery-dl 1.32.x sends requests to x.com and looks up cookies for
+        # its exact .x.com cookie domain.  A twitter.com-only export can look
+        # plausible here while leaving the extractor unauthenticated.
+        if domain != "x.com" or not value:
             continue
-        names.add(name)
-        if name == "auth_token":
-            try:
-                expires_at = int(expiry)
-                if expires_at > 10_000_000_000:
-                    expires_at //= 1000
-                expired_auth = bool(expires_at and expires_at < now)
-            except ValueError:
-                pass
-    if "auth_token" not in names:
-        raise ArchiveError(f"{path} does not contain an X auth_token")
-    if expired_auth:
-        raise ArchiveError(f"the X auth_token in {path} is expired")
-    if "ct0" not in names:
-        raise ArchiveError(f"{path} does not contain the required X ct0 cookie")
-    return names
+        present_names.add(name)
+        expired = False
+        try:
+            expires_at = int(expiry)
+            if expires_at > 10_000_000_000:
+                expires_at //= 1000
+            expired = bool(expires_at and expires_at < now)
+        except ValueError:
+            pass
+        if not expired:
+            usable_names.add(name)
+
+    for required in ("auth_token", "ct0"):
+        if required in usable_names:
+            continue
+        if required in present_names:
+            raise ArchiveError(f"the X {required} cookie in {path} is expired")
+        raise ArchiveError(
+            f"{path} does not contain a usable .x.com {required} cookie"
+        )
+    return usable_names
 
 
 def exact_mount_is_writable(path: Path) -> bool:
@@ -287,7 +295,7 @@ def exact_mount_is_writable(path: Path) -> bool:
     return str(path) in targets
 
 
-def resolve_output_root(explicit: Path | None) -> Path:
+def resolve_output_root(explicit: Path | None, *, plan_only: bool = False) -> Path:
     if explicit is not None:
         return explicit.expanduser().resolve()
 
@@ -303,6 +311,11 @@ def resolve_output_root(explicit: Path | None) -> Path:
     for mount in candidates:
         if exact_mount_is_writable(mount):
             return mount / "gdl" / "x-archive"
+    if plan_only:
+        # A dry run promises no writes.  Show the intended stable destination
+        # even when the disk is not presently mounted; the real run still
+        # performs the fail-closed check above.
+        return candidates[0] / "gdl" / "x-archive"
     raise ArchiveError(
         "Bibliotheque is not mounted read-write at /mnt/Bibliotheque, "
         "/tmp/Bibliotheque, or /Volumes/Bibliotheque. Mount it first or "
@@ -412,6 +425,19 @@ def id_string(value: Any) -> str | None:
     return str(value)
 
 
+def same_user(
+    author: dict[str, Any], user: dict[str, Any], requested_handle: str
+) -> bool:
+    """Compare stable IDs first, with handles only as a legacy fallback."""
+    author_id = id_string(author.get("id"))
+    user_id = id_string(user.get("id"))
+    if author_id and user_id:
+        return author_id == user_id
+    author_handle = str(author.get("name") or "").lower()
+    user_handle = str(user.get("name") or requested_handle).lower()
+    return bool(author_handle) and author_handle == user_handle
+
+
 def relation_for(metadata: dict[str, Any], requested_handle: str) -> str:
     subcategory = str(metadata.get("subcategory") or "")
     if subcategory == "avatar":
@@ -419,10 +445,10 @@ def relation_for(metadata: dict[str, Any], requested_handle: str) -> str:
     if subcategory == "background":
         return "profile_background"
     author = metadata.get("author") or {}
-    author_handle = str(author.get("name") or "").lower()
+    user = metadata.get("user") or {}
     if id_string(metadata.get("retweet_id")):
         return "repost"
-    if author_handle == requested_handle.lower():
+    if same_user(author, user, requested_handle):
         if id_string(metadata.get("reply_id")):
             return "reply"
         return "post"
@@ -443,12 +469,22 @@ def normalize_post(
     relationship = relation_for(metadata, requested_handle)
     archived_at = str(metadata.get("archived_at") or iso_utc(utc_now()))
     repost_of_post_id = id_string(metadata.get("retweet_id"))
-    source_handle = requested_handle if relationship == "repost" else author_handle
+    requested_user_handle = str(user.get("name") or requested_handle)
+    source_handle = (
+        requested_user_handle if relationship == "repost" else author_handle
+    )
+    event_at = metadata.get("date")
+    original_posted_at = (
+        metadata.get("date_original")
+        if relationship == "repost"
+        else event_at
+    )
     return {
         "schema": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,
         "requested_handle": requested_handle,
         "requested_user_id": id_string(user.get("id")),
+        "canonical_requested_handle": requested_user_handle or None,
         "post_id": post_id,
         "source_url": (
             f"https://x.com/{source_handle}/status/{post_id}"
@@ -465,7 +501,11 @@ def normalize_post(
         "author_handle": author_handle or None,
         "author_id": id_string(author.get("id")),
         "author_display_name": author.get("nick"),
-        "posted_at": metadata.get("date"),
+        # `posted_at` is the target account's timeline event time.  It equals
+        # the post time normally and the repost action time for repost rows.
+        "posted_at": event_at,
+        "original_posted_at": original_posted_at,
+        "reposted_at": event_at if relationship == "repost" else None,
         "first_captured_at": archived_at,
         "last_captured_at": archived_at,
         "capture_count": 1,
@@ -476,7 +516,6 @@ def normalize_post(
         "reply_to_post_id": id_string(metadata.get("reply_id")),
         "conversation_id": id_string(metadata.get("conversation_id")),
         "repost_of_post_id": repost_of_post_id,
-        "quoted_by_post_id": id_string(metadata.get("quote_id")),
         "hashtags": metadata.get("hashtags") or [],
         "mentions": metadata.get("mentions") or [],
         "sensitive": metadata.get("sensitive"),
@@ -503,7 +542,23 @@ def merge_post_records(
 ) -> dict[str, Any]:
     if not existing:
         return new
-    chosen = new if record_richness(new) >= record_richness(existing) else existing.copy()
+
+    # The newest crawl owns observation-time values (especially metrics), but
+    # a temporarily sparse API response must not erase richer static metadata
+    # captured earlier.  Merge nested raw dictionaries with new values taking
+    # precedence instead of selecting one whole observation by "richness".
+    def merge_dicts(old: dict[str, Any], latest: dict[str, Any]) -> dict[str, Any]:
+        merged = old.copy()
+        for key, value in latest.items():
+            previous = merged.get(key)
+            if isinstance(previous, dict) and isinstance(value, dict):
+                merged[key] = merge_dicts(previous, value)
+            else:
+                merged[key] = value
+        return merged
+
+    chosen = merge_dicts(existing, new)
+    chosen["metrics"] = new.get("metrics")
     chosen["first_captured_at"] = existing.get(
         "first_captured_at", new["first_captured_at"]
     )
@@ -603,6 +658,46 @@ def update_profile_dataset(
     return True
 
 
+def profile_identity(raw_path: Path) -> tuple[str | None, str | None]:
+    """Return the stable numeric ID and current handle from an info snapshot."""
+    profile: dict[str, Any] | None = None
+    for record in iter_jsonl(raw_path):
+        profile = record
+    if not profile:
+        return None, None
+    # The /info extractor emits the transformed user directly.  Accept a
+    # nested `user` too so this remains usable with raw timeline fixtures.
+    candidate = profile.get("user")
+    if not isinstance(candidate, dict) or not candidate.get("id"):
+        candidate = profile
+    return id_string(candidate.get("id")), (
+        str(candidate.get("name")) if candidate.get("name") else None
+    )
+
+
+def bind_profile_identity(
+    state: dict[str, Any], requested_handle: str, observed_id: str, canonical_handle: str | None
+) -> None:
+    """Bind a handle archive to one X account, aborting on reassignment."""
+    expected_id = id_string(state.get("requested_user_id"))
+    if expected_id and expected_id != observed_id:
+        raise ArchiveError(
+            f"identity mismatch for @{requested_handle}: this archive is bound "
+            f"to X user ID {expected_id}, but the handle now resolves to "
+            f"{observed_id}; no timeline data was downloaded"
+        )
+    state.update(
+        {
+            "schema": SCHEMA_NAME,
+            "schema_version": SCHEMA_VERSION,
+            "requested_handle": requested_handle,
+            "requested_user_id": observed_id,
+            "canonical_handle": canonical_handle or requested_handle,
+            "identity_checked_at": iso_utc(utc_now()),
+        }
+    )
+
+
 def update_media_dataset(user_dir: Path, requested_handle: str) -> dict[str, int]:
     media_root = user_dir / "media"
     records: list[dict[str, Any]] = []
@@ -627,6 +722,14 @@ def update_media_dataset(user_dir: Path, requested_handle: str) -> dict[str, int
                     "relationship": relation,
                     "author_handle": (metadata.get("author") or {}).get("name"),
                     "posted_at": metadata.get("date"),
+                    "original_posted_at": (
+                        metadata.get("date_original")
+                        if relation == "repost"
+                        else metadata.get("date")
+                    ),
+                    "reposted_at": (
+                        metadata.get("date") if relation == "repost" else None
+                    ),
                     "media_number": metadata.get("num"),
                     "asset_path": str(asset.relative_to(user_dir)),
                     "sidecar_path": str(sidecar.relative_to(user_dir)),
@@ -656,10 +759,24 @@ def update_media_dataset(user_dir: Path, requested_handle: str) -> dict[str, int
 
 def write_dataset_readme(user_dir: Path) -> None:
     path = user_dir / "dataset" / "README.md"
-    if path.exists():
-        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = """# X archive dataset\n\n+This directory is a derived, portable view of immutable run snapshots.\n+\n+- `posts.jsonl`: all retained posts and reposts, with explicit `relationship`.\n+- `authored-posts.jsonl`: only posts/replies authored by the requested user.\n+- `reposts.jsonl`: reposts, retaining the original author.\n+- `media.jsonl`: local asset paths, source metadata, and SHA-256 digests.\n+- `profile.json`: latest captured profile metadata.\n+\n+`posted_at` is the original X post timestamp. `first_captured_at` and\n+`last_captured_at` describe archive observations. Engagement metrics are\n+point-in-time values, not historical totals. Raw per-run JSONL and logs live\n+under `../runs/` and remain the source of truth.\n+"""
+    text = """# X archive dataset
+
+This directory is a derived, portable view of immutable run snapshots.
+
+- `posts.jsonl`: all retained posts and reposts, with explicit `relationship`.
+- `authored-posts.jsonl`: only posts/replies authored by the requested user.
+- `reposts.jsonl`: reposts, retaining the original author.
+- `media.jsonl`: local asset paths, source metadata, and SHA-256 digests.
+- `profile.json`: latest captured profile metadata.
+
+`posted_at` is the target account's timeline-event timestamp. For a repost,
+`reposted_at` is that event time and `original_posted_at` is the original
+author's post time. `first_captured_at` and `last_captured_at` describe archive
+observations. Engagement metrics are point-in-time values, not historical
+totals. Raw per-run JSONL and logs live under `../runs/` and remain the source
+of truth.
+"""
     path.write_text(text, encoding="utf-8")
     os.chmod(path, 0o600)
 
@@ -749,7 +866,9 @@ def build_gallery_config(
         "replies": True,
         "retweets": True if include_reposts else False,
         "quoted": False,
-        "pinned": True,
+        # An old pinned post can appear first and make gallery-dl's generic
+        # --date-after predicate stop an incremental crawl with exit code 0.
+        "pinned": False,
         "expand": False,
         "showreplies": False,
         "cards": True,
@@ -845,7 +964,11 @@ def run_gallery_dl(
                 remainder, _ = process.communicate(timeout=15)
             except subprocess.TimeoutExpired:
                 process.terminate()
-                remainder, _ = process.communicate(timeout=10)
+                try:
+                    remainder, _ = process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    remainder, _ = process.communicate()
             for line in remainder.splitlines(keepends=True):
                 print(f"[{prefix}] {line}", end="")
                 log.write(line)
@@ -948,7 +1071,7 @@ def archive_endpoint(
     command = gallery_command(
         repo_dir,
         config_path,
-        date_after=date_after if endpoint == "timeline" and not cursor else None,
+        date_after=date_after if endpoint == "timeline" else None,
         post_limit=args.post_limit if endpoint == "timeline" else None,
         retries=args.retries,
         rate_limit=args.rate_limit,
@@ -977,6 +1100,47 @@ def archive_endpoint(
     }
 
 
+def select_timeline_state(
+    args: argparse.Namespace, state: dict[str, Any], started: datetime
+) -> tuple[str | None, str, datetime | None]:
+    """Select a saved cursor and preserve its original incremental cutoff."""
+    resume = state.get("resume") if isinstance(state.get("resume"), dict) else None
+    if args.full_rescan or args.since is not None or args.post_limit:
+        resume = None
+
+    cursor = str(resume.get("cursor")) if resume and resume.get("cursor") else None
+    chain_started_at = (
+        str(resume.get("started_at")) if resume else iso_utc(started)
+    )
+    if cursor:
+        saved_cutoff = resume.get("date_after") if resume else None
+        if saved_cutoff:
+            try:
+                date_after = parse_datetime(str(saved_cutoff))
+            except argparse.ArgumentTypeError:
+                date_after = None
+        else:
+            # Resume states written by older versions did not retain this.
+            # Re-crawling more is safer than inventing a cutoff and missing data.
+            date_after = None
+    elif args.since is not None:
+        date_after = args.since
+    elif args.full_rescan:
+        date_after = None
+    else:
+        previous = state.get("last_successful_started_at")
+        if previous:
+            try:
+                date_after = parse_datetime(str(previous)) - timedelta(
+                    hours=args.overlap_hours
+                )
+            except argparse.ArgumentTypeError:
+                date_after = None
+        else:
+            date_after = None
+    return cursor, chain_started_at, date_after
+
+
 def archive_user(
     args: argparse.Namespace,
     repo_dir: Path,
@@ -997,31 +1161,9 @@ def archive_user(
     state = load_json(state_path, {})
     if not isinstance(state, dict):
         state = {}
-    resume = state.get("resume") if isinstance(state.get("resume"), dict) else None
-    if args.full_rescan or args.since is not None or args.post_limit:
-        resume = None
-
-    cursor = str(resume.get("cursor")) if resume and resume.get("cursor") else None
-    chain_started_at = (
-        str(resume.get("started_at")) if resume else iso_utc(started)
+    cursor, chain_started_at, date_after = select_timeline_state(
+        args, state, started
     )
-    if cursor:
-        date_after = None
-    elif args.since is not None:
-        date_after = args.since
-    elif args.full_rescan:
-        date_after = None
-    else:
-        previous = state.get("last_successful_started_at")
-        if previous:
-            try:
-                date_after = parse_datetime(str(previous)) - timedelta(
-                    hours=args.overlap_hours
-                )
-            except argparse.ArgumentTypeError:
-                date_after = None
-        else:
-            date_after = None
 
     manifest: dict[str, Any] = {
         "schema": SCHEMA_NAME,
@@ -1038,7 +1180,8 @@ def archive_user(
         "cookie_values_logged": False,
         "reposts_included": not args.no_reposts,
         "quoted_source_media_included": False,
-        "unrelated_reply_context_included": False,
+        "reply_context_policy": "target numeric author ID or repost-shaped entry",
+        "repost_context_attribution_best_effort": bool(not args.no_reposts),
         "request_delay_seconds": args.request_delay,
         "download_delay_seconds": args.download_delay,
         "extractor_delay_seconds": args.extractor_delay,
@@ -1049,6 +1192,74 @@ def archive_user(
     }
     manifest_path = run_dir / "manifest.json"
     atomic_write_json(manifest_path, manifest)
+
+    # Resolve and bind the stable numeric account ID before timeline media can
+    # touch this handle's archive.  This fails closed if a handle is recycled.
+    info_result = archive_endpoint(
+        args=args,
+        repo_dir=repo_dir,
+        archive_root=archive_root,
+        user_dir=user_dir,
+        handle=handle,
+        endpoint="info",
+        run_dir=run_dir,
+        archive_run_id=current_run_id,
+        archived_at=iso_utc(started),
+        date_after=None,
+        cursor=None,
+    )
+    manifest["endpoints"].append(info_result)
+    info_raw = user_dir / info_result["raw_path"]
+    if info_result.get("interrupted") or info_result["exit_code"] != 0:
+        manifest["status"] = (
+            "interrupted" if info_result.get("interrupted") else "failed"
+        )
+        manifest["failure_stage"] = "identity_probe"
+        manifest["completed_at"] = iso_utc(utc_now())
+        atomic_write_json(manifest_path, manifest)
+        if info_result.get("interrupted"):
+            raise KeyboardInterrupt
+        return manifest
+
+    observed_user_id, canonical_handle = profile_identity(info_raw)
+    if not observed_user_id:
+        manifest["status"] = "failed"
+        manifest["failure_stage"] = "identity_probe"
+        manifest["error"] = "X profile metadata did not contain a numeric user ID"
+        manifest["completed_at"] = iso_utc(utc_now())
+        atomic_write_json(manifest_path, manifest)
+        return manifest
+    try:
+        bind_profile_identity(
+            state, handle, observed_user_id, canonical_handle
+        )
+    except ArchiveError as exc:
+        manifest["status"] = "failed"
+        manifest["failure_stage"] = "identity_guard"
+        manifest["error"] = str(exc)
+        manifest["observed_user_id"] = observed_user_id
+        manifest["completed_at"] = iso_utc(utc_now())
+        atomic_write_json(manifest_path, manifest)
+        print(f"Identity guard stopped @{handle}: {exc}")
+        return manifest
+
+    manifest["requested_user_id"] = observed_user_id
+    manifest["canonical_handle"] = canonical_handle or handle
+    manifest["canonical_profile_url"] = (
+        f"https://x.com/{canonical_handle or handle}"
+    )
+    atomic_write_json(state_path, state)
+    update_profile_dataset(
+        user_dir, handle, info_raw, iso_utc(started)
+    )
+
+    try:
+        sleep_random(args.endpoint_delay, f"before {handle}:timeline")
+    except KeyboardInterrupt:
+        manifest["status"] = "interrupted"
+        manifest["completed_at"] = iso_utc(utc_now())
+        atomic_write_json(manifest_path, manifest)
+        raise
 
     timeline_result = archive_endpoint(
         args=args,
@@ -1074,7 +1285,10 @@ def archive_user(
         timeline_result["exit_code"] == 0
         and not timeline_result.get("interrupted")
     )
-    if timeline_ok and not args.post_limit:
+    if args.post_limit:
+        # A smoke test must not advance or replace production crawl state.
+        pass
+    elif timeline_ok:
         state.update(
             {
                 "schema": SCHEMA_NAME,
@@ -1094,6 +1308,9 @@ def archive_user(
                 "resume": {
                     "cursor": timeline_result["resume_cursor"],
                     "started_at": chain_started_at,
+                    "date_after": (
+                        iso_utc(date_after) if date_after else None
+                    ),
                     "saved_at": iso_utc(utc_now()),
                 },
             }
@@ -1115,8 +1332,17 @@ def archive_user(
     if args.post_limit:
         manifest["status"] = "limited"
     else:
-        for endpoint, _path in PROFILE_ENDPOINTS:
-            sleep_random(args.endpoint_delay, f"before {handle}:{endpoint}")
+        for endpoint in ("avatar", "background"):
+            try:
+                sleep_random(args.endpoint_delay, f"before {handle}:{endpoint}")
+            except KeyboardInterrupt:
+                manifest["status"] = "interrupted"
+                manifest["media_dataset"] = update_media_dataset(
+                    user_dir, handle
+                )
+                manifest["completed_at"] = iso_utc(utc_now())
+                atomic_write_json(manifest_path, manifest)
+                raise
             result = archive_endpoint(
                 args=args,
                 repo_dir=repo_dir,
@@ -1131,13 +1357,6 @@ def archive_user(
                 cursor=None,
             )
             manifest["endpoints"].append(result)
-            if endpoint == "info" and result["exit_code"] == 0:
-                update_profile_dataset(
-                    user_dir,
-                    handle,
-                    user_dir / result["raw_path"],
-                    iso_utc(started),
-                )
             if result.get("interrupted"):
                 manifest["status"] = "interrupted"
                 manifest["media_dataset"] = update_media_dataset(
@@ -1167,13 +1386,18 @@ def dry_run_summary(
     print("Dry run: no X requests and no archive writes will be made.")
     print(f"gallery-dl: {version}")
     print(f"archive root: {archive_root}")
+    if args.output_root is None and not os.environ.get("GDL_X_ARCHIVE_ROOT"):
+        print("note: the real run will require Bibliotheque mounted read-write")
     print(f"cookie file: {args.cookies} (values not displayed)")
     print(f"users ({len(targets)}): {', '.join(targets)}")
     print("main endpoint: /USER/timeline (with replies + older search backfill)")
-    print("profile endpoints: info, avatar, background")
+    print("identity/profile endpoint first: info (stable user-ID guard)")
+    print("profile media endpoints after timeline: avatar, background")
     print(f"reposts: {'included and labeled' if not args.no_reposts else 'excluded'}")
     print("quoted-source media: excluded")
-    print("unrelated reply-thread authors: excluded")
+    print("non-repost reply-thread context: excluded by numeric author ID")
+    if not args.no_reposts:
+        print("repost attribution: best effort where X omits wrapper-author identity")
     print(f"request delay: {args.request_delay}s")
     print(f"download delay: {args.download_delay}s")
     print(f"between users: {args.user_delay}s")
@@ -1313,7 +1537,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         targets = load_targets(args.user, args.input_file)
         validate_cookie_file(args.cookies)
-        archive_root = resolve_output_root(args.output_root)
+        archive_root = resolve_output_root(args.output_root, plan_only=args.dry_run)
         version = gallery_dl_version()
         if args.dry_run:
             dry_run_summary(args, archive_root, targets, version)
@@ -1363,9 +1587,12 @@ def main(argv: list[str] | None = None) -> int:
             "results": results,
         }
         atomic_write_json(archive_root / "runs" / f"{invocation_id}.json", invocation)
-        failed = [result for result in results if result["status"] == "failed"]
-        partial = [result for result in results if result["status"] == "partial"]
-        return 1 if failed or partial or len(results) < len(targets) else 0
+        unsuccessful = [
+            result
+            for result in results
+            if result["status"] not in {"success", "limited"}
+        ]
+        return 1 if unsuccessful or len(results) < len(targets) else 0
     except ArchiveError as exc:
         parser.exit(2, f"archive-x: {exc}\n")
     except OSError as exc:

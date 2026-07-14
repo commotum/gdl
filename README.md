@@ -48,13 +48,24 @@ The default is deliberately slow and fail-closed:
 - X rate-limit reset headers are respected, account-lock errors abort, and
   retries are bounded;
 - no proxy rotation, header spoofing, concurrency, or local-disk fallback;
-- initial runs backfill as far as X exposes; later runs use a 48-hour overlap;
+- a profile-info probe binds each handle archive to its stable numeric X user
+  ID before timeline downloads, so a recycled handle fails closed;
+- initial runs backfill as far as X exposes; later runs use a best-effort
+  48-hour overlap, with pinned-item injection disabled so an old pin cannot
+  silently terminate the incremental scan;
 - interrupted timeline cursors are recorded for a later resume when provided
-  by gallery-dl;
+  by gallery-dl, together with the original date cutoff;
 - reposts are included by default, retain the original author, and are marked
   `relationship: "repost"`; use `--no-reposts` to exclude them;
-- unrelated reply-thread participants and separately yielded quoted-source
-  media are excluded so they are not mislabeled as the requested user.
+- non-repost reply-thread context is excluded using numeric author IDs, and
+  separately yielded quoted-source media is excluded.
+
+X's transformed reply-timeline data does not always retain the account ID of
+the repost wrapper. Repost attribution is therefore best effort: an unusual
+repost-shaped item embedded as conversation context can be retained as a
+repost. The raw metadata is kept so this can be reclassified later. Use
+`--no-reposts` if strict target-authorship filtering is more important than
+retaining reposts.
 
 Run a network-free validation first:
 
@@ -74,6 +85,12 @@ backfill. Other useful controls include `--since 2026-01-01`,
 goes to a writable Bibliotheque mount under `gdl/x-archive`; the command exits
 instead of silently filling the local disk.
 
+Incremental stopping relies on timeline order supplied by X. A 48-hour
+overlap and disabled pin injection address the common failure mode, but X can
+still return non-monotonic thread modules. Periodic `--full-rescan` runs are
+the maximum-completeness option; gallery-dl and X themselves can still impose
+historical visibility limits.
+
 ### X archive contents
 
 Each account is self-contained under `users/HANDLE/`:
@@ -92,10 +109,15 @@ users/HANDLE/
     └── profile.json         # latest observed profile metadata
 ```
 
-The post records retain original post date and text; author/requested-user
-identity; reply, conversation, quote, and repost IDs; language, hashtags,
-mentions, sensitive-content flags, and article HTML; plus point-in-time likes,
-views, reposts, quotes, replies, and bookmark counts. They also record
+The post records retain text; stable author/requested-user IDs; reply,
+conversation, and repost IDs; language, hashtags, mentions, sensitive-content
+flags, and article HTML; plus point-in-time likes, views, reposts, quotes,
+replies, and bookmark counts. `posted_at` is the target account's timeline
+event time. On repost rows, `reposted_at` records that action while
+`original_posted_at` records the original author's post time. A user's own
+quote post is retained, but with quoted-source extraction disabled X/gallery-dl
+does not reliably provide a structured ID for the quoted target. Records also
+store
 `first_captured_at` and `last_captured_at`, because engagement counts describe
 the crawl time rather than a permanent historical total. Raw run snapshots
 remain the source of truth, while `dataset/*.jsonl` are atomically rebuilt
@@ -109,6 +131,8 @@ The config points Instagram and Behance at local ignored files under `state/`.
 Twitter/X uses an ignored Netscape cookie file at
 `state/cookies/x.cookies.txt`. The recommended way to create it is with the
 repo's dedicated Firefox profile, which works on both macOS and Linux.
+The archiver requires usable `auth_token` and `ct0` cookies on `.x.com` and
+rejects a `.twitter.com`-only export or an expired cookie.
 
 Open the dedicated X login profile (on the MacBook or Ubuntu desktop):
 
