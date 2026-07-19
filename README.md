@@ -47,6 +47,12 @@ The default is deliberately slow and fail-closed:
 - 4–8 seconds between X extraction requests and 1–3 seconds before assets;
 - X rate-limit reset headers are respected, account-lock errors abort, and
   retries are bounded;
+- successful responses received at the end of an X quota window are processed
+  before waiting for the reset, using a version-checked gallery-dl 1.32.4
+  compatibility runner that fails closed after an unreviewed upgrade;
+- three consecutive rate-limit windows without any new raw metadata trigger a
+  clean, resumable checkpoint instead of an unbounded old-search loop; change
+  the threshold with `--stalled-rate-limit-cycles`;
 - no proxy rotation, header spoofing, concurrency, or local-disk fallback;
 - a profile-info probe binds each handle archive to its stable numeric X user
   ID before timeline downloads, so a recycled handle fails closed;
@@ -54,7 +60,9 @@ The default is deliberately slow and fail-closed:
   48-hour overlap, with pinned-item injection disabled so an old pin cannot
   silently terminate the incremental scan;
 - interrupted timeline cursors are recorded for a later resume when provided
-  by gallery-dl, together with the original date cutoff;
+  by gallery-dl, together with the original date cutoff; a legacy terminal
+  rate-limit loop that omitted its cursor is recovered conservatively from the
+  oldest saved post rather than restarting the full historical crawl;
 - reposts are included by default, retain the original author, and are marked
   `relationship: "repost"`; use `--no-reposts` to exclude them;
 - non-repost reply-thread context is excluded using numeric author IDs, and
@@ -84,6 +92,35 @@ backfill. Other useful controls include `--since 2026-01-01`,
 `--full-rescan`, `--keep-going`, and `--output-root PATH`. By default output
 goes to a writable Bibliotheque mount under `gdl/x-archive`; the command exits
 instead of silently filling the local disk.
+
+### Recovering incomplete media
+
+A download-only media error does not force another historical timeline
+backfill. When timeline enumeration otherwise completed, the archiver advances
+the timeline state, records the incomplete asset as pending, and marks the run
+`partial`. A normal later run retries recorded pending media before refreshing
+the timeline, avatar, and background.
+
+To retry only recorded incomplete media without crawling the timeline, run:
+
+```bash
+uv run python scripts/archive_x.py --user USER --retry-failed-only
+```
+
+gallery-dl preserves an interrupted download as a `.part` file and resumes it
+with an HTTP Range request when the server supports resuming. Pending-media
+recovery uses up to 8 retries and a 300-second inactivity timeout by default;
+these can be changed with `--media-retries` and `--media-timeout`. The normal
+request and endpoint delays still apply.
+
+If an asset remains incomplete, the recovery run stays `partial` and exits
+nonzero; rerunning the same command continues from the retained `.part` file.
+After a recovery-only run succeeds, run the normal archive command when a
+current timeline and profile-media refresh is also wanted:
+
+```bash
+uv run python scripts/archive_x.py --user USER
+```
 
 Incremental stopping relies on timeline order supplied by X. A 48-hour
 overlap and disabled pin injection address the common failure mode, but X can

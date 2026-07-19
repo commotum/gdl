@@ -35,6 +35,17 @@ MIN_GALLERY_DL = (1, 32, 0)
 HANDLE_RE = re.compile(r"[A-Za-z0-9_]{1,15}\Z")
 DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?\Z")
 CURSOR_RE = re.compile(r"Use '-o cursor=(.+)' to continue")
+CHECKPOINT_CURSOR_RE = re.compile(r"Archive checkpoint cursor=(\S+)")
+RATE_LIMIT_WAIT_RE = re.compile(
+    r"\[twitter\]\[info\]\s+Waiting for .+\(rate limit\)\s*$"
+)
+DOWNLOAD_ERROR_RE = re.compile(
+    r"\[download\]\[error\]\s+Failed to download\s+(.+?)\s*$"
+)
+LOG_ERROR_RE = re.compile(r"\[[^\]]+\]\[error\]")
+MEDIA_FILENAME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}_(\d{5,25})_(\d+)_"
+)
 X_HOSTS = {
     "x.com",
     "www.x.com",
@@ -70,6 +81,8 @@ EXIT_FLAGS = {
     64: "unsupported URL",
     128: "operating-system error",
 }
+CHILD_INTERRUPT_GRACE_SECONDS = 15
+CHILD_TERMINATE_GRACE_SECONDS = 10
 
 
 class ArchiveError(RuntimeError):
@@ -337,6 +350,40 @@ def gallery_dl_version() -> str:
     return version
 
 
+def verify_gallery_dl_x_runner(repo_dir: Path, version: str) -> None:
+    """Fail before archive writes if the pinned X shim is incompatible."""
+    command = [
+        sys.executable,
+        str(repo_dir / "scripts" / "gallery_dl_x_runner.py"),
+        "--version",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ArchiveError(
+            f"could not verify the gallery-dl X runner: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ArchiveError(
+            "gallery-dl X runner compatibility check failed"
+            + (f": {detail}" if detail else "")
+        )
+    reported = result.stdout.strip()
+    if reported != version:
+        raise ArchiveError(
+            "gallery-dl X runner reported an unexpected version: "
+            f"expected {version}, found {reported or 'no output'}"
+        )
+
+
 def atomic_write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
@@ -386,6 +433,30 @@ def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
                 continue
             if isinstance(record, dict):
                 yield record
+
+
+def jsonl_has_record(path: Path) -> bool:
+    return next(iter_jsonl(path), None) is not None
+
+
+def oldest_tweet_id(path: Path) -> str | None:
+    oldest: int | None = None
+    for record in iter_jsonl(path):
+        value = id_string(record.get("tweet_id"))
+        if not value:
+            continue
+        try:
+            number = int(value)
+        except ValueError:
+            continue
+        if number > 0 and (oldest is None or number < oldest):
+            oldest = number
+    return str(oldest) if oldest is not None else None
+
+
+def synthetic_search_cursor(path: Path) -> str | None:
+    tweet_id = oldest_tweet_id(path)
+    return f"3_{tweet_id}/" if tweet_id else None
 
 
 @contextmanager
@@ -922,16 +993,168 @@ def build_gallery_config(
 def decode_exit_status(status: int) -> list[str]:
     if status == 0:
         return []
+    if status < 0:
+        return [f"terminated by signal {-status}"]
     descriptions = [text for bit, text in EXIT_FLAGS.items() if status & bit]
     return descriptions or [f"exit status {status}"]
 
 
+def download_failure_from_line(line: str) -> dict[str, Any] | None:
+    match = DOWNLOAD_ERROR_RE.search(line)
+    if not match:
+        return None
+    filename = Path(match.group(1).strip()).name
+    media_match = MEDIA_FILENAME_RE.match(filename)
+    if not media_match:
+        return {"filename": filename, "post_id": None, "media_number": None}
+    return {
+        "filename": filename,
+        "post_id": media_match.group(1),
+        "media_number": int(media_match.group(2)),
+    }
+
+
+def analyze_gallery_log(path: Path) -> tuple[list[dict[str, Any]], int]:
+    failed_downloads: list[dict[str, Any]] = []
+    other_error_count = 0
+    try:
+        lines = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return failed_downloads, other_error_count
+    with lines:
+        for line in lines:
+            failure = download_failure_from_line(line)
+            if failure:
+                failed_downloads.append(failure)
+            elif LOG_ERROR_RE.search(line):
+                other_error_count += 1
+    return failed_downloads, other_error_count
+
+
+def gallery_metadata_complete(
+    status: int,
+    resume_cursor: str | None,
+    interrupted: bool,
+    failed_downloads: list[dict[str, Any]],
+    other_error_count: int,
+) -> bool:
+    """Whether extraction completed even if one or more assets failed."""
+    if interrupted:
+        return False
+    if status == 0:
+        return True
+    return bool(
+        status == 4
+        and failed_downloads
+        and all(
+            id_string(failure.get("post_id"))
+            and isinstance(failure.get("media_number"), int)
+            and failure["media_number"] > 0
+            for failure in failed_downloads
+        )
+        and not other_error_count
+        and not resume_cursor
+    )
+
+
+class RateLimitProgressWatchdog:
+    """Stop an endpoint after repeated quota windows without raw progress."""
+
+    def __init__(self, progress_path: Path | None, limit: int):
+        self.progress_path = progress_path
+        self.limit = limit
+        self.last_size = self._size()
+        self.consecutive_stalls = 0
+
+    def _size(self) -> int:
+        if self.progress_path is None:
+            return 0
+        try:
+            return self.progress_path.stat().st_size
+        except OSError:
+            return 0
+
+    def observe(self, line: str) -> bool:
+        if not self.limit or not RATE_LIMIT_WAIT_RE.search(line):
+            return False
+        size = self._size()
+        if size > self.last_size:
+            self.consecutive_stalls = 0
+        else:
+            self.consecutive_stalls += 1
+        self.last_size = size
+        return self.consecutive_stalls >= self.limit
+
+
 def run_gallery_dl(
-    command: list[str], log_path: Path, prefix: str
-) -> tuple[int, str | None, float, bool]:
+    command: list[str],
+    log_path: Path,
+    prefix: str,
+    *,
+    progress_path: Path | None = None,
+    stalled_rate_limit_cycles: int = 0,
+) -> tuple[
+    int,
+    str | None,
+    float,
+    bool,
+    list[dict[str, Any]],
+    int,
+    bool,
+    int,
+]:
     started = time.monotonic()
     resume_cursor = None
+    checkpoint_cursor = None
     interrupted = False
+    failed_downloads: list[dict[str, Any]] = []
+    other_error_count = 0
+    stalled = False
+    watchdog = RateLimitProgressWatchdog(
+        progress_path, stalled_rate_limit_cycles
+    )
+
+    def observe(line: str) -> None:
+        nonlocal resume_cursor, checkpoint_cursor, other_error_count
+        if match := CURSOR_RE.search(line):
+            resume_cursor = match.group(1).strip()
+        elif match := CHECKPOINT_CURSOR_RE.search(line):
+            checkpoint_cursor = match.group(1).strip()
+        failure = download_failure_from_line(line)
+        if failure:
+            failed_downloads.append(failure)
+        elif LOG_ERROR_RE.search(line):
+            other_error_count += 1
+
+    def stop_child(*, interrupt_already_sent: bool) -> tuple[str, int]:
+        """Drain a child after SIGINT, escalating so shutdown is bounded."""
+        if not interrupt_already_sent:
+            try:
+                process.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        try:
+            remainder, _ = process.communicate(
+                timeout=CHILD_INTERRUPT_GRACE_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                remainder, _ = process.communicate(
+                    timeout=CHILD_TERMINATE_GRACE_SECONDS
+                )
+            except subprocess.TimeoutExpired:
+                process.kill()
+                remainder, _ = process.communicate()
+        status = process.returncode if process.returncode is not None else 130
+        return remainder, status
+
+    def record_remainder(remainder: str) -> None:
+        for line in remainder.splitlines(keepends=True):
+            print(f"[{prefix}] {line}", end="")
+            log.write(line)
+            observe(line)
+
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
         os.chmod(log_path, 0o600)
@@ -951,33 +1174,95 @@ def run_gallery_dl(
             for line in process.stdout:
                 print(f"[{prefix}] {line}", end="")
                 log.write(line)
-                if match := CURSOR_RE.search(line):
-                    resume_cursor = match.group(1).strip()
-            status = process.wait()
+                log.flush()
+                observe(line)
+                if not stalled and watchdog.observe(line):
+                    stalled = True
+                    message = (
+                        "[archive-x][warning] No raw metadata progress across "
+                        f"{watchdog.consecutive_stalls} consecutive X "
+                        "rate-limit windows; stopping this endpoint with a "
+                        "resumable checkpoint.\n"
+                    )
+                    print(f"[{prefix}] {message}", end="")
+                    log.write(message)
+                    log.flush()
+                    try:
+                        process.send_signal(signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
+                    # Do not wait for EOF here: a child that ignores SIGINT
+                    # could otherwise leave the watchdog blocked forever.
+                    break
+            if stalled:
+                remainder, status = stop_child(interrupt_already_sent=True)
+                record_remainder(remainder)
+            else:
+                status = process.wait()
         except KeyboardInterrupt:
             interrupted = True
-            try:
-                process.send_signal(signal.SIGINT)
-            except ProcessLookupError:
-                pass
-            try:
-                remainder, _ = process.communicate(timeout=15)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                try:
-                    remainder, _ = process.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    remainder, _ = process.communicate()
-            for line in remainder.splitlines(keepends=True):
-                print(f"[{prefix}] {line}", end="")
-                log.write(line)
-                if match := CURSOR_RE.search(line):
-                    resume_cursor = match.group(1).strip()
-            status = process.returncode if process.returncode is not None else 130
+            remainder, status = stop_child(interrupt_already_sent=False)
+            record_remainder(remainder)
         finally:
             log.flush()
-    return status, resume_cursor, time.monotonic() - started, interrupted
+            process.stdout.close()
+    if stalled or interrupted:
+        # A checkpoint can be newer than gallery-dl's SIGINT cursor, but an
+        # earlier checkpoint can also predate several successful pages before
+        # a sequence of real HTTP 429 responses.  Compare search progress and
+        # keep whichever boundary is demonstrably farther along.
+        resume_cursor = prefer_advanced_search_cursor(
+            resume_cursor, checkpoint_cursor
+        )
+    return (
+        status,
+        resume_cursor,
+        time.monotonic() - started,
+        interrupted,
+        failed_downloads,
+        other_error_count,
+        stalled,
+        watchdog.consecutive_stalls,
+    )
+
+
+def search_cursor_position(cursor: str | None) -> tuple[int, int] | None:
+    """Return a comparable (stage, tweet ID) for search-stage cursors."""
+    if not cursor:
+        return None
+    boundary = cursor.partition("/")[0]
+    stage_text, separator, tweet_id_text = boundary.partition("_")
+    if not separator:
+        return None
+    try:
+        stage = int(stage_text)
+        tweet_id = int(tweet_id_text)
+    except ValueError:
+        return None
+    if stage not in {2, 3} or tweet_id < 1:
+        return None
+    return stage, tweet_id
+
+
+def prefer_advanced_search_cursor(
+    final_cursor: str | None, checkpoint_cursor: str | None
+) -> str | None:
+    """Prefer a checkpoint only when it demonstrably advanced pagination."""
+    if not final_cursor:
+        return checkpoint_cursor
+    if not checkpoint_cursor:
+        return final_cursor
+    final_position = search_cursor_position(final_cursor)
+    checkpoint_position = search_cursor_position(checkpoint_cursor)
+    if final_position and checkpoint_position:
+        final_stage, final_tweet_id = final_position
+        checkpoint_stage, checkpoint_tweet_id = checkpoint_position
+        if checkpoint_stage > final_stage or (
+            checkpoint_stage == final_stage
+            and checkpoint_tweet_id < final_tweet_id
+        ):
+            return checkpoint_cursor
+    return final_cursor
 
 
 def gallery_command(
@@ -987,13 +1272,13 @@ def gallery_command(
     date_after: datetime | None,
     post_limit: int | None,
     retries: int,
+    http_timeout: int,
     rate_limit: str,
     url: str,
 ) -> list[str]:
     command = [
         sys.executable,
-        "-m",
-        "gallery_dl",
+        str(repo_dir / "scripts" / "gallery_dl_x_runner.py"),
         "--config-ignore",
         "-c",
         str(repo_dir / "gallery-dl.conf"),
@@ -1002,7 +1287,7 @@ def gallery_command(
         "--no-input",
         "--no-colors",
         "--http-timeout",
-        "60",
+        str(http_timeout),
         "--sleep-retries",
         "30-60",
         "--sleep-429",
@@ -1046,6 +1331,10 @@ def archive_endpoint(
     archived_at: str,
     date_after: datetime | None,
     cursor: str | None,
+    target_url: str | None = None,
+    retries: int | None = None,
+    http_timeout: int | None = None,
+    include_reposts: bool | None = None,
 ) -> dict[str, Any]:
     raw_partial = run_dir / "raw" / f"{endpoint}.posts.jsonl.partial"
     config_path = run_dir / f"{endpoint}.gallery-dl.json"
@@ -1061,38 +1350,108 @@ def archive_endpoint(
         request_delay=args.request_delay,
         download_delay=args.download_delay,
         extractor_delay=args.extractor_delay,
-        include_reposts=not args.no_reposts,
+        include_reposts=(
+            not args.no_reposts
+            if include_reposts is None
+            else include_reposts
+        ),
         checksums=not args.no_checksums,
         cursor=cursor,
     )
     atomic_write_json(config_path, config)
     config_hash = sha256_file(config_path)
-    url = endpoint_url(handle, endpoint)
+    url = target_url or endpoint_url(handle, endpoint)
     command = gallery_command(
         repo_dir,
         config_path,
         date_after=date_after if endpoint == "timeline" else None,
         post_limit=args.post_limit if endpoint == "timeline" else None,
-        retries=args.retries,
+        retries=args.retries if retries is None else retries,
+        http_timeout=(
+            args.http_timeout if http_timeout is None else http_timeout
+        ),
         rate_limit=args.rate_limit,
         url=url,
     )
     print(f"Archiving {handle}: {endpoint} ({url})")
-    status, resume_cursor, duration, interrupted = run_gallery_dl(
-        command, run_dir / f"{endpoint}.log", f"{handle}:{endpoint}"
+    (
+        status,
+        resume_cursor,
+        duration,
+        interrupted,
+        failed_downloads,
+        other_error_count,
+        stalled,
+        stalled_cycles,
+    ) = run_gallery_dl(
+        command,
+        run_dir / f"{endpoint}.log",
+        f"{handle}:{endpoint}",
+        progress_path=raw_partial if endpoint == "timeline" else None,
+        stalled_rate_limit_cycles=(
+            getattr(args, "stalled_rate_limit_cycles", 3)
+            if endpoint == "timeline"
+            else 0
+        ),
     )
-    raw_path = finalize_raw_file(raw_partial, status == 0 and not interrupted)
+    synthetic_cursor = False
+    if stalled:
+        derived_cursor = synthetic_search_cursor(raw_partial)
+        stage_three_boundary = bool(
+            resume_cursor
+            and resume_cursor.startswith("3_")
+            and not resume_cursor.partition("/")[2]
+        )
+        if not resume_cursor:
+            resume_cursor = derived_cursor or cursor
+            synthetic_cursor = bool(derived_cursor)
+        elif stage_three_boundary and derived_cursor:
+            selected = prefer_advanced_search_cursor(
+                resume_cursor, derived_cursor
+            )
+            synthetic_cursor = selected == derived_cursor and (
+                selected != resume_cursor
+            )
+            resume_cursor = selected
+    metadata_complete = gallery_metadata_complete(
+        status,
+        resume_cursor,
+        interrupted,
+        failed_downloads,
+        other_error_count,
+    )
+    if stalled:
+        metadata_complete = False
+    raw_has_record = jsonl_has_record(raw_partial)
+    if status != 0 and metadata_complete and not raw_has_record:
+        metadata_complete = False
+    raw_path = finalize_raw_file(raw_partial, metadata_complete)
+    if interrupted:
+        endpoint_status = "interrupted"
+    elif stalled:
+        endpoint_status = "stalled"
+    elif status == 0:
+        endpoint_status = "success"
+    elif metadata_complete:
+        endpoint_status = "media_partial"
+    else:
+        endpoint_status = "failed"
     return {
         "endpoint": endpoint,
         "url": url,
-        "status": (
-            "interrupted" if interrupted else "success" if status == 0 else "failed"
-        ),
+        "status": endpoint_status,
         "exit_code": status,
         "exit_reasons": decode_exit_status(status),
         "duration_seconds": round(duration, 3),
         "resume_cursor": resume_cursor,
         "interrupted": interrupted,
+        "stalled": stalled,
+        "stalled_rate_limit_cycles": stalled_cycles,
+        "synthetic_resume_cursor": synthetic_cursor,
+        "metadata_complete": metadata_complete,
+        "failed_downloads": failed_downloads,
+        "other_error_count": other_error_count,
+        "raw_has_record": raw_has_record,
         "raw_path": str(raw_path.relative_to(user_dir)),
         "config_path": str(config_path.relative_to(user_dir)),
         "config_sha256": config_hash,
@@ -1141,6 +1500,352 @@ def select_timeline_state(
     return cursor, chain_started_at, date_after
 
 
+def update_timeline_state(
+    state: dict[str, Any],
+    *,
+    limited_run: bool,
+    metadata_complete: bool,
+    resume_cursor: str | None,
+    handle: str,
+    chain_started_at: str,
+    date_after: datetime | None,
+    observed_at: str,
+) -> None:
+    """Commit crawl progress without discarding an older safe checkpoint."""
+    if limited_run:
+        # A smoke test must not advance or replace production crawl state.
+        return
+    if metadata_complete:
+        state.update(
+            {
+                "schema": SCHEMA_NAME,
+                "schema_version": SCHEMA_VERSION,
+                "requested_handle": handle,
+                "last_successful_started_at": chain_started_at,
+                "last_successful_completed_at": observed_at,
+                "resume": None,
+            }
+        )
+    elif resume_cursor:
+        state.update(
+            {
+                "schema": SCHEMA_NAME,
+                "schema_version": SCHEMA_VERSION,
+                "requested_handle": handle,
+                "resume": {
+                    "cursor": resume_cursor,
+                    "started_at": chain_started_at,
+                    "date_after": iso_utc(date_after) if date_after else None,
+                    "saved_at": observed_at,
+                },
+            }
+        )
+    # A failure before the first new checkpoint is not evidence that an
+    # existing cursor is invalid.  Preserve it rather than forcing a restart.
+
+
+def merge_pending_media(
+    state: dict[str, Any],
+    failures: Iterable[dict[str, Any]],
+    *,
+    source_run_id: str,
+    observed_at: str,
+) -> None:
+    current = state.get("pending_media")
+    records = current if isinstance(current, list) else []
+    by_filename = {
+        str(record.get("filename")): record.copy()
+        for record in records
+        if isinstance(record, dict) and record.get("filename")
+    }
+    for failure in failures:
+        filename = Path(str(failure.get("filename") or "")).name
+        if not filename:
+            continue
+        record = by_filename.get(filename, {})
+        previous_source = record.get("last_source_run_id")
+        record.update(
+            {
+                "filename": filename,
+                "post_id": id_string(failure.get("post_id")),
+                "media_number": failure.get("media_number"),
+                "source_url": (
+                    f"https://x.com/i/web/status/{failure.get('post_id')}"
+                    if failure.get("post_id")
+                    else None
+                ),
+                "first_failed_at": record.get("first_failed_at") or observed_at,
+                "last_failed_at": observed_at,
+                "last_source_run_id": source_run_id,
+                "attempts": int(record.get("attempts") or 0)
+                + (0 if previous_source == source_run_id else 1),
+            }
+        )
+        by_filename[filename] = record
+    state["pending_media"] = sorted(
+        by_filename.values(), key=lambda record: record["filename"]
+    )
+
+
+def pending_media_is_complete(user_dir: Path, record: dict[str, Any]) -> bool:
+    def asset_is_complete(path: Path) -> bool:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        sidecar = Path(str(path) + ".json")
+        return (
+            sidecar.is_file()
+            and sidecar.stat().st_size > 0
+            and isinstance(load_json(sidecar, None), dict)
+        )
+
+    media_root = user_dir / "media"
+    filename = Path(str(record.get("filename") or "")).name
+    if filename and any(asset_is_complete(path) for path in media_root.rglob(filename)):
+        return True
+    post_id = id_string(record.get("post_id"))
+    media_number = record.get("media_number")
+    if not post_id or not media_number:
+        return False
+    pattern = f"*_{post_id}_{media_number}_*"
+    return any(asset_is_complete(path) for path in media_root.rglob(pattern))
+
+
+def prune_completed_pending_media(
+    state: dict[str, Any], user_dir: Path
+) -> list[dict[str, Any]]:
+    current = state.get("pending_media")
+    records = current if isinstance(current, list) else []
+    remaining = [
+        record
+        for record in records
+        if isinstance(record, dict)
+        and not pending_media_is_complete(user_dir, record)
+    ]
+    state["pending_media"] = remaining
+    return remaining
+
+
+def recover_download_only_runs(
+    state: dict[str, Any], user_dir: Path
+) -> list[str]:
+    """Migrate older runs whose timeline ended but one asset failed."""
+    recovered_value = state.get("recovered_download_only_runs")
+    recovered = set(recovered_value if isinstance(recovered_value, list) else ())
+    newly_recovered: list[str] = []
+    for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
+        manifest = load_json(manifest_path, {})
+        if not isinstance(manifest, dict) or manifest.get("limited_run"):
+            continue
+        completed_value = str(manifest.get("completed_at") or "")
+        if manifest.get("status") not in {"failed", "partial"} or not completed_value:
+            # Endpoint results are checkpointed into a still-running manifest
+            # before derived datasets are rebuilt.  Such a provisional run is
+            # not proof that the timeline can be advanced safely.
+            continue
+        try:
+            parse_datetime(completed_value)
+        except argparse.ArgumentTypeError:
+            continue
+        run_id_value = str(manifest.get("run_id") or manifest_path.parent.name)
+        if run_id_value in recovered:
+            continue
+        timeline = next(
+            (
+                endpoint
+                for endpoint in manifest.get("endpoints", ())
+                if isinstance(endpoint, dict)
+                and endpoint.get("endpoint") == "timeline"
+            ),
+            None,
+        )
+        if not timeline or timeline.get("interrupted"):
+            continue
+        if timeline.get("exit_code") != 4 or timeline.get("resume_cursor"):
+            continue
+        raw_relative = timeline.get("raw_path")
+        raw_path = user_dir / str(raw_relative) if raw_relative else None
+        if not raw_path or not jsonl_has_record(raw_path):
+            continue
+        failures, other_error_count = analyze_gallery_log(
+            manifest_path.parent / "timeline.log"
+        )
+        if not gallery_metadata_complete(
+            4, None, False, failures, other_error_count
+        ):
+            continue
+
+        observed_at = completed_value
+        merge_pending_media(
+            state,
+            failures,
+            source_run_id=run_id_value,
+            observed_at=observed_at,
+        )
+        started_at = str(manifest.get("started_at") or "")
+        previous = str(state.get("last_successful_started_at") or "")
+        resume = state.get("resume") if isinstance(state.get("resume"), dict) else None
+        resume_started = str(resume.get("started_at") or "") if resume else ""
+        if started_at and started_at >= previous and resume_started <= started_at:
+            state["last_successful_started_at"] = started_at
+            state["last_successful_completed_at"] = observed_at
+            state["resume"] = None
+        recovered.add(run_id_value)
+        newly_recovered.append(run_id_value)
+
+    state["recovered_download_only_runs"] = sorted(recovered)
+    prune_completed_pending_media(state, user_dir)
+    return newly_recovered
+
+
+def finalize_abandoned_manifests(
+    user_dir: Path, *, recovered_at: str
+) -> list[str]:
+    """Close stale running manifests after the global archive lock is held."""
+    finalized: list[str] = []
+    for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
+        manifest = load_json(manifest_path, {})
+        if not isinstance(manifest, dict) or manifest.get("status") != "running":
+            continue
+        run_id_value = str(manifest.get("run_id") or manifest_path.parent.name)
+        manifest["status"] = "interrupted"
+        manifest["failure_stage"] = "process_ended_before_manifest_finalization"
+        manifest["completed_at"] = recovered_at
+        manifest["finalized_on_later_startup"] = True
+        atomic_write_json(manifest_path, manifest)
+        finalized.append(run_id_value)
+    return finalized
+
+
+def trailing_rate_limit_waits(path: Path) -> int:
+    try:
+        lines = path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return 0
+    count = 0
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped or stripped == "KeyboardInterrupt":
+            continue
+        if CHECKPOINT_CURSOR_RE.search(line):
+            continue
+        if RATE_LIMIT_WAIT_RE.search(line):
+            count += 1
+            continue
+        break
+    return count
+
+
+def recover_stalled_interrupted_runs(
+    state: dict[str, Any],
+    user_dir: Path,
+    *,
+    minimum_waits: int,
+) -> list[str]:
+    """Recover a search-stage cursor when gallery-dl omitted one on SIGINT."""
+    recovered_value = state.get("recovered_stalled_runs")
+    recovered = set(recovered_value if isinstance(recovered_value, list) else ())
+    newly_recovered: list[str] = []
+    candidates: list[tuple[str, dict[str, Any]]] = []
+
+    for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
+        manifest = load_json(manifest_path, {})
+        if not isinstance(manifest, dict) or manifest.get("limited_run"):
+            continue
+        run_id_value = str(manifest.get("run_id") or manifest_path.parent.name)
+        if run_id_value in recovered:
+            continue
+        timeline = next(
+            (
+                endpoint
+                for endpoint in manifest.get("endpoints", ())
+                if isinstance(endpoint, dict)
+                and endpoint.get("endpoint") == "timeline"
+            ),
+            None,
+        )
+        if not timeline:
+            continue
+        stalled = bool(timeline.get("stalled"))
+        interrupted = bool(timeline.get("interrupted"))
+        if not stalled and not interrupted:
+            continue
+
+        raw_relative = timeline.get("raw_path")
+        raw_path = user_dir / str(raw_relative) if raw_relative else None
+        if not raw_path or not jsonl_has_record(raw_path):
+            continue
+
+        try:
+            completed_at = parse_datetime(str(manifest.get("completed_at") or ""))
+        except argparse.ArgumentTypeError:
+            continue
+        raw_modified_at = datetime.fromtimestamp(
+            raw_path.stat().st_mtime, tz=timezone.utc
+        )
+        if completed_at - raw_modified_at < timedelta(
+            minutes=10 * minimum_waits
+        ):
+            continue
+
+        cursor = timeline.get("resume_cursor")
+        wait_count = trailing_rate_limit_waits(
+            manifest_path.parent / "timeline.log"
+        )
+        synthetic = False
+        if not cursor:
+            if wait_count < minimum_waits:
+                continue
+            cursor = synthetic_search_cursor(raw_path)
+            synthetic = bool(cursor)
+        if not cursor:
+            continue
+
+        observed_at = str(
+            manifest.get("completed_at")
+            or manifest.get("started_at")
+            or iso_utc(utc_now())
+        )
+        failures, _ = analyze_gallery_log(
+            manifest_path.parent / "timeline.log"
+        )
+        merge_pending_media(
+            state,
+            failures,
+            source_run_id=run_id_value,
+            observed_at=observed_at,
+        )
+        candidates.append(
+            (
+                str(manifest.get("started_at") or ""),
+                {
+                    "cursor": str(cursor),
+                    "started_at": str(manifest.get("started_at") or observed_at),
+                    "date_after": manifest.get("date_after"),
+                    "saved_at": observed_at,
+                    "source_run_id": run_id_value,
+                    "synthetic": synthetic,
+                    "stalled_rate_limit_cycles": wait_count,
+                },
+            )
+        )
+        recovered.add(run_id_value)
+        newly_recovered.append(run_id_value)
+
+    if candidates:
+        candidate_started, candidate = max(candidates, key=lambda item: item[0])
+        successful_started = str(state.get("last_successful_started_at") or "")
+        current = state.get("resume") if isinstance(state.get("resume"), dict) else None
+        current_started = str(current.get("started_at") or "") if current else ""
+        if candidate_started >= successful_started and candidate_started >= current_started:
+            state["resume"] = candidate
+
+    state["recovered_stalled_runs"] = sorted(recovered)
+    prune_completed_pending_media(state, user_dir)
+    return newly_recovered
+
+
 def archive_user(
     args: argparse.Namespace,
     repo_dir: Path,
@@ -1161,6 +1866,32 @@ def archive_user(
     state = load_json(state_path, {})
     if not isinstance(state, dict):
         state = {}
+    finalized_abandoned_runs = finalize_abandoned_manifests(
+        user_dir, recovered_at=iso_utc(started)
+    )
+    if finalized_abandoned_runs:
+        print(
+            f"Finalized abandoned run manifest(s) for @{handle}: "
+            f"{', '.join(finalized_abandoned_runs)}"
+        )
+    recovered_stalled_runs = recover_stalled_interrupted_runs(
+        state,
+        user_dir,
+        minimum_waits=getattr(args, "stalled_rate_limit_cycles", 3),
+    )
+    recovered_runs = recover_download_only_runs(state, user_dir)
+    if recovered_stalled_runs or recovered_runs:
+        atomic_write_json(state_path, state)
+    if recovered_stalled_runs:
+        print(
+            f"Recovered resumable search state for @{handle} from stalled "
+            f"run(s): {', '.join(recovered_stalled_runs)}"
+        )
+    if recovered_runs:
+        print(
+            f"Recovered completed timeline state for @{handle} from "
+            f"download-only run(s): {', '.join(recovered_runs)}"
+        )
     cursor, chain_started_at, date_after = select_timeline_state(
         args, state, started
     )
@@ -1188,6 +1919,10 @@ def archive_user(
         "date_after": iso_utc(date_after) if date_after else None,
         "resumed_from_cursor": cursor,
         "limited_run": bool(args.post_limit),
+        "retry_failed_only": bool(args.retry_failed_only),
+        "finalized_abandoned_runs": finalized_abandoned_runs,
+        "recovered_stalled_runs": recovered_stalled_runs,
+        "recovered_download_only_runs": recovered_runs,
         "endpoints": [],
     }
     manifest_path = run_dir / "manifest.json"
@@ -1209,6 +1944,7 @@ def archive_user(
         cursor=None,
     )
     manifest["endpoints"].append(info_result)
+    atomic_write_json(manifest_path, manifest)
     info_raw = user_dir / info_result["raw_path"]
     if info_result.get("interrupted") or info_result["exit_code"] != 0:
         manifest["status"] = (
@@ -1253,6 +1989,84 @@ def archive_user(
         user_dir, handle, info_raw, iso_utc(started)
     )
 
+    pending_before = prune_completed_pending_media(state, user_dir)
+    retried_post_ids: list[str] = []
+    if pending_before:
+        retry_post_ids = sorted(
+            {
+                str(record["post_id"])
+                for record in pending_before
+                if record.get("post_id")
+            }
+        )
+        for post_id in retry_post_ids:
+            try:
+                sleep_random(
+                    args.endpoint_delay,
+                    f"before {handle}:retry-media-{post_id}",
+                )
+            except KeyboardInterrupt:
+                manifest["status"] = "interrupted"
+                manifest["completed_at"] = iso_utc(utc_now())
+                atomic_write_json(manifest_path, manifest)
+                raise
+            result = archive_endpoint(
+                args=args,
+                repo_dir=repo_dir,
+                archive_root=archive_root,
+                user_dir=user_dir,
+                handle=handle,
+                endpoint=f"retry-media-{post_id}",
+                run_dir=run_dir,
+                archive_run_id=current_run_id,
+                archived_at=iso_utc(started),
+                date_after=None,
+                cursor=None,
+                target_url=f"https://x.com/{handle}/status/{post_id}",
+                retries=max(args.retries, args.media_retries),
+                http_timeout=max(args.http_timeout, args.media_timeout),
+                # A queued failure may itself be a repost. Recovery must not
+                # silently skip it merely because a later invocation chooses
+                # --no-reposts for new timeline material.
+                include_reposts=True,
+            )
+            manifest["endpoints"].append(result)
+            atomic_write_json(manifest_path, manifest)
+            retried_post_ids.append(post_id)
+            if result.get("failed_downloads"):
+                merge_pending_media(
+                    state,
+                    result["failed_downloads"],
+                    source_run_id=current_run_id,
+                    observed_at=iso_utc(utc_now()),
+                )
+            prune_completed_pending_media(state, user_dir)
+            atomic_write_json(state_path, state)
+            if result.get("interrupted"):
+                manifest["status"] = "interrupted"
+                manifest["media_dataset"] = update_media_dataset(
+                    user_dir, handle
+                )
+                manifest["completed_at"] = iso_utc(utc_now())
+                atomic_write_json(manifest_path, manifest)
+                raise KeyboardInterrupt
+
+    remaining_pending = prune_completed_pending_media(state, user_dir)
+    manifest["media_recovery"] = {
+        "pending_before": len(pending_before),
+        "retried_post_ids": retried_post_ids,
+        "pending_after": len(remaining_pending),
+    }
+    atomic_write_json(state_path, state)
+
+    if args.retry_failed_only:
+        manifest["media_dataset"] = update_media_dataset(user_dir, handle)
+        manifest["pending_media"] = remaining_pending
+        manifest["status"] = "success" if not remaining_pending else "partial"
+        manifest["completed_at"] = iso_utc(utc_now())
+        atomic_write_json(manifest_path, manifest)
+        return manifest
+
     try:
         sleep_random(args.endpoint_delay, f"before {handle}:timeline")
     except KeyboardInterrupt:
@@ -1275,54 +2089,54 @@ def archive_user(
         cursor=cursor,
     )
     manifest["endpoints"].append(timeline_result)
+    atomic_write_json(manifest_path, manifest)
     timeline_raw = user_dir / timeline_result["raw_path"]
+    timeline_complete = bool(
+        timeline_result.get("metadata_complete")
+        and not timeline_result.get("interrupted")
+    )
+    if timeline_result.get("failed_downloads"):
+        merge_pending_media(
+            state,
+            timeline_result["failed_downloads"],
+            source_run_id=current_run_id,
+            observed_at=iso_utc(utc_now()),
+        )
+    if timeline_result.get("status") == "media_partial":
+        processed = state.get("recovered_download_only_runs")
+        processed_runs = set(processed if isinstance(processed, list) else ())
+        processed_runs.add(current_run_id)
+        state["recovered_download_only_runs"] = sorted(processed_runs)
+    prune_completed_pending_media(state, user_dir)
+
     manifest["post_dataset"] = update_post_dataset(
         user_dir, handle, timeline_raw, "timeline"
     )
     manifest["media_dataset"] = update_media_dataset(user_dir, handle)
 
-    timeline_ok = (
-        timeline_result["exit_code"] == 0
-        and not timeline_result.get("interrupted")
+    # Advance crawl state only after raw records have been merged into the
+    # derived datasets.  A crash before here retains the prior cursor and
+    # safely replays this page instead of skipping records in posts.jsonl.
+    update_timeline_state(
+        state,
+        limited_run=bool(args.post_limit),
+        metadata_complete=timeline_complete,
+        resume_cursor=timeline_result.get("resume_cursor"),
+        handle=handle,
+        chain_started_at=chain_started_at,
+        date_after=date_after,
+        observed_at=iso_utc(utc_now()),
     )
-    if args.post_limit:
-        # A smoke test must not advance or replace production crawl state.
-        pass
-    elif timeline_ok:
-        state.update(
-            {
-                "schema": SCHEMA_NAME,
-                "schema_version": SCHEMA_VERSION,
-                "requested_handle": handle,
-                "last_successful_started_at": chain_started_at,
-                "last_successful_completed_at": iso_utc(utc_now()),
-                "resume": None,
-            }
-        )
-    elif not timeline_ok and timeline_result.get("resume_cursor"):
-        state.update(
-            {
-                "schema": SCHEMA_NAME,
-                "schema_version": SCHEMA_VERSION,
-                "requested_handle": handle,
-                "resume": {
-                    "cursor": timeline_result["resume_cursor"],
-                    "started_at": chain_started_at,
-                    "date_after": (
-                        iso_utc(date_after) if date_after else None
-                    ),
-                    "saved_at": iso_utc(utc_now()),
-                },
-            }
-        )
-    elif not timeline_ok:
-        state["resume"] = None
     atomic_write_json(state_path, state)
 
-    if not timeline_ok:
-        manifest["status"] = (
-            "interrupted" if timeline_result.get("interrupted") else "failed"
-        )
+    if not timeline_complete:
+        if timeline_result.get("interrupted"):
+            manifest["status"] = "interrupted"
+        elif timeline_result.get("stalled"):
+            manifest["status"] = "stalled"
+            manifest["failure_stage"] = "timeline_no_progress_watchdog"
+        else:
+            manifest["status"] = "failed"
         manifest["completed_at"] = iso_utc(utc_now())
         atomic_write_json(manifest_path, manifest)
         if timeline_result.get("interrupted"):
@@ -1332,6 +2146,7 @@ def archive_user(
     if args.post_limit:
         manifest["status"] = "limited"
     else:
+        profile_partial = False
         for endpoint in ("avatar", "background"):
             try:
                 sleep_random(args.endpoint_delay, f"before {handle}:{endpoint}")
@@ -1357,6 +2172,7 @@ def archive_user(
                 cursor=None,
             )
             manifest["endpoints"].append(result)
+            atomic_write_json(manifest_path, manifest)
             if result.get("interrupted"):
                 manifest["status"] = "interrupted"
                 manifest["media_dataset"] = update_media_dataset(
@@ -1366,12 +2182,17 @@ def archive_user(
                 atomic_write_json(manifest_path, manifest)
                 raise KeyboardInterrupt
             if result["exit_code"] != 0:
-                manifest["status"] = "partial"
+                profile_partial = True
                 break
-        else:
-            manifest["status"] = "success"
+        remaining_pending = prune_completed_pending_media(state, user_dir)
+        manifest["pending_media"] = remaining_pending
+        manifest["status"] = (
+            "partial" if profile_partial or remaining_pending else "success"
+        )
 
     manifest["media_dataset"] = update_media_dataset(user_dir, handle)
+    manifest["pending_media"] = prune_completed_pending_media(state, user_dir)
+    atomic_write_json(state_path, state)
     manifest["completed_at"] = iso_utc(utc_now())
     atomic_write_json(manifest_path, manifest)
     return manifest
@@ -1390,9 +2211,17 @@ def dry_run_summary(
         print("note: the real run will require Bibliotheque mounted read-write")
     print(f"cookie file: {args.cookies} (values not displayed)")
     print(f"users ({len(targets)}): {', '.join(targets)}")
-    print("main endpoint: /USER/timeline (with replies + older search backfill)")
     print("identity/profile endpoint first: info (stable user-ID guard)")
-    print("profile media endpoints after timeline: avatar, background")
+    if args.retry_failed_only:
+        print("mode: retry recorded incomplete media; no timeline crawl")
+        print(
+            "failed-media recovery: "
+            f"{max(args.retries, args.media_retries)} retries, "
+            f"{max(args.http_timeout, args.media_timeout)}s inactivity timeout"
+        )
+    else:
+        print("main endpoint: /USER/timeline (with replies + older search backfill)")
+        print("profile media endpoints after timeline: avatar, background")
     print(f"reposts: {'included and labeled' if not args.no_reposts else 'excluded'}")
     print("quoted-source media: excluded")
     print("non-repost reply-thread context: excluded by numeric author ID")
@@ -1400,6 +2229,10 @@ def dry_run_summary(
         print("repost attribution: best effort where X omits wrapper-author identity")
     print(f"request delay: {args.request_delay}s")
     print(f"download delay: {args.download_delay}s")
+    print(
+        "no-progress watchdog: stop after "
+        f"{args.stalled_rate_limit_cycles} unchanged rate-limit windows"
+    )
     print(f"between users: {args.user_delay}s")
     if args.post_limit:
         print(f"post limit: {args.post_limit} (state will not mark a complete crawl)")
@@ -1465,6 +2298,15 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
         help="smoke-test limit; limited runs are never marked complete",
     )
     parser.add_argument(
+        "--stalled-rate-limit-cycles",
+        type=positive_int,
+        default=3,
+        help=(
+            "stop and checkpoint a timeline after this many consecutive "
+            "X rate-limit windows without new raw metadata (default: 3)"
+        ),
+    )
+    parser.add_argument(
         "--request-delay",
         type=duration_arg,
         default="4-8",
@@ -1501,6 +2343,24 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
         help="general HTTP retries (default: 1)",
     )
     parser.add_argument(
+        "--http-timeout",
+        type=positive_int,
+        default=60,
+        help="normal HTTP inactivity timeout in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--media-retries",
+        type=positive_int,
+        default=8,
+        help="retries for previously failed media assets (default: 8)",
+    )
+    parser.add_argument(
+        "--media-timeout",
+        type=positive_int,
+        default=300,
+        help="inactivity timeout for failed-media recovery (default: 300)",
+    )
+    parser.add_argument(
         "--rate-limit",
         default="8M",
         help="asset download bandwidth limit (default: 8M)",
@@ -1514,6 +2374,14 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
         "--keep-going",
         action="store_true",
         help="continue to the next user after a failed/partial user run",
+    )
+    parser.add_argument(
+        "--retry-failed-only",
+        action="store_true",
+        help=(
+            "retry recorded incomplete media without crawling the timeline; "
+            "completed download-only runs are recovered automatically"
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -1530,6 +2398,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.full_rescan and args.since is not None:
         parser.error("--full-rescan and --since cannot be used together")
+    if args.retry_failed_only and (
+        args.full_rescan or args.since is not None or args.post_limit
+    ):
+        parser.error(
+            "--retry-failed-only cannot be combined with --full-rescan, "
+            "--since, or --post-limit"
+        )
     args.cookies = args.cookies.expanduser().resolve()
     if args.input_file is not None:
         args.input_file = args.input_file.expanduser().resolve()
@@ -1539,6 +2414,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_cookie_file(args.cookies)
         archive_root = resolve_output_root(args.output_root, plan_only=args.dry_run)
         version = gallery_dl_version()
+        verify_gallery_dl_x_runner(repo_dir, version)
         if args.dry_run:
             dry_run_summary(args, archive_root, targets, version)
             return 0
