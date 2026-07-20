@@ -420,6 +420,37 @@ def load_json(path: Path, default: Any) -> Any:
         return default
 
 
+def repair_resume_cursor(
+    state_path: Path,
+    *,
+    expected_cursor: str,
+    replacement_cursor: str,
+    source_run_id: str,
+    repaired_at: str,
+) -> dict[str, Any]:
+    """Atomically apply an operator-approved cursor repair with a stale guard."""
+    state = load_json(state_path, {})
+    resume = state.get("resume") if isinstance(state, dict) else None
+    current = resume.get("cursor") if isinstance(resume, dict) else None
+    if current != expected_cursor:
+        raise ArchiveError(
+            "resume cursor changed before repair: "
+            f"expected {expected_cursor}, found {current or 'none'}"
+        )
+    repaired = dict(resume)
+    repaired.update(
+        {
+            "cursor": replacement_cursor,
+            "saved_at": repaired_at,
+            "source_run_id": source_run_id,
+            "operator_repaired_from_cursor": expected_cursor,
+        }
+    )
+    state["resume"] = repaired
+    atomic_write_json(state_path, state)
+    return repaired
+
+
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     try:
         file = path.open("r", encoding="utf-8")
@@ -840,6 +871,9 @@ This directory is a derived, portable view of immutable run snapshots.
 - `reposts.jsonl`: reposts, retaining the original author.
 - `media.jsonl`: local asset paths, source metadata, and SHA-256 digests.
 - `profile.json`: latest captured profile metadata.
+- `context-posts.jsonl`: optional captured reply ancestors.
+- `reply-edges.jsonl`: optional child-to-parent graph and boundary states.
+- `context-status.json`: optional queue, closure, pacing, and media summary.
 
 `posted_at` is the target account's timeline-event timestamp. For a repost,
 `reposted_at` is that event time and `original_posted_at` is the original
@@ -847,6 +881,11 @@ author's post time. `first_captured_at` and `last_captured_at` describe archive
 observations. Engagement metrics are point-in-time values, not historical
 totals. Raw per-run JSONL and logs live under `../runs/` and remain the source
 of truth.
+
+Reply context is ancestor-only and opt-in. It excludes sibling replies,
+descendants, whole-conversation expansion, and quoted sources. Context state is
+durable in `../_state/context.sqlite3`; use
+`scripts/archive-x-context --user HANDLE export` to rebuild these views.
 """
     path.write_text(text, encoding="utf-8")
     os.chmod(path, 0o600)
@@ -1206,11 +1245,13 @@ def run_gallery_dl(
         finally:
             log.flush()
             process.stdout.close()
-    if stalled or interrupted:
-        # A checkpoint can be newer than gallery-dl's SIGINT cursor, but an
-        # earlier checkpoint can also predate several successful pages before
-        # a sequence of real HTTP 429 responses.  Compare search progress and
-        # keep whichever boundary is demonstrably farther along.
+    if stalled or interrupted or (status != 0 and other_error_count):
+        # A checkpoint can be newer than gallery-dl's final cursor after a
+        # SIGINT or extraction failure, but an earlier checkpoint can also
+        # predate several successful pages before a sequence of real HTTP 429
+        # responses.  Compare search progress and keep whichever boundary is
+        # demonstrably farther along.  Do not promote a checkpoint merely for
+        # a download-only failure: metadata enumeration may have completed.
         resume_cursor = prefer_advanced_search_cursor(
             resume_cursor, checkpoint_cursor
         )
@@ -2129,6 +2170,51 @@ def archive_user(
     )
     atomic_write_json(state_path, state)
 
+    # This is local graph discovery only.  It deliberately runs after both the
+    # dataset merge and timeline-state commit, and its result is reported on a
+    # separate manifest field so it has no authority over the timeline cursor
+    # or endpoint status.
+    if getattr(args, "seed_reply_context", False) and not timeline_result.get(
+        "interrupted"
+    ):
+        command = [
+            sys.executable,
+            str(repo_dir / "scripts" / "archive_x_context.py"),
+            "--user",
+            handle,
+            "--output-root",
+            str(archive_root),
+            "seed",
+            "--raw-path",
+            str(timeline_raw),
+        ]
+        try:
+            discovery = subprocess.run(
+                command,
+                cwd=repo_dir,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        except KeyboardInterrupt:
+            manifest["status"] = "interrupted"
+            manifest["reply_context_discovery"] = {
+                "status": "interrupted",
+                "timeline_state_committed": True,
+            }
+            manifest["completed_at"] = iso_utc(utc_now())
+            atomic_write_json(manifest_path, manifest)
+            raise
+        manifest["reply_context_discovery"] = {
+            "status": "success" if discovery.returncode == 0 else "failed",
+            "exit_code": discovery.returncode,
+            "timeline_state_committed": True,
+            "network_requests": 0,
+            "output": discovery.stdout[-4000:],
+        }
+        atomic_write_json(manifest_path, manifest)
+
     if not timeline_complete:
         if timeline_result.get("interrupted"):
             manifest["status"] = "interrupted"
@@ -2222,6 +2308,10 @@ def dry_run_summary(
     else:
         print("main endpoint: /USER/timeline (with replies + older search backfill)")
         print("profile media endpoints after timeline: avatar, background")
+        print(
+            "reply-context discovery after durable timeline merge: "
+            f"{'enabled (no context requests)' if args.seed_reply_context else 'disabled'}"
+        )
     print(f"reposts: {'included and labeled' if not args.no_reposts else 'excluded'}")
     print("quoted-source media: excluded")
     print("non-repost reply-thread context: excluded by numeric author ID")
@@ -2381,6 +2471,14 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
         help=(
             "retry recorded incomplete media without crawling the timeline; "
             "completed download-only runs are recovered automatically"
+        ),
+    )
+    parser.add_argument(
+        "--seed-reply-context",
+        action="store_true",
+        help=(
+            "after each durable timeline merge, discover reply-parent work "
+            "locally without launching context network requests"
         ),
     )
     parser.add_argument(

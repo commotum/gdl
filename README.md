@@ -128,13 +128,65 @@ still return non-monotonic thread modules. Periodic `--full-rescan` runs are
 the maximum-completeness option; gallery-dl and X themselves can still impose
 historical visibility limits.
 
+### Reply-context ancestors
+
+The timeline archive intentionally saves a reply itself without automatically
+fetching the post it answers. The separate context resolver can fill that gap
+without expanding an entire conversation. It follows only the immediate
+parent, then that parent's parent, until a root or an explicit unavailable
+boundary is reached. It never fetches siblings, descendants, quoted sources,
+or “show more” conversation expansions.
+
+Start with a read-only, network-free inventory:
+
+```bash
+scripts/archive-x-context --user USER seed --dry-run
+```
+
+Create or update the private SQLite queue from existing raw timeline files,
+then inspect it:
+
+```bash
+scripts/archive-x-context --user USER seed
+scripts/archive-x-context --user USER integrity
+scripts/archive-x-context --user USER status
+```
+
+Resolving is always an explicit bounded action. The worker shares the main
+archive locks, makes one focal-post request at a time, persists its next-safe
+request time, prefers finishing the current ancestor chain, and periodically
+yields to other chains:
+
+```bash
+scripts/archive-x-context --user USER run --max-posts 1
+scripts/archive-x-context --user USER run --max-posts 100
+```
+
+Stopping with Ctrl-C or SIGTERM leaves the current target retryable. Deleted,
+private, suspended, and withheld boundaries are recorded; ambiguous failures
+are retried with bounded backoff and eventually require manual review. Use
+`retry POST_ID...` for an explicit reclassification retry. Rebuild the
+portable views with `export`.
+
+Metadata closure is independent of media. Context media is a separate bounded
+command, verifies SHA-256 sidecars, and refuses to start below 5 GiB free:
+
+```bash
+scripts/archive-x-context --user USER media --max-posts 10
+```
+
+Add `--seed-reply-context` to a normal `scripts/archive-x` invocation to seed
+new local edges only after each timeline merge and cursor commit. This option
+makes no context requests and never launches the historical context backlog.
+The large initial `seed` and all `run`/`media` work remain operator actions.
+
 ### X archive contents
 
 Each account is self-contained under `users/HANDLE/`:
 
 ```text
 users/HANDLE/
-├── _state/                  # per-user media archive DB and resume state
+├── _state/                  # timeline state plus separate context.sqlite3
 ├── media/YYYY/MM/           # original images/videos plus JSON sidecars
 ├── media/profile/           # avatar and header history
 ├── runs/RUN_ID/             # immutable raw JSONL, configs, logs, manifest
@@ -143,6 +195,9 @@ users/HANDLE/
     ├── authored-posts.jsonl # only content authored by HANDLE
     ├── reposts.jsonl        # repost-only view with original author retained
     ├── media.jsonl          # portable local asset index and SHA-256 values
+    ├── context-posts.jsonl  # captured ancestor metadata
+    ├── reply-edges.jsonl    # child-to-parent graph and boundary states
+    ├── context-status.json  # queue, closure, pacing, and media readout
     └── profile.json         # latest observed profile metadata
 ```
 

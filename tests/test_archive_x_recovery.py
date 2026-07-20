@@ -508,6 +508,57 @@ class StallRecoveryTests(unittest.TestCase):
         self.assertEqual(result[0], 0)
         self.assertIsNone(result[1])
 
+    def test_api_failure_prefers_advanced_checkpoint_over_stale_cursor(self):
+        child = (
+            "import sys; "
+            "print('[twitter][info] Archive checkpoint "
+            "cursor=3_1181651824673083392/'); "
+            "print('[twitter][info] Waiting for 2 minutes until 14:20:24 "
+            "(rate limit)'); "
+            "print('[twitter][warning] API errors (1/2):'); "
+            "print(\"- 'Dependency: Unspecified'\"); "
+            "print('[twitter][warning] API errors (2/2):'); "
+            "print(\"- 'Dependency: Unspecified'\"); "
+            "print('[twitter][error] Unable to retrieve Tweets from this "
+            "timeline'); "
+            "print(\"[twitter][info] Use '-o "
+            "cursor=3_1989611863986851957/' to continue downloading from "
+            "the current position\"); "
+            "sys.exit(4)"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = archive_x.run_gallery_dl(
+                [sys.executable, "-c", child],
+                Path(directory) / "timeline.log",
+                "test:timeline",
+            )
+
+        self.assertEqual(result[0], 4)
+        self.assertEqual(result[1], "3_1181651824673083392/")
+        self.assertEqual(result[5], 1)
+        self.assertFalse(result[3])
+        self.assertFalse(result[6])
+
+    def test_download_only_failure_does_not_promote_checkpoint(self):
+        child = (
+            "import sys; "
+            "print('[twitter][info] Archive checkpoint cursor=3_50/'); "
+            "print('[download][error] Failed to download "
+            "2020-05-22T17-05-54_1263878765400125440_1_visakanv.mp4'); "
+            "sys.exit(4)"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = archive_x.run_gallery_dl(
+                [sys.executable, "-c", child],
+                Path(directory) / "timeline.log",
+                "test:timeline",
+            )
+
+        self.assertEqual(result[0], 4)
+        self.assertIsNone(result[1])
+        self.assertEqual(len(result[4]), 1)
+        self.assertEqual(result[5], 0)
+
     def test_watchdog_prefers_checkpoint_over_stale_sigint_cursor(self):
         child = (
             "import signal,sys,time; "
@@ -871,6 +922,45 @@ class RunnerPreflightTests(unittest.TestCase):
 
 
 class TimelineStateTests(unittest.TestCase):
+    def test_operator_cursor_repair_is_atomic_and_stale_guarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "resume": {
+                            "cursor": "3_100/",
+                            "started_at": "2026-07-16T00:00:00Z",
+                        },
+                        "unrelated": "preserved",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repaired = archive_x.repair_resume_cursor(
+                state_path,
+                expected_cursor="3_100/",
+                replacement_cursor="3_50/",
+                source_run_id="interrupted-run",
+                repaired_at="2026-07-20T00:00:00Z",
+            )
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(repaired["cursor"], "3_50/")
+            self.assertEqual(saved["unrelated"], "preserved")
+            self.assertEqual(
+                saved["resume"]["operator_repaired_from_cursor"], "3_100/"
+            )
+            before = state_path.read_bytes()
+            with self.assertRaises(archive_x.ArchiveError):
+                archive_x.repair_resume_cursor(
+                    state_path,
+                    expected_cursor="3_100/",
+                    replacement_cursor="3_25/",
+                    source_run_id="stale",
+                    repaired_at="later",
+                )
+            self.assertEqual(state_path.read_bytes(), before)
+
     def test_failure_before_first_checkpoint_preserves_existing_resume(self):
         existing = {
             "cursor": "3_100/safe-token",

@@ -114,6 +114,13 @@ class DeferredRateLimitTests(unittest.TestCase):
             getattr(api, runner.DEFERRED_RESPONSE_ATTRIBUTE),
             low,
         )
+        self.assertIn(
+            (
+                "info",
+                "Archive rate-limit reset=1800000000 remaining=0",
+            ),
+            api.events,
+        )
 
     def test_next_call_checkpoints_cursor_then_waits_before_request(self):
         low = FakeResponse(200, {"page": 1}, remaining="0")
@@ -268,6 +275,22 @@ class CompatibilityTests(unittest.TestCase):
                     runner.install_patch()
         finally:
             runner.TwitterAPI._call = original
+
+    def test_rejects_changed_individual_tweet_extractor(self):
+        with mock.patch.object(
+            runner.importlib.metadata,
+            "version",
+            return_value=runner.SUPPORTED_VERSION,
+        ), mock.patch.object(
+            runner,
+            "SUPPORTED_TWEET_EXTRACTOR_SHA256",
+            "unreviewed",
+        ):
+            with self.assertRaisesRegex(
+                runner.ShimCompatibilityError,
+                "individual Tweet extractor does not match",
+            ):
+                runner.require_supported_gallery_dl()
 
 
 if __name__ == "__main__":

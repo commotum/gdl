@@ -2,6 +2,15 @@
 
 Shorthand: `X-CONTEXT`
 
+## Implementation Status (2026-07-19)
+
+Complete and verified. Stages 1 through 10 are recorded in their indexed stage
+files. The final offline suite passes 88 tests; the pinned gallery-dl 1.32.4
+individual-post path passed a one-request disposable live smoke; the production
+dry-run made no writes; and the historical context backlog remains unstarted.
+Visakanv's main timeline was separately repaired to the proven
+`3_1173685814485643265/` cursor and safely resumed in tmux session `x`.
+
 ## Big-Picture Objective
 
 Implement an opt-in, SQLite-backed reply-context subsystem for the existing X
@@ -117,6 +126,15 @@ These facts are a starting snapshot and must be rechecked before implementation:
   `scripts/archive_x.py`, `scripts/gallery_dl_x_runner.py`, and tests. Their
   exact state must be inspected at each stage rather than assumed from this
   snapshot.
+- The Visakanv archive was explicitly stopped on 2026-07-19 while waiting on a
+  rate-limit reset. Its interrupted endpoint manifest contains the proven
+  cursor `3_1173685814485643265/`, while the older state file still contains
+  `3_1181651824673083392/` because a second interrupt arrived before final
+  state commit. Existing abandoned/interrupted-run recovery must be verified
+  to select the newer manifest cursor before any final resume.
+- Normal context tests and implementation may now use the existing checkout;
+  no archive process is running. Production archive files remain read-only
+  inputs until the explicit rollout stage.
 
 ## Assumptions Requiring Verification
 

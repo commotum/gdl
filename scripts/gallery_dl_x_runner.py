@@ -28,14 +28,18 @@ import textwrap
 from typing import Any
 
 import gallery_dl
-from gallery_dl.extractor.twitter import TwitterAPI
+from gallery_dl.extractor.twitter import TwitterAPI, TwitterTweetExtractor
 
 
 SUPPORTED_VERSION = "1.32.4"
 SUPPORTED_CALL_SHA256 = (
     "c7c1062eaf240cae86904fad97847c01aeb76b0161ab82671e91686c78a1e7df"
 )
+SUPPORTED_TWEET_EXTRACTOR_SHA256 = (
+    "bea8901624be2021c0dcc4ceaa97d698d3df026e5f0aa06209a678205adfe626"
+)
 DEFERRED_RESPONSE_ATTRIBUTE = "_gdl_x_deferred_ratelimit_response"
+RATE_LIMIT_RESET_LOG = "Archive rate-limit reset=%s remaining=%s"
 
 
 class ShimCompatibilityError(RuntimeError):
@@ -55,11 +59,29 @@ def require_supported_gallery_dl() -> str:
             "X rate-limit shim supports gallery-dl "
             f"{SUPPORTED_VERSION} exactly; found {version}"
         )
+    try:
+        tweet_fingerprint = _source_sha256(TwitterTweetExtractor)
+    except (OSError, TypeError) as exc:
+        raise ShimCompatibilityError(
+            "cannot verify gallery-dl individual Tweet extractor source"
+        ) from exc
+    if tweet_fingerprint != SUPPORTED_TWEET_EXTRACTOR_SHA256:
+        raise ShimCompatibilityError(
+            "gallery-dl individual Tweet extractor does not match the "
+            f"supported {SUPPORTED_VERSION} implementation"
+        )
     return version
 
 
 def _remember_deferred_ratelimit(api: TwitterAPI, response: Any) -> None:
     setattr(api, DEFERRED_RESPONSE_ATTRIBUTE, response)
+    reset = response.headers.get("x-rate-limit-reset")
+    remaining = response.headers.get("x-rate-limit-remaining")
+    if reset:
+        # Individual-post extractors may exit before another API call applies
+        # the deferred wait. Emit only non-secret quota state so an outer
+        # sequential worker can persist the same not-before boundary.
+        api.log.info(RATE_LIMIT_RESET_LOG, reset, remaining or "unknown")
 
 
 def _checkpoint_cursor(api: TwitterAPI) -> Any:
