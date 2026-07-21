@@ -17,3 +17,4 @@ gallery-dl/
 *.sqlite3
 *.part
 *.log
+.DS_Store
