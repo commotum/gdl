@@ -31,9 +31,15 @@ Use the dedicated archiver when the goal is a durable, training-ready record
 of an X account rather than a one-off media download:
 
 ```bash
-scripts/archive-x --user tszzl
-scripts/archive-x --input-file x.txt
+uv run scripts/archive-x --user USERNAME
+uv run scripts/archive-x --input-file x.txt
 ```
+
+That one command updates the modern timeline, automatically resumes any
+strictly proven pre-Snowflake legacy history, then seeds and drains the
+ancestor-only reply-context queue (including recoverable context media). No
+legacy window count, context post count, seed flag, or follow-up command is
+required for normal operation.
 
 The input file accepts one bare handle, `@handle`, or `x.com`/`twitter.com`
 profile URL per line. Blank lines and lines beginning with `#` are ignored,
@@ -65,8 +71,12 @@ The default is deliberately slow and fail-closed:
   oldest saved post rather than restarting the full historical crawl;
 - reposts are included by default, retain the original author, and are marked
   `relationship: "repost"`; use `--no-reposts` to exclude them;
-- non-repost reply-thread context is excluded using numeric author IDs, and
-  separately yielded quoted-source media is excluded.
+- embedded non-focal conversation modules are excluded from the account's own
+  timeline dataset using numeric author IDs; the later ancestor phase fetches
+  only the immediate replied-to post and its ancestors, retaining their true
+  authorship;
+- siblings, descendants, quoted sources, and “show more replies” expansion are
+  never crawled, and separately yielded quoted-source media is excluded.
 
 X's transformed reply-timeline data does not always retain the account ID of
 the repost wrapper. Repost attribution is therefore best effort: an unusual
@@ -78,13 +88,13 @@ retaining reposts.
 Run a network-free validation first:
 
 ```bash
-scripts/archive-x --user tszzl --dry-run
+uv run scripts/archive-x --user USERNAME --dry-run
 ```
 
 Run a deliberately incomplete live smoke test with a small post limit:
 
 ```bash
-scripts/archive-x --user tszzl --post-limit 5
+uv run scripts/archive-x --user USERNAME --post-limit 5
 ```
 
 Limited runs save what they observe but are never marked as a completed
@@ -104,7 +114,7 @@ the timeline, avatar, and background.
 To retry only recorded incomplete media without crawling the timeline, run:
 
 ```bash
-uv run python scripts/archive_x.py --user USER --retry-failed-only
+uv run scripts/archive-x --user USERNAME --retry-failed-only
 ```
 
 gallery-dl preserves an interrupted download as a `.part` file and resumes it
@@ -119,7 +129,7 @@ After a recovery-only run succeeds, run the normal archive command when a
 current timeline and profile-media refresh is also wanted:
 
 ```bash
-uv run python scripts/archive_x.py --user USER
+uv run scripts/archive-x --user USERNAME
 ```
 
 Incremental stopping relies on timeline order supplied by X. A 48-hour
@@ -131,32 +141,16 @@ historical visibility limits.
 ### Pre-Snowflake history
 
 Twitter changed from sequential post IDs to Snowflake IDs in November 2010.
-The normal timeline crawler deliberately stops if gallery-dl's Snowflake
-pagination arithmetic stalls at that boundary. Do not delete its saved
-`3_POST_ID/` cursor or increase the no-progress watchdog to force it onward.
+The modern timeline crawler stops cleanly if gallery-dl's Snowflake arithmetic
+reaches that boundary. The unified command initializes legacy work only when
+the stopped manifest, raw metadata, saved cursor, oldest merged row, stable
+numeric identity, pre-Snowflake timestamp, and watchdog failure class all
+agree. It first creates and verifies an exact private state backup. Ambiguous
+or generic failures never trigger the handoff.
 
-Pre-Snowflake recovery is a separate, opt-in command. First inspect the local,
-network-free plan:
-
-```bash
-scripts/archive-x-legacy --user USER status
-scripts/archive-x-legacy --user USER plan
-```
-
-`plan` reads the saved cursor, matching stopped manifest, oldest dataset row,
-numeric account identity, and account-creation timestamp. It makes no request
-and no write, and prints a stale-guarded initialization command. Review those
-fields before running that exact `init --token TOKEN` command. Installing the
-code, running `status`/`plan`, or using ordinary `scripts/archive-x` never
-initializes or launches legacy work.
-
-After initialization, every network invocation requires an explicit window
-bound:
-
-```bash
-scripts/archive-x-legacy --user USER run --windows 1
-scripts/archive-x-legacy --user USER status
-```
+Once initialized, the same normal command resumes bounded internal UTC windows
+until the source-visible account-creation floor or an explicit manual-review
+stop. Operators do not calculate or supply a window count.
 
 Each UTC interval is queried with exact epoch-second bounds, never by decoding
 or decrementing a legacy ID. Coverage advances only after two independent,
@@ -173,7 +167,7 @@ windows enter `manual_review`; after inspection, replay only the exact guarded
 window shown by `status`:
 
 ```bash
-scripts/archive-x-legacy --user USER retry \
+scripts/archive-x-legacy --user USERNAME retry \
   --window-id LEGACY_WINDOW_ID --reason 'operator review reason'
 ```
 
@@ -181,39 +175,30 @@ Legacy metadata completion is independent of media completion. Media-bearing
 posts enter the existing pending-media queue and are retried through the normal
 individual-post recovery path.
 
+The standalone legacy CLI is an advanced maintenance interface. Its
+network-free `status`/`plan`, exact guarded `retry`, and optional bounded `run`
+are useful for inspection and rollout; they are not part of routine setup:
+
+```bash
+scripts/archive-x-legacy --user USERNAME status
+scripts/archive-x-legacy --user USERNAME plan
+scripts/archive-x-legacy --user USERNAME run --windows 1  # bounded maintenance
+```
+
 ### Reply-context ancestors
 
-The timeline archive intentionally saves a reply itself without automatically
-fetching the post it answers. The separate context resolver can fill that gap
-without expanding an entire conversation. It follows only the immediate
-parent, then that parent's parent, until a root or an explicit unavailable
-boundary is reached. It never fetches siblings, descendants, quoted sources,
-or “show more” conversation expansions.
+After modern/legacy metadata commits, the unified command inventories every
+authoritative raw timeline source in a private SQLite ledger. Every authored
+reply seeds its immediate parent, and the resolver follows that parent and its
+parent until a root, an explicit unavailable boundary, the depth guard, or a
+manual-review item. Parents authored by other accounts are retained with their
+true authorship. Siblings, descendants, quoted sources, and broad conversation
+expansion remain out of scope.
 
-Start with a read-only, network-free inventory:
-
-```bash
-scripts/archive-x-context --user USER seed --dry-run
-```
-
-Create or update the private SQLite queue from existing raw timeline files,
-then inspect it:
-
-```bash
-scripts/archive-x-context --user USER seed
-scripts/archive-x-context --user USER integrity
-scripts/archive-x-context --user USER status
-```
-
-Resolving is always an explicit bounded action. The worker shares the main
-archive locks, makes one focal-post request at a time, persists its next-safe
-request time, prefers finishing the current ancestor chain, and periodically
-yields to other chains:
-
-```bash
-scripts/archive-x-context --user USER run --max-posts 1
-scripts/archive-x-context --user USER run --max-posts 100
-```
+The worker makes one focal-post request at a time, persists its next-safe
+request time, prefers finishing the current ancestor chain, periodically yields
+between chains/users, and has bounded attempts, leases, timeouts, and backoff.
+No `--max-posts` value is required for normal closure.
 
 Stopping with Ctrl-C or SIGTERM leaves the current target retryable. Deleted,
 private, suspended, and withheld boundaries are recorded; ambiguous failures
@@ -221,17 +206,26 @@ are retried with bounded backoff and eventually require manual review. Use
 `retry POST_ID...` for an explicit reclassification retry. Rebuild the
 portable views with `export`.
 
-Metadata closure is independent of media. Context media is a separate bounded
-command, verifies SHA-256 sidecars, and refuses to start below 5 GiB free:
+Metadata closure is independent of media. Context media is processed
+automatically after metadata, verifies SHA-256 sidecars, and refuses to start
+below 5 GiB free. Failures remain explicit and retryable without unresolving
+captured metadata.
+
+The standalone context CLI remains available for advanced read-only status,
+integrity, export, guarded retry, and deliberately bounded maintenance:
 
 ```bash
-scripts/archive-x-context --user USER media --max-posts 10
+scripts/archive-x-context --user USERNAME status
+scripts/archive-x-context --user USERNAME integrity
+scripts/archive-x-context --user USERNAME export
+scripts/archive-x-context --user USERNAME run --max-posts 1  # bounded maintenance
+scripts/archive-x-context --user USERNAME media --max-posts 1
 ```
 
-Add `--seed-reply-context` to a normal `scripts/archive-x` invocation to seed
-new local edges only after each timeline merge and cursor commit. This option
-makes no context requests and never launches the historical context backlog.
-The large initial `seed` and all `run`/`media` work remain operator actions.
+For a deliberately bounded unified production smoke, use the advanced
+`--modern-max-posts`, `--legacy-max-windows`, `--context-max-posts`, and
+`--context-media-max-posts` controls. A bounded result remains resumable and is
+never reported as full completion.
 
 ### X archive contents
 

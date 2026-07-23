@@ -6,7 +6,7 @@ import tempfile
 import types
 import unittest
 from argparse import Namespace
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -26,6 +26,27 @@ FIXTURE = json.loads(
         encoding="utf-8"
     )
 )
+
+
+@contextmanager
+def isolated_cli_locks(root: Path):
+    """Keep CLI mutation tests independent from a real archive lock owner."""
+    original_lock = archive_x.exclusive_lock
+    mapped: dict[str, Path] = {}
+
+    @contextmanager
+    def temporary_lock(path: Path):
+        key = str(path)
+        target = mapped.setdefault(
+            key, root / "test-locks" / f"lock-{len(mapped)}.lock"
+        )
+        with original_lock(target):
+            yield
+
+    with mock.patch.object(
+        archive_x_legacy.archive_x, "exclusive_lock", temporary_lock
+    ):
+        yield
 
 
 def search_page(*, cursor=None, keep_going_on_empty=False):
@@ -282,6 +303,234 @@ def fixture_archive(root: Path):
     return user_dir, state_path, state
 
 
+def strict_transition_archive(root: Path):
+    user_dir, state_path, state = fixture_archive(root)
+    run_id = "20260720T023918Z-fixture"
+    raw_path = user_dir / "runs" / run_id / "raw" / "timeline.posts.incomplete.jsonl"
+    archive_x.atomic_write_jsonl(
+        raw_path,
+        [
+            {
+                "tweet_id": "29116490825",
+                "date": "2010-10-29 19:30:34",
+                "archived_at": "2026-07-20T12:00:00Z",
+                "author": {"id": "12345", "name": "alice"},
+                "user": {"id": "12345", "name": "alice"},
+                "reply_id": None,
+                "retweet_id": None,
+                "count": 0,
+            }
+        ],
+    )
+    archive_x.atomic_write_json(
+        user_dir / "runs" / run_id / "manifest.json",
+        {
+            "run_id": run_id,
+            "started_at": "2026-07-20T02:39:18Z",
+            "completed_at": "2026-07-21T01:04:43Z",
+            "status": "stalled",
+            "failure_stage": "timeline_no_progress_watchdog",
+            "reposts_included": True,
+            "limited_run": False,
+            "retry_failed_only": False,
+            "date_after": None,
+            "endpoints": [
+                {
+                    "endpoint": "timeline",
+                    "status": "stalled",
+                    "exit_code": 1,
+                    "interrupted": False,
+                    "stalled": True,
+                    "stalled_rate_limit_cycles": 3,
+                    "resume_cursor": "3_29116490825/",
+                    "synthetic_resume_cursor": False,
+                    "metadata_complete": False,
+                    "other_error_count": 0,
+                    "raw_has_record": True,
+                    "raw_path": str(raw_path.relative_to(user_dir)),
+                }
+            ],
+        },
+    )
+    return user_dir, state_path, state
+
+
+class AutomaticLegacyTransitionTests(unittest.TestCase):
+    def test_exact_pre_snowflake_watchdog_boundary_is_proven(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, state_path, _ = strict_transition_archive(Path(directory))
+            before = archive_x.sha256_file(state_path)
+
+            result = archive_x_legacy.classify_legacy_transition(
+                user_dir, expected_run_id="20260720T023918Z-fixture"
+            )
+
+            self.assertEqual(result["decision"], "proven")
+            self.assertEqual(
+                result["reason"], "exact_pre_snowflake_watchdog_boundary"
+            )
+            self.assertEqual(result["oldest_post_id"], "29116490825")
+            self.assertRegex(result["source_raw_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(archive_x.sha256_file(state_path), before)
+
+    def test_weak_or_failed_boundaries_never_prove(self):
+        mutations = {
+            "generic stall": lambda manifest, raw: manifest.update(
+                failure_stage="other"
+            ),
+            "api error": lambda manifest, raw: manifest["endpoints"][0].update(
+                other_error_count=1
+            ),
+            "interrupted": lambda manifest, raw: manifest["endpoints"][0].update(
+                interrupted=True
+            ),
+            "metadata complete": lambda manifest, raw: manifest["endpoints"][0].update(
+                metadata_complete=True
+            ),
+            "successful exit": lambda manifest, raw: manifest["endpoints"][0].update(
+                exit_code=0
+            ),
+            "limited run": lambda manifest, raw: manifest.update(limited_run=True),
+            "missing raw evidence": lambda manifest, raw: manifest["endpoints"][0].update(
+                raw_has_record=False
+            ),
+            "incremental cutoff": lambda manifest, raw: manifest.update(
+                date_after="2026-07-01T00:00:00Z"
+            ),
+            "too few windows": lambda manifest, raw: manifest["endpoints"][0].update(
+                stalled_rate_limit_cycles=2
+            ),
+            "identity mismatch": lambda manifest, raw: archive_x.atomic_write_jsonl(
+                raw,
+                [
+                    {
+                        "tweet_id": "29116490825",
+                        "date": "2010-10-29 19:30:34",
+                        "author": {"id": "999"},
+                        "user": {"id": "999"},
+                    }
+                ],
+            ),
+            "post-snowflake metadata": lambda manifest, raw: archive_x.atomic_write_jsonl(
+                raw,
+                [
+                    {
+                        "tweet_id": "29116490825",
+                        "date": "2010-11-05 00:00:00",
+                        "author": {"id": "12345"},
+                        "user": {"id": "12345"},
+                    }
+                ],
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                user_dir, _state_path, _ = strict_transition_archive(Path(directory))
+                manifest_path = (
+                    user_dir
+                    / "runs"
+                    / "20260720T023918Z-fixture"
+                    / "manifest.json"
+                )
+                manifest = archive_x.load_json(manifest_path, {})
+                raw_path = user_dir / manifest["endpoints"][0]["raw_path"]
+                mutate(manifest, raw_path)
+                archive_x.atomic_write_json(manifest_path, manifest)
+
+                result = archive_x_legacy.classify_legacy_transition(user_dir)
+
+                self.assertNotEqual(result["decision"], "proven")
+
+    def test_automatic_initialization_preserves_cursor_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, state_path, original = strict_transition_archive(Path(directory))
+            original_hash = archive_x.sha256_file(state_path)
+
+            result = archive_x_legacy.automatic_initialize_legacy(
+                user_dir,
+                initialized_at="2026-07-22T12:00:00Z",
+                expected_run_id="20260720T023918Z-fixture",
+            )
+
+            self.assertTrue(result["legacy_initialized"])
+            self.assertTrue(result["modern_head_initialized"])
+            state = archive_x.load_json(state_path, {})
+            self.assertEqual(state["resume"], original["resume"])
+            self.assertEqual(state["legacy_backfill"]["status"], "pending")
+            self.assertEqual(
+                state["modern_head"]["baseline_started_at"],
+                "2026-07-20T02:39:18Z",
+            )
+            backup = Path(result["backup_path"])
+            self.assertEqual(archive_x.sha256_file(backup), original_hash)
+            self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+
+            repeated = archive_x_legacy.automatic_initialize_legacy(
+                user_dir, initialized_at="2026-07-22T13:00:00Z"
+            )
+            self.assertFalse(repeated["legacy_initialized"])
+            self.assertFalse(repeated["modern_head_initialized"])
+            self.assertEqual(repeated["state"], state)
+
+    def test_failed_state_write_leaves_prior_state_and_verified_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, state_path, original = strict_transition_archive(Path(directory))
+            original_hash = archive_x.sha256_file(state_path)
+
+            def fail_state(path, value):
+                if Path(path) == state_path:
+                    raise OSError("injected state write failure")
+                archive_x.atomic_write_json(Path(path), value)
+
+            with self.assertRaisesRegex(OSError, "injected state write failure"):
+                archive_x_legacy.automatic_initialize_legacy(
+                    user_dir,
+                    initialized_at="2026-07-22T12:00:00Z",
+                    writer=fail_state,
+                )
+
+            self.assertEqual(archive_x.load_json(state_path, {}), original)
+            plan = archive_x_legacy.initialization_plan(user_dir)
+            backup = archive_x_legacy.legacy_backup_path(user_dir, plan["source"])
+            self.assertEqual(archive_x.sha256_file(backup), original_hash)
+
+    def test_failed_backup_write_leaves_prior_state_without_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, state_path, original = strict_transition_archive(Path(directory))
+            plan = archive_x_legacy.initialization_plan(user_dir)
+            backup = archive_x_legacy.legacy_backup_path(user_dir, plan["source"])
+
+            def fail_backup(path, value):
+                raise OSError("injected backup write failure")
+
+            with self.assertRaisesRegex(OSError, "injected backup write failure"):
+                archive_x_legacy.automatic_initialize_legacy(
+                    user_dir,
+                    initialized_at="2026-07-22T12:00:00Z",
+                    writer=fail_backup,
+                )
+
+            self.assertEqual(archive_x.load_json(state_path, {}), original)
+            self.assertFalse(backup.exists())
+
+    def test_existing_legacy_without_exact_backup_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, state_path, _ = strict_transition_archive(Path(directory))
+            plan = archive_x_legacy.initialization_plan(user_dir)
+            state = archive_x.load_json(state_path, {})
+            initialized, _ = archive_x_legacy.initialize_state(
+                state, plan, plan["confirmation_token"], "2026-07-22T12:00:00Z"
+            )
+            archive_x.atomic_write_json(state_path, initialized)
+
+            with self.assertRaisesRegex(
+                archive_x.ArchiveError, "missing its exact pre-init backup"
+            ):
+                archive_x_legacy.automatic_initialize_legacy(
+                    user_dir, initialized_at="2026-07-22T13:00:00Z"
+                )
+
+
 class LegacyStateTests(unittest.TestCase):
     def test_initialization_plan_is_exact_and_stale_guarded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -502,7 +751,7 @@ class LegacyStateTests(unittest.TestCase):
                 plan["confirmation_token"],
             ]
 
-            with redirect_stdout(io.StringIO()):
+            with isolated_cli_locks(root), redirect_stdout(io.StringIO()):
                 self.assertEqual(archive_x_legacy.main(args), 0)
             initialized_bytes = state_path.read_bytes()
             initialized = archive_x.load_json(state_path, {})
@@ -515,7 +764,7 @@ class LegacyStateTests(unittest.TestCase):
             self.assertEqual(archive_x.load_json(backups[0], {}), original)
             self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
 
-            with redirect_stdout(io.StringIO()):
+            with isolated_cli_locks(root), redirect_stdout(io.StringIO()):
                 self.assertEqual(archive_x_legacy.main(args), 0)
             self.assertEqual(state_path.read_bytes(), initialized_bytes)
 
@@ -527,7 +776,7 @@ class LegacyStateTests(unittest.TestCase):
             before = state_path.read_bytes()
             errors = io.StringIO()
 
-            with mock.patch.object(
+            with isolated_cli_locks(root), mock.patch.object(
                 archive_x_legacy.archive_x,
                 "atomic_write_json",
                 side_effect=OSError("injected write failure"),
@@ -633,7 +882,7 @@ def initialized_fixture_archive(root: Path):
 
 def legacy_run_args(root: Path, **overrides):
     values = {
-        "windows": 1,
+        "max_root_windows": 1,
         "request_limit": 6,
         "walk_attempts": 3,
         "window_attempts": 3,
@@ -647,7 +896,7 @@ def legacy_run_args(root: Path, **overrides):
         "stalled_rate_limit_cycles": 3,
     }
     values.update(overrides)
-    return Namespace(**values)
+    return archive_x_legacy.LegacyRunOptions(**values)
 
 
 def valid_walk(kwargs, post_id="29000000000", date="2010-10-29 12:00:00", count=0):
@@ -694,6 +943,44 @@ def valid_walk(kwargs, post_id="29000000000", date="2010-10-29 12:00:00", count=
 
 
 class LegacyOrchestrationTests(unittest.TestCase):
+    def test_no_root_budget_runs_to_exact_floor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _user_dir, state_path, _ = initialized_fixture_archive(root)
+            state = archive_x.load_json(state_path, {})
+            state["legacy_backfill"]["floor_since"] = "2010-10-29T00:00:00Z"
+            archive_x.atomic_write_json(state_path, state)
+
+            def fake_walk(**kwargs):
+                return valid_walk(kwargs)
+
+            with mock.patch.object(
+                archive_x_legacy, "run_legacy_walk", side_effect=fake_walk
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ):
+                result = archive_x_legacy.run_legacy_archive(
+                    legacy_run_args(root, max_root_windows=None),
+                    REPO,
+                    root,
+                    "alice",
+                    "1.32.4",
+                )
+
+            state = archive_x.load_json(state_path, {})
+            self.assertEqual(result["status"], "complete")
+            self.assertIsNone(result["window_limit"])
+            self.assertEqual(state["legacy_backfill"]["status"], "complete")
+            self.assertEqual(
+                state["legacy_backfill"]["next_until"],
+                "2010-10-29T00:00:00Z",
+            )
+
+    def test_standalone_run_window_limit_is_optional(self):
+        parser = archive_x_legacy.build_parser()
+        args = parser.parse_args(["--user", "alice", "run"])
+        self.assertIsNone(args.windows)
+
     def test_two_matching_walks_merge_then_advance_and_queue_media(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -712,7 +999,7 @@ class LegacyOrchestrationTests(unittest.TestCase):
                 )
 
             state = archive_x.load_json(state_path, {})
-            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["status"], "limited")
             self.assertEqual(
                 state["legacy_backfill"]["next_until"],
                 "2010-10-29T00:00:00Z",
@@ -805,7 +1092,7 @@ class LegacyOrchestrationTests(unittest.TestCase):
                     legacy_run_args(root), REPO, root, "alice", "1.32.4"
                 )
 
-            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["status"], "limited")
             self.assertEqual(
                 calls[1],
                 ("2010-10-29T12:00:00Z", "2010-10-30T00:00:00Z"),
@@ -863,7 +1150,7 @@ class LegacyRecoveryTests(unittest.TestCase):
                 )
 
             recovered = archive_x.load_json(state_path, {})
-            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["status"], "limited")
             self.assertEqual(
                 recovered["legacy_backfill"]["next_until"],
                 "2010-10-29T00:00:00Z",
@@ -1062,7 +1349,7 @@ class LegacyRecoveryTests(unittest.TestCase):
             )
             archive_x.atomic_write_json(state_path, state)
 
-            with redirect_stdout(io.StringIO()):
+            with isolated_cli_locks(root), redirect_stdout(io.StringIO()):
                 self.assertEqual(
                     archive_x_legacy.main(
                         [

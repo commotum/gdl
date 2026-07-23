@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import importlib.metadata
 import json
 import mimetypes
@@ -32,6 +33,9 @@ except ImportError:  # pragma: no cover - this repo targets macOS/Linux
 SCHEMA_NAME = "gdl-x-archive"
 SCHEMA_VERSION = 1
 MIN_GALLERY_DL = (1, 32, 0)
+SNOWFLAKE_EPOCH = datetime(
+    2010, 11, 4, 1, 42, 54, 657000, tzinfo=timezone.utc
+)
 HANDLE_RE = re.compile(r"[A-Za-z0-9_]{1,15}\Z")
 DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?\Z")
 CURSOR_RE = re.compile(r"Use '-o cursor=(.+)' to continue")
@@ -128,6 +132,11 @@ def positive_int(value: str) -> int:
     if number < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return number
+
+
+def effective_timeline_post_limit(args: argparse.Namespace) -> int | None:
+    """Return either mutually exclusive modern acquisition bound."""
+    return args.post_limit or getattr(args, "modern_max_posts", None)
 
 
 def nonnegative_float(value: str) -> float:
@@ -334,6 +343,14 @@ def resolve_output_root(explicit: Path | None, *, plan_only: bool = False) -> Pa
         "/tmp/Bibliotheque, or /Volumes/Bibliotheque. Mount it first or "
         "pass --output-root explicitly."
     )
+
+
+def filesystem_is_read_only(path: Path) -> bool:
+    """Inspect the containing filesystem without probing it with a write."""
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return bool(os.statvfs(probe).f_flag & os.ST_RDONLY)
 
 
 def gallery_dl_version() -> str:
@@ -871,9 +888,9 @@ This directory is a derived, portable view of immutable run snapshots.
 - `reposts.jsonl`: reposts, retaining the original author.
 - `media.jsonl`: local asset paths, source metadata, and SHA-256 digests.
 - `profile.json`: latest captured profile metadata.
-- `context-posts.jsonl`: optional captured reply ancestors.
-- `reply-edges.jsonl`: optional child-to-parent graph and boundary states.
-- `context-status.json`: optional queue, closure, pacing, and media summary.
+- `context-posts.jsonl`: captured reply ancestors from the unified lifecycle.
+- `reply-edges.jsonl`: child-to-parent graph and boundary states.
+- `context-status.json`: queue, closure, pacing, and media summary.
 
 `posted_at` is the target account's timeline-event timestamp. For a repost,
 `reposted_at` is that event time and `original_posted_at` is the original
@@ -882,16 +899,17 @@ observations. Engagement metrics are point-in-time values, not historical
 totals. Raw per-run JSONL and logs live under `../runs/` and remain the source
 of truth.
 
-Reply context is ancestor-only and opt-in. It excludes sibling replies,
-descendants, whole-conversation expansion, and quoted sources. Context state is
-durable in `../_state/context.sqlite3`; use
-`scripts/archive-x-context --user HANDLE export` to rebuild these views.
+Reply context is automatically processed but remains ancestor-only. It excludes
+sibling replies, descendants, whole-conversation expansion, and quoted sources.
+Context state is durable in `../_state/context.sqlite3`; the unified command
+rebuilds these views, while `scripts/archive-x-context` remains available for
+advanced maintenance.
 
-Pre-Snowflake history is an explicit, separate operation through
-`scripts/archive-x-legacy`. Its UTC frontier means repeat-confirmed contiguous
-windows visible through X search; it is not proof that deleted, private,
-withheld, or unindexed posts were recovered. Legacy metadata may advance while
-its media remains in the shared pending-media queue.
+Pre-Snowflake history is automatically initialized only after strict boundary
+proof, then resumed through bounded internal UTC windows. Its frontier means
+repeat-confirmed contiguous windows visible through X search; it is not proof
+that deleted, private, withheld, or unindexed posts were recovered. Legacy
+metadata may advance while its media remains in the shared pending-media queue.
 """
     path.write_text(text, encoding="utf-8")
     os.chmod(path, 0o600)
@@ -1412,7 +1430,11 @@ def archive_endpoint(
         repo_dir,
         config_path,
         date_after=date_after if endpoint == "timeline" else None,
-        post_limit=args.post_limit if endpoint == "timeline" else None,
+        post_limit=(
+            effective_timeline_post_limit(args)
+            if endpoint == "timeline"
+            else None
+        ),
         retries=args.retries if retries is None else retries,
         http_timeout=(
             args.http_timeout if http_timeout is None else http_timeout
@@ -1510,6 +1532,38 @@ def select_timeline_state(
     args: argparse.Namespace, state: dict[str, Any], started: datetime
 ) -> tuple[str | None, str, datetime | None]:
     """Select a saved cursor and preserve its original incremental cutoff."""
+    modern_head = (
+        state.get("modern_head")
+        if isinstance(state.get("modern_head"), dict)
+        and isinstance(state.get("legacy_backfill"), dict)
+        else None
+    )
+    if modern_head and args.full_rescan:
+        return None, iso_utc(started), SNOWFLAKE_EPOCH
+    if modern_head and args.since is not None:
+        return None, iso_utc(started), max(args.since, SNOWFLAKE_EPOCH)
+    if modern_head and not args.post_limit:
+        active = (
+            modern_head.get("active")
+            if isinstance(modern_head.get("active"), dict)
+            else None
+        )
+        cursor = str(active.get("cursor")) if active and active.get("cursor") else None
+        chain_started_at = (
+            str(active.get("started_at")) if active else iso_utc(started)
+        )
+        cutoff_value = (
+            active.get("date_after")
+            if active
+            else modern_head.get("last_successful_started_at")
+        )
+        try:
+            cutoff = parse_datetime(str(cutoff_value)) - (
+                timedelta(0) if active else timedelta(hours=args.overlap_hours)
+            )
+        except argparse.ArgumentTypeError:
+            cutoff = None
+        return cursor, chain_started_at, cutoff
     resume = state.get("resume") if isinstance(state.get("resume"), dict) else None
     if args.full_rescan or args.since is not None or args.post_limit:
         resume = None
@@ -1557,10 +1611,31 @@ def update_timeline_state(
     chain_started_at: str,
     date_after: datetime | None,
     observed_at: str,
+    modern_head_mode: bool = False,
 ) -> None:
     """Commit crawl progress without discarding an older safe checkpoint."""
     if limited_run:
         # A smoke test must not advance or replace production crawl state.
+        return
+    if modern_head_mode:
+        modern_head = state.get("modern_head")
+        if not isinstance(modern_head, dict):
+            raise ArchiveError("modern-head timeline state is missing")
+        if metadata_complete:
+            modern_head.update(
+                {
+                    "last_successful_started_at": chain_started_at,
+                    "last_successful_completed_at": observed_at,
+                    "active": None,
+                }
+            )
+        elif resume_cursor:
+            modern_head["active"] = {
+                "cursor": resume_cursor,
+                "started_at": chain_started_at,
+                "date_after": iso_utc(date_after) if date_after else None,
+                "saved_at": observed_at,
+            }
         return
     if metadata_complete:
         state.update(
@@ -1689,7 +1764,10 @@ def prune_completed_pending_media(
 
 
 def recover_download_only_runs(
-    state: dict[str, Any], user_dir: Path
+    state: dict[str, Any],
+    user_dir: Path,
+    *,
+    modern_head_mode: bool = False,
 ) -> list[str]:
     """Migrate older runs whose timeline ended but one asset failed."""
     recovered_value = state.get("recovered_download_only_runs")
@@ -1698,6 +1776,9 @@ def recover_download_only_runs(
     for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
         manifest = load_json(manifest_path, {})
         if not isinstance(manifest, dict) or manifest.get("limited_run"):
+            continue
+        is_modern_head_run = manifest.get("timeline_mode") == "modern_head"
+        if is_modern_head_run != modern_head_mode:
             continue
         completed_value = str(manifest.get("completed_at") or "")
         if manifest.get("status") not in {"failed", "partial"} or not completed_value:
@@ -1745,13 +1826,25 @@ def recover_download_only_runs(
             observed_at=observed_at,
         )
         started_at = str(manifest.get("started_at") or "")
-        previous = str(state.get("last_successful_started_at") or "")
-        resume = state.get("resume") if isinstance(state.get("resume"), dict) else None
-        resume_started = str(resume.get("started_at") or "") if resume else ""
+        authority = state
+        active_key = "resume"
+        if modern_head_mode:
+            modern_head = state.get("modern_head")
+            if not isinstance(modern_head, dict):
+                raise ArchiveError("modern-head timeline state is missing")
+            authority = modern_head
+            active_key = "active"
+        previous = str(authority.get("last_successful_started_at") or "")
+        active = (
+            authority.get(active_key)
+            if isinstance(authority.get(active_key), dict)
+            else None
+        )
+        resume_started = str(active.get("started_at") or "") if active else ""
         if started_at and started_at >= previous and resume_started <= started_at:
-            state["last_successful_started_at"] = started_at
-            state["last_successful_completed_at"] = observed_at
-            state["resume"] = None
+            authority["last_successful_started_at"] = started_at
+            authority["last_successful_completed_at"] = observed_at
+            authority[active_key] = None
         recovered.add(run_id_value)
         newly_recovered.append(run_id_value)
 
@@ -1776,6 +1869,37 @@ def finalize_abandoned_manifests(
         manifest["finalized_on_later_startup"] = True
         atomic_write_json(manifest_path, manifest)
         finalized.append(run_id_value)
+    return finalized
+
+
+def finalize_abandoned_invocations(
+    archive_root: Path,
+    *,
+    current_invocation_id: str,
+    current_started_at: str,
+    recovered_at: str,
+) -> list[str]:
+    """Close stale root readouts after the authoritative outer locks are held."""
+    finalized: list[str] = []
+    for path in sorted((archive_root / "runs").glob("*.json")):
+        invocation = load_json(path, None)
+        if not isinstance(invocation, dict):
+            continue
+        invocation_id = str(invocation.get("invocation_id") or path.stem)
+        started_at = str(invocation.get("started_at") or "")
+        if (
+            invocation_id == current_invocation_id
+            or (started_at and started_at >= current_started_at)
+            or invocation.get("status") != "running"
+        ):
+            continue
+        invocation["status"] = "interrupted"
+        invocation["failure_stage"] = "process_ended_before_invocation_finalization"
+        invocation["completed_at"] = recovered_at
+        invocation["updated_at"] = recovered_at
+        invocation["finalized_on_later_startup"] = True
+        atomic_write_json(path, invocation)
+        finalized.append(invocation_id)
     return finalized
 
 
@@ -1805,6 +1929,7 @@ def recover_stalled_interrupted_runs(
     user_dir: Path,
     *,
     minimum_waits: int,
+    modern_head_mode: bool = False,
 ) -> list[str]:
     """Recover a search-stage cursor when gallery-dl omitted one on SIGINT."""
     recovered_value = state.get("recovered_stalled_runs")
@@ -1815,6 +1940,9 @@ def recover_stalled_interrupted_runs(
     for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
         manifest = load_json(manifest_path, {})
         if not isinstance(manifest, dict) or manifest.get("limited_run"):
+            continue
+        is_modern_head_run = manifest.get("timeline_mode") == "modern_head"
+        if is_modern_head_run != modern_head_mode:
             continue
         run_id_value = str(manifest.get("run_id") or manifest_path.parent.name)
         if run_id_value in recovered:
@@ -1898,11 +2026,25 @@ def recover_stalled_interrupted_runs(
 
     if candidates:
         candidate_started, candidate = max(candidates, key=lambda item: item[0])
-        successful_started = str(state.get("last_successful_started_at") or "")
-        current = state.get("resume") if isinstance(state.get("resume"), dict) else None
+        authority = state
+        active_key = "resume"
+        if modern_head_mode:
+            modern_head = state.get("modern_head")
+            if not isinstance(modern_head, dict):
+                raise ArchiveError("modern-head timeline state is missing")
+            authority = modern_head
+            active_key = "active"
+        successful_started = str(
+            authority.get("last_successful_started_at") or ""
+        )
+        current = (
+            authority.get(active_key)
+            if isinstance(authority.get(active_key), dict)
+            else None
+        )
         current_started = str(current.get("started_at") or "") if current else ""
         if candidate_started >= successful_started and candidate_started >= current_started:
-            state["resume"] = candidate
+            authority[active_key] = candidate
 
     state["recovered_stalled_runs"] = sorted(recovered)
     prune_completed_pending_media(state, user_dir)
@@ -1917,18 +2059,29 @@ def archive_user(
     version: str,
 ) -> dict[str, Any]:
     started = utc_now()
+    timeline_post_limit = effective_timeline_post_limit(args)
     current_run_id = run_id(started)
     user_dir = archive_root / "users" / handle
     run_dir = user_dir / "runs" / current_run_id
     state_path = user_dir / "_state" / "state.json"
     user_dir.mkdir(parents=True, exist_ok=True)
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    run_dir.mkdir(parents=True, exist_ok=False)
-    write_dataset_readme(user_dir)
 
     state = load_json(state_path, {})
     if not isinstance(state, dict):
         state = {}
+    if isinstance(state.get("legacy_backfill"), dict):
+        legacy_module = importlib.import_module("archive_x_legacy")
+        prepared = legacy_module.automatic_initialize_legacy(
+            user_dir, initialized_at=iso_utc(started)
+        )
+        state = prepared["state"]
+    run_dir.mkdir(parents=True, exist_ok=False)
+    write_dataset_readme(user_dir)
+    modern_head_mode = bool(
+        isinstance(state.get("legacy_backfill"), dict)
+        and isinstance(state.get("modern_head"), dict)
+    )
     finalized_abandoned_runs = finalize_abandoned_manifests(
         user_dir, recovered_at=iso_utc(started)
     )
@@ -1941,8 +2094,11 @@ def archive_user(
         state,
         user_dir,
         minimum_waits=getattr(args, "stalled_rate_limit_cycles", 3),
+        modern_head_mode=modern_head_mode,
     )
-    recovered_runs = recover_download_only_runs(state, user_dir)
+    recovered_runs = recover_download_only_runs(
+        state, user_dir, modern_head_mode=modern_head_mode
+    )
     if recovered_stalled_runs or recovered_runs:
         atomic_write_json(state_path, state)
     if recovered_stalled_runs:
@@ -1958,7 +2114,6 @@ def archive_user(
     cursor, chain_started_at, date_after = select_timeline_state(
         args, state, started
     )
-
     manifest: dict[str, Any] = {
         "schema": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -1981,7 +2136,8 @@ def archive_user(
         "extractor_delay_seconds": args.extractor_delay,
         "date_after": iso_utc(date_after) if date_after else None,
         "resumed_from_cursor": cursor,
-        "limited_run": bool(args.post_limit),
+        "timeline_mode": "modern_head" if modern_head_mode else "history",
+        "limited_run": bool(timeline_post_limit),
         "retry_failed_only": bool(args.retry_failed_only),
         "finalized_abandoned_runs": finalized_abandoned_runs,
         "recovered_stalled_runs": recovered_stalled_runs,
@@ -2182,58 +2338,22 @@ def archive_user(
     # safely replays this page instead of skipping records in posts.jsonl.
     update_timeline_state(
         state,
-        limited_run=bool(args.post_limit),
+        limited_run=bool(timeline_post_limit),
         metadata_complete=timeline_complete,
         resume_cursor=timeline_result.get("resume_cursor"),
         handle=handle,
         chain_started_at=chain_started_at,
         date_after=date_after,
         observed_at=iso_utc(utc_now()),
+        modern_head_mode=modern_head_mode,
     )
     atomic_write_json(state_path, state)
 
-    # This is local graph discovery only.  It deliberately runs after both the
-    # dataset merge and timeline-state commit, and its result is reported on a
-    # separate manifest field so it has no authority over the timeline cursor
-    # or endpoint status.
-    if getattr(args, "seed_reply_context", False) and not timeline_result.get(
-        "interrupted"
-    ):
-        command = [
-            sys.executable,
-            str(repo_dir / "scripts" / "archive_x_context.py"),
-            "--user",
-            handle,
-            "--output-root",
-            str(archive_root),
-            "seed",
-            "--raw-path",
-            str(timeline_raw),
-        ]
-        try:
-            discovery = subprocess.run(
-                command,
-                cwd=repo_dir,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        except KeyboardInterrupt:
-            manifest["status"] = "interrupted"
-            manifest["reply_context_discovery"] = {
-                "status": "interrupted",
-                "timeline_state_committed": True,
-            }
-            manifest["completed_at"] = iso_utc(utc_now())
-            atomic_write_json(manifest_path, manifest)
-            raise
+    if getattr(args, "seed_reply_context", False):
         manifest["reply_context_discovery"] = {
-            "status": "success" if discovery.returncode == 0 else "failed",
-            "exit_code": discovery.returncode,
+            "status": "deferred_to_unified_context_phase",
             "timeline_state_committed": True,
             "network_requests": 0,
-            "output": discovery.stdout[-4000:],
         }
         atomic_write_json(manifest_path, manifest)
 
@@ -2251,7 +2371,7 @@ def archive_user(
             raise KeyboardInterrupt
         return manifest
 
-    if args.post_limit:
+    if timeline_post_limit:
         manifest["status"] = "limited"
     else:
         profile_partial = False
@@ -2315,8 +2435,24 @@ def dry_run_summary(
     print("Dry run: no X requests and no archive writes will be made.")
     print(f"gallery-dl: {version}")
     print(f"archive root: {archive_root}")
+    read_only = filesystem_is_read_only(archive_root)
+    print(
+        "archive filesystem in this process: "
+        + (
+            "READ-ONLY; a real run will refuse to start"
+            if read_only
+            else "read-write"
+        )
+    )
     if args.output_root is None and not os.environ.get("GDL_X_ARCHIVE_ROOT"):
-        print("note: the real run will require Bibliotheque mounted read-write")
+        print(
+            "note: "
+            + (
+                "remount Bibliotheque read-write before a real run"
+                if read_only
+                else "a real run requires this Bibliotheque root to remain read-write"
+            )
+        )
     print(f"cookie file: {args.cookies} (values not displayed)")
     print(f"users ({len(targets)}): {', '.join(targets)}")
     print("identity/profile endpoint first: info (stable user-ID guard)")
@@ -2328,15 +2464,13 @@ def dry_run_summary(
             f"{max(args.http_timeout, args.media_timeout)}s inactivity timeout"
         )
     else:
-        print("main endpoint: /USER/timeline (with replies + older search backfill)")
+        print("phase 1: modern timeline/profile/media update")
+        print("phase 2: guarded automatic legacy detection/resume to source-visible floor")
+        print("phase 3: seed and drain ancestor-only reply context plus context media")
         print("profile media endpoints after timeline: avatar, background")
-        print(
-            "reply-context discovery after durable timeline merge: "
-            f"{'enabled (no context requests)' if args.seed_reply_context else 'disabled'}"
-        )
     print(f"reposts: {'included and labeled' if not args.no_reposts else 'excluded'}")
     print("quoted-source media: excluded")
-    print("non-repost reply-thread context: excluded by numeric author ID")
+    print("context scope: immediate reply ancestors only; no siblings/descendants/quotes")
     if not args.no_reposts:
         print("repost attribution: best effort where X omits wrapper-author identity")
     print(f"request delay: {args.request_delay}s")
@@ -2347,15 +2481,143 @@ def dry_run_summary(
     )
     print(f"between users: {args.user_delay}s")
     if args.post_limit:
-        print(f"post limit: {args.post_limit} (state will not mark a complete crawl)")
+        print(
+            f"modern diagnostic post limit: {args.post_limit}; automatic legacy and "
+            "context network phases will be skipped"
+        )
+    if args.since is not None:
+        print("explicit --since mode: modern acquisition only; backlog phases skipped")
+    if args.legacy_max_windows is not None:
+        print(f"advanced legacy bound: {args.legacy_max_windows} root window(s) per user")
+    if args.context_max_posts is not None:
+        print(f"advanced context metadata bound: {args.context_max_posts} attempt(s)")
+    if args.context_media_max_posts is not None:
+        print(
+            "advanced context media bound: "
+            f"{args.context_media_max_posts} attempt(s)"
+        )
+    if args.modern_max_posts is not None:
+        print(
+            f"advanced modern rollout bound: {args.modern_max_posts} post(s); "
+            "downstream phases require existing initialized legacy state"
+        )
+
+    context_module = importlib.import_module("archive_x_context")
+    legacy_module = importlib.import_module("archive_x_legacy")
+    for handle in targets:
+        user_dir = archive_root / "users" / handle
+        state = load_json(user_dir / "_state" / "state.json", None)
+        print(f"plan @{handle}:")
+        diagnostic_modern_only = bool(args.post_limit or args.since is not None)
+        if not isinstance(state, dict):
+            if args.retry_failed_only:
+                print("  modern/legacy/context metadata: skipped (no existing state)")
+            elif diagnostic_modern_only or args.modern_max_posts:
+                print("  modern: bounded diagnostic acquisition")
+                print("  legacy/context network: skipped by diagnostic mode")
+            else:
+                print("  modern: initial source-visible historical crawl")
+                print("  legacy: evaluate only after an exact proven boundary")
+            print("  shared media: no existing queue")
+            if not args.retry_failed_only and not diagnostic_modern_only:
+                print(
+                    "  context: bootstrap from committed sources, then drain to closure"
+                )
+            continue
+        pending = state.get("pending_media")
+        pending_count = len(pending) if isinstance(pending, list) else 0
+        if args.retry_failed_only:
+            print("  modern/legacy/context metadata: skipped by retry-only mode")
+            print(f"  shared media: {pending_count} pending item(s) to retry")
+            summary = context_module.readonly_context_summary(
+                user_dir / "_state" / "context.sqlite3"
+            )
+            if summary["status"] == "absent":
+                print("  context media: skipped; context database absent")
+            else:
+                print(
+                    f"  context media: {summary['media_pending']} pending item(s); "
+                    f"integrity={'ok' if summary['integrity_ok'] else 'FAILED'}"
+                )
+            continue
+        legacy = state.get("legacy_backfill")
+        if isinstance(legacy, dict):
+            validated = legacy_module.validate_legacy_state(
+                legacy,
+                expected_user_id=str(state.get("requested_user_id") or ""),
+            )
+            head = state.get("modern_head")
+            head_active = isinstance(head, dict) and isinstance(
+                head.get("active"), dict
+            )
+            print(
+                "  modern: "
+                + ("resume interrupted head" if head_active else "incremental head update")
+            )
+            print(
+                "  legacy: "
+                f"{validated['status']}; frontier={validated['next_until']}; "
+                f"account_floor={validated['floor_since']}"
+            )
+        else:
+            resume = state.get("resume")
+            if isinstance(resume, dict):
+                print("  modern: resume historical crawl (cursor redacted)")
+            elif state.get("last_successful_started_at"):
+                print("  modern: incremental update")
+            else:
+                print("  modern: initial source-visible historical crawl")
+            print("  legacy: not initialized; strict transition evidence required")
+            if args.modern_max_posts:
+                print("  legacy/context network: skipped; legacy is not initialized")
+        print(f"  shared media: {pending_count} pending item(s)")
+        summary = context_module.readonly_context_summary(
+            user_dir / "_state" / "context.sqlite3"
+        )
+        if summary["status"] == "absent":
+            print("  context: database absent; bootstrap all committed sources")
+        else:
+            print(
+                "  context: "
+                f"{summary['metadata_pending']} metadata pending, "
+                f"{summary['manual_review']} manual review, "
+                f"{summary['media_pending']} media pending, "
+                f"integrity={'ok' if summary['integrity_ok'] else 'FAILED'}"
+            )
+        if args.post_limit or args.since is not None:
+            print("  note: legacy/context network work is shown but skipped this run")
+
+
+def print_invocation_summary(results: list[dict[str, Any]]) -> None:
+    """Print a compact non-authoritative readout from structured phase truth."""
+    print("X archive phase summary:")
+    phase_names = (
+        "modern",
+        "transition",
+        "modern_head_after_transition",
+        "legacy",
+        "shared_media",
+        "context_seed",
+        "context_metadata",
+        "context_media",
+        "context_export",
+    )
+    for result in results:
+        handle = result["requested_handle"]
+        print(f"  @{handle}: {result['status']}")
+        phases = result.get("phases") or {}
+        for name in phase_names:
+            phase = phases.get(name)
+            if isinstance(phase, dict) and phase.get("status"):
+                print(f"    {name}: {phase['status']}")
 
 
 def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scripts/archive-x",
         description=(
-            "Conservatively archive X posts, replies, reposts, media, profile "
-            "metadata, and point-in-time engagement metrics for later analysis."
+            "Conservatively archive an X account's modern timeline, any proven "
+            "legacy-ID history, reply ancestors, media, and profile metadata."
         ),
     )
     target = parser.add_mutually_exclusive_group(required=True)
@@ -2391,7 +2653,7 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
     parser.add_argument(
         "--full-rescan",
         action="store_true",
-        help="ignore incremental cutoff and any saved cursor",
+        help="rescan the full modern-ID domain without changing legacy state",
     )
     parser.add_argument(
         "--since",
@@ -2407,7 +2669,7 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
     parser.add_argument(
         "--post-limit",
         type=positive_int,
-        help="smoke-test limit; limited runs are never marked complete",
+        help="modern-only smoke limit; later network phases are skipped",
     )
     parser.add_argument(
         "--stalled-rate-limit-cycles",
@@ -2485,28 +2747,50 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-going",
         action="store_true",
-        help="continue to the next user after a failed/partial user run",
+        help="compatibility flag; independent users already continue safely",
     )
     parser.add_argument(
         "--retry-failed-only",
         action="store_true",
         help=(
-            "retry recorded incomplete media without crawling the timeline; "
-            "completed download-only runs are recovered automatically"
+            "retry recorded shared/context media without new timeline, legacy, "
+            "or context-metadata acquisition"
         ),
     )
     parser.add_argument(
         "--seed-reply-context",
         action="store_true",
         help=(
-            "after each durable timeline merge, discover reply-parent work "
-            "locally without launching context network requests"
+            "deprecated compatibility flag; unified context processing is automatic"
         ),
+    )
+    parser.add_argument(
+        "--modern-max-posts",
+        type=positive_int,
+        help=(
+            "advanced rollout bound for modern posts; permits later bounded "
+            "phases only when legacy is already initialized"
+        ),
+    )
+    parser.add_argument(
+        "--legacy-max-windows",
+        type=positive_int,
+        help="advanced rollout/diagnostic limit for committed legacy root windows",
+    )
+    parser.add_argument(
+        "--context-max-posts",
+        type=positive_int,
+        help="advanced rollout/diagnostic limit for reply-parent attempts",
+    )
+    parser.add_argument(
+        "--context-media-max-posts",
+        type=positive_int,
+        help="advanced rollout/diagnostic limit for context-media attempts",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="validate and show the plan without network calls or writes",
+        help="read-only preview of all phases and existing backlog state",
     )
     return parser
 
@@ -2516,10 +2800,25 @@ def main(argv: list[str] | None = None) -> int:
     repo_dir = Path(__file__).resolve().parent.parent
     parser = build_parser(repo_dir)
     args = parser.parse_args(argv)
+    if args.seed_reply_context:
+        print(
+            "note: --seed-reply-context is deprecated and no longer changes "
+            "behavior; context seeding and resolution are automatic"
+        )
     if args.full_rescan and args.since is not None:
         parser.error("--full-rescan and --since cannot be used together")
+    if args.modern_max_posts and (
+        args.post_limit or args.since is not None or args.full_rescan
+    ):
+        parser.error(
+            "--modern-max-posts cannot be combined with --post-limit, "
+            "--since, or --full-rescan"
+        )
     if args.retry_failed_only and (
-        args.full_rescan or args.since is not None or args.post_limit
+        args.full_rescan
+        or args.since is not None
+        or args.post_limit
+        or args.modern_max_posts
     ):
         parser.error(
             "--retry-failed-only cannot be combined with --full-rescan, "
@@ -2539,55 +2838,162 @@ def main(argv: list[str] | None = None) -> int:
             dry_run_summary(args, archive_root, targets, version)
             return 0
 
+        if filesystem_is_read_only(archive_root):
+            raise ArchiveError(
+                f"archive root filesystem is mounted read-only: {archive_root}"
+            )
         archive_root.mkdir(parents=True, exist_ok=True)
         if not os.access(archive_root, os.W_OK | os.X_OK):
             raise ArchiveError(f"archive root is not writable: {archive_root}")
 
         invocation_started = utc_now()
         invocation_id = run_id(invocation_started)
-        results: list[dict[str, Any]] = []
-        with exclusive_lock(repo_dir / "state" / "locks" / "archive-x.lock"), \
-             exclusive_lock(archive_root / "_state" / "archive-x.lock"):
-            for index, handle in enumerate(targets):
-                if index:
-                    sleep_random(args.user_delay, f"before user {handle}")
-                try:
-                    result = archive_user(
-                        args, repo_dir, archive_root, handle, version
-                    )
-                except KeyboardInterrupt:
-                    print("Interrupted; partial run data and logs were retained.")
-                    return 130
-                results.append(
-                    {
-                        "requested_handle": handle,
-                        "run_id": result["run_id"],
-                        "status": result["status"],
-                    }
-                )
-                if result["status"] not in {"success", "limited"}:
-                    print(
-                        f"Archive for {handle} ended with status "
-                        f"{result['status']}."
-                    )
-                    if not args.keep_going:
-                        break
-
         invocation = {
             "schema": SCHEMA_NAME,
             "schema_version": SCHEMA_VERSION,
             "invocation_id": invocation_id,
             "started_at": iso_utc(invocation_started),
-            "completed_at": iso_utc(utc_now()),
+            "status": "running",
             "gallery_dl_version": version,
-            "results": results,
+            "results": [],
         }
-        atomic_write_json(archive_root / "runs" / f"{invocation_id}.json", invocation)
+        invocation_path = archive_root / "runs" / f"{invocation_id}.json"
+        modern_results: dict[str, dict[str, Any]] = {}
+        latest_combined: dict[str, dict[str, Any]] = {}
+
+        def checkpoint_invocation(
+            phase_results: dict[str, dict[str, Any]] | None = None,
+            *,
+            status: str = "running",
+            error: str | None = None,
+        ) -> None:
+            nonlocal latest_combined
+            if phase_results is not None:
+                latest_combined = phase_results
+            rows = []
+            phases_by_handle = phase_results or {}
+            for handle in targets:
+                phases = phases_by_handle.get(handle)
+                if phases is None and handle in modern_results:
+                    phases = {"modern": modern_results[handle]}
+                phases = phases or {}
+                target_status = phases.get("status")
+                if not target_status:
+                    if status != "running":
+                        target_status = status
+                    else:
+                        target_status = "running" if phases else "pending"
+                rows.append(
+                    {
+                        "requested_handle": handle,
+                        "status": target_status,
+                        "phases": phases,
+                    }
+                )
+            invocation["status"] = status
+            invocation["results"] = rows
+            invocation["updated_at"] = iso_utc(utc_now())
+            if status != "running":
+                invocation["completed_at"] = invocation["updated_at"]
+            if error:
+                invocation["error"] = error
+            atomic_write_json(invocation_path, invocation)
+
+        checkpoint_invocation()
+        combined: dict[str, dict[str, Any]] = {}
+        current_handle: str | None = None
+        try:
+            with exclusive_lock(repo_dir / "state" / "locks" / "archive-x.lock"), \
+                 exclusive_lock(archive_root / "_state" / "archive-x.lock"):
+                finalized_invocations = finalize_abandoned_invocations(
+                    archive_root,
+                    current_invocation_id=invocation_id,
+                    current_started_at=invocation["started_at"],
+                    recovered_at=iso_utc(utc_now()),
+                )
+                if finalized_invocations:
+                    invocation["finalized_abandoned_invocations"] = (
+                        finalized_invocations
+                    )
+                    checkpoint_invocation()
+                for index, handle in enumerate(targets):
+                    current_handle = handle
+                    if index:
+                        sleep_random(args.user_delay, f"before user {handle}")
+                    try:
+                        result = archive_user(
+                            args, repo_dir, archive_root, handle, version
+                        )
+                    except ArchiveError as exc:
+                        result = {
+                            "status": "failed",
+                            "failure_stage": "modern",
+                            "error": str(exc),
+                        }
+                    modern_results[handle] = result
+                    current_handle = None
+                    checkpoint_invocation()
+                    if result["status"] not in {
+                        "success",
+                        "partial",
+                        "limited",
+                        "stalled",
+                    }:
+                        print(
+                            f"Modern archive phase for {handle} ended with status "
+                            f"{result['status']}."
+                        )
+                unified = importlib.import_module("archive_x_unified")
+                combined = unified.run_unified_followups(
+                    args,
+                    repo_dir,
+                    archive_root,
+                    version,
+                    modern_results,
+                    checkpoint=checkpoint_invocation,
+                )
+        except KeyboardInterrupt:
+            if current_handle and current_handle not in modern_results:
+                modern_results[current_handle] = {
+                    "status": "interrupted",
+                    "failure_stage": "modern",
+                }
+            checkpoint_invocation(latest_combined or None, status="interrupted")
+            print("Interrupted; partial phase state, logs, and invocation were retained.")
+            return 130
+        except (ArchiveError, OSError) as exc:
+            checkpoint_invocation(
+                latest_combined or None,
+                status="failed",
+                error=str(exc),
+            )
+            raise
+
+        results = []
+        for handle in targets:
+            target = combined.get(handle) or {
+                "modern": modern_results[handle],
+                "status": "failed",
+            }
+            results.append(
+                {
+                    "requested_handle": handle,
+                    "status": target.get("status", "failed"),
+                    "phases": target,
+                }
+            )
         unsuccessful = [
             result
             for result in results
             if result["status"] not in {"success", "limited"}
         ]
+        final_status = "failed" if unsuccessful else (
+            "limited"
+            if any(result["status"] == "limited" for result in results)
+            else "success"
+        )
+        checkpoint_invocation(combined, status=final_status)
+        print_invocation_summary(results)
         return 1 if unsuccessful or len(results) < len(targets) else 0
     except ArchiveError as exc:
         parser.exit(2, f"archive-x: {exc}\n")

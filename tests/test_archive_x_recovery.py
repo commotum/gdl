@@ -653,6 +653,60 @@ class StallRecoveryTests(unittest.TestCase):
                 [],
             )
 
+    def test_modern_head_recovery_never_reuses_historical_cursor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir = Path(directory) / "tszzl"
+            run_dir = write_legacy_run(
+                user_dir,
+                interrupted=True,
+                log=self.WAIT * 4 + "\nKeyboardInterrupt\n",
+            )
+            raw = run_dir / "raw" / "timeline.posts.incomplete.jsonl"
+            raw.write_text(
+                '{"tweet_id": 300}\n{"tweet_id": 100}\n',
+                encoding="utf-8",
+            )
+            old_timestamp = (
+                archive_x.parse_datetime(COMPLETED_AT).timestamp() - 3600
+            )
+            os.utime(raw, (old_timestamp, old_timestamp))
+            historical = {
+                "cursor": "3_29116490825/",
+                "started_at": "2026-07-01T00:00:00Z",
+            }
+            state = {
+                "resume": copy.deepcopy(historical),
+                "modern_head": {
+                    "last_successful_started_at": "2026-07-13T00:00:00Z",
+                    "active": None,
+                },
+            }
+
+            recovered = archive_x.recover_stalled_interrupted_runs(
+                state,
+                user_dir,
+                minimum_waits=3,
+                modern_head_mode=True,
+            )
+
+            self.assertEqual(recovered, [])
+            self.assertEqual(state["resume"], historical)
+            self.assertIsNone(state["modern_head"]["active"])
+
+            manifest_path = run_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["timeline_mode"] = "modern_head"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            recovered = archive_x.recover_stalled_interrupted_runs(
+                state,
+                user_dir,
+                minimum_waits=3,
+                modern_head_mode=True,
+            )
+            self.assertEqual(recovered, [RUN_ID])
+            self.assertEqual(state["resume"], historical)
+            self.assertEqual(state["modern_head"]["active"]["cursor"], "3_100/")
+
     def test_does_not_synthesize_cursor_for_an_ordinary_interrupt(self):
         with tempfile.TemporaryDirectory() as directory:
             user_dir = Path(directory) / "tszzl"
@@ -741,6 +795,44 @@ class MigrationTests(unittest.TestCase):
                 archive_x.recover_download_only_runs(state, user_dir), []
             )
             self.assertEqual(state, once)
+
+    def test_download_only_recovery_commits_only_to_modern_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir = Path(directory) / "tszzl"
+            run_dir = write_legacy_run(user_dir)
+            manifest_path = run_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["timeline_mode"] = "modern_head"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            historical = {
+                "cursor": "3_29116490825/",
+                "started_at": "2026-07-01T00:00:00Z",
+            }
+            state = {
+                "resume": copy.deepcopy(historical),
+                "modern_head": {
+                    "last_successful_started_at": "2026-07-14T00:00:00Z",
+                    "last_successful_completed_at": "2026-07-14T01:00:00Z",
+                    "active": {
+                        "cursor": "head-cursor",
+                        "started_at": STARTED_AT,
+                    },
+                },
+            }
+
+            recovered = archive_x.recover_download_only_runs(
+                state, user_dir, modern_head_mode=True
+            )
+
+            self.assertEqual(recovered, [RUN_ID])
+            self.assertEqual(state["resume"], historical)
+            self.assertEqual(
+                state["modern_head"]["last_successful_started_at"], STARTED_AT
+            )
+            self.assertEqual(
+                state["modern_head"]["last_successful_completed_at"], COMPLETED_AT
+            )
+            self.assertIsNone(state["modern_head"]["active"])
 
     def test_refuses_provisional_running_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

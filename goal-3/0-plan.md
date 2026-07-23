@@ -26,8 +26,9 @@ window counts, or post budgets. UTC legacy windows, SQLite context queues,
 request caps, leases, retries, pacing, checkpoints, and media queues remain
 internal safety mechanisms.
 
-This folder is scaffolding only. Refreshing it does not authorize code changes,
-live X requests, production state mutation, or restarting Visakanv.
+This goal was explicitly started on branch `goal-3-unified-x-archive` on
+2026-07-22. Production rollout remains separately bounded; starting the goal
+does not authorize the remaining Visakanv backlogs.
 
 ## Scope and Completion Boundary
 
@@ -168,8 +169,13 @@ Prioritized in this order:
 - Goal 2 ended with 258,070 dataset posts and two pending media items. At that
   point no context database existed for Visakanv; Stage 1 must recheck this
   rather than assume it remains true.
-- The repository passed 126 tests after Goal 2. The worktree contains
-  intentional uncommitted Goal 2 implementation and documentation.
+- Goal 2's 126-test baseline was committed before this branch. The first Goal 3
+  baseline run passed 123 tests while three legacy CLI tests were blocked by a
+  real archive process holding the repository lock; no executable code had
+  changed.
+- Work is isolated on `goal-3-unified-x-archive`. Tmux `x` is currently running
+  the unrelated `airkatakana` modern archive, so executable edits and clean
+  full-suite verification must not occur until it releases the shared lock.
 
 ## Assumptions Requiring Proof
 
@@ -302,6 +308,10 @@ private, or no longer indexes.
 
 ### 1-FLOWMAP
 
+Status: complete on 2026-07-22. The modern, legacy, context, media, state,
+manifest, lock, option, and production boundaries are recorded in
+`1-FLOWMAP.md`; no live process or production artifact was changed.
+
 #### Big Picture Objective
 
 Map all three existing engines, state authorities, locks, media paths, and
@@ -332,6 +342,11 @@ option interactions before changing orchestration.
 
 ### 2-LIFECYCLE
 
+Status: complete on 2026-07-22. The authoritative state split, strict
+transition gate, `modern_head` checkpoint, phase order, context source ledger,
+closure-aware no-budget engines, multi-user fairness, options, and exit
+semantics are fixed in `2-LIFECYCLE.md`; production remained untouched.
+
 #### Big Picture Objective
 
 Specify the exact three-phase state machine, completion language, and operator
@@ -361,6 +376,11 @@ semantics before implementation.
 
 ### 3-DETECT
 
+Status: complete on 2026-07-22. Strict automatic classification, exact backup
+and initialization, separate schema-validated modern-head state, fault tests,
+and read-only production derivation are implemented and recorded in
+`3-DETECT.md`.
+
 #### Big Picture Objective
 
 Implement strict, auditable automatic legacy detection and guarded setup.
@@ -385,6 +405,10 @@ Implement strict, auditable automatic legacy detection and guarded setup.
 - Modern cursor/run evidence and unrelated state remain preserved.
 
 ### 4-ENGINES
+
+Status: complete on 2026-07-22. Typed direct legacy execution, closure-aware
+no-budget context execution, optional advanced CLI bounds, and focused tests
+are implemented in `4-ENGINES.md`; inner safety limits are unchanged.
 
 #### Big Picture Objective
 
@@ -417,6 +441,11 @@ safety-critical state machines.
 
 ### 5-SEEDING
 
+Status: complete on 2026-07-22. Context schema-v2 migration/backup,
+manifest-authoritative modern+legacy source discovery, transactional source
+ledger, persistent local-parent index, exclusions, recovery tests, and a
+read-only production inventory are implemented in `5-SEEDING.md`.
+
 #### Big Picture Objective
 
 Guarantee every durable modern or legacy authored reply enters the context
@@ -444,6 +473,11 @@ graph exactly and efficiently.
 - Seeding makes zero X requests and does not advance any archive cursor.
 
 ### 6-ORCHESTRATE
+
+Status: complete on 2026-07-22. One-lock direct orchestration, automatic
+transition/head recheck, legacy/context fairness, shared/context media,
+structured phase results, and pagination-domain-safe recovery are implemented
+and verified in `6-ORCHESTRATE.md`.
 
 #### Big Picture Objective
 
@@ -474,6 +508,11 @@ legacy, context, and media work.
 
 ### 7-RECOVERY
 
+Status: complete on 2026-07-22. Durable combined checkpoints, truthful
+interruption, per-target fault isolation, typed global authentication stops,
+idempotent ordinary reruns, and cross-engine recovery evidence are recorded in
+`7-RECOVERY.md`.
+
 #### Big Picture Objective
 
 Prove the three-phase lifecycle is safe across crashes, interruption, partial
@@ -500,6 +539,10 @@ writes, and manual-review states.
 - Manual-review items remain visible and are never automatically reset.
 
 ### 8-UX
+
+Status: complete on 2026-07-22. The exact one-command UX, read-only phase-aware
+dry-run, truthful summary, modern-domain option guard, README, and generated
+dataset documentation are complete and recorded in `8-UX.md`.
 
 #### Big Picture Objective
 
@@ -529,6 +572,11 @@ one command and one coherent readout.
   that ever existed.”
 
 ### 9-VERIFY
+
+Status: complete on 2026-07-22. All 176 repository tests, both runner
+fingerprints, option/failure/static/privacy/mode/artifact audits, production
+read-only dry-run, and frozen Visakanv hash checks passed as recorded in
+`9-VERIFY.md`.
 
 #### Big Picture Objective
 
@@ -597,4 +645,3 @@ recoverable media handling with no required phase-specific follow-up commands
 or operator-calculated budgets. A wrapper that merely seeds context, a main
 command that still requires separate legacy/context invocations, or green tests
 that never exercise the phase transitions do not satisfy the objective.
-

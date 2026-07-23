@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterator
 import archive_x
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MIN_CONTEXT_MEDIA_FREE_BYTES = 5 * 1024 * 1024 * 1024
 VALID_STATES = (
     "pending",
@@ -64,8 +64,12 @@ SENSITIVE_LOG_RE = re.compile(
 )
 
 
-class ContextError(RuntimeError):
+class ContextError(archive_x.ArchiveError):
     """A fail-closed context archive error."""
+
+
+class ContextAuthenticationError(ContextError):
+    """A credential/account failure that must stop all network workers."""
 
 
 def utc_now() -> datetime:
@@ -100,6 +104,106 @@ def safe_detail(value: str, limit: int = 2000) -> str:
         for line in value.replace("\x00", "").splitlines()
     )
     return value[-limit:]
+
+
+def existing_schema_version(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT value FROM context_meta WHERE key='schema_version'"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return 0
+    try:
+        return int(row[0]) if row else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def readonly_context_summary(path: Path) -> dict[str, Any]:
+    """Inspect queue truth without creating, migrating, or journaling a DB."""
+    if not path.is_file():
+        return {"status": "absent"}
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            version_row = connection.execute(
+                "SELECT value FROM context_meta WHERE key='schema_version'"
+            ).fetchone()
+            version = int(version_row[0]) if version_row else 0
+            states = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    "SELECT state,COUNT(*) FROM targets GROUP BY state"
+                )
+            }
+            media = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    "SELECT media_state,COUNT(*) FROM targets GROUP BY media_state"
+                )
+            }
+            edges = int(
+                connection.execute("SELECT COUNT(*) FROM reply_edges").fetchone()[0]
+            )
+            quick = connection.execute("PRAGMA quick_check").fetchone()
+            foreign = connection.execute("PRAGMA foreign_key_check").fetchone()
+        finally:
+            connection.close()
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        raise ContextError(f"cannot inspect context database read-only: {exc}") from exc
+    pending = sum(
+        int(states.get(name, 0)) for name in ("pending", "retryable", "leased")
+    )
+    manual = int(states.get("manual_review", 0))
+    media_pending = sum(
+        int(media.get(name, 0))
+        for name in ("pending", "retryable", "leased", "manual_review")
+    )
+    return {
+        "status": "present",
+        "schema_version": version,
+        "targets": sum(states.values()),
+        "edges": edges,
+        "metadata_pending": pending,
+        "manual_review": manual,
+        "media_pending": media_pending,
+        "integrity_ok": bool(quick and quick[0] == "ok" and foreign is None),
+    }
+
+
+def backup_context_before_v2(path: Path) -> Path:
+    digest = archive_x.sha256_file(path)
+    backup = path.parent / "backups" / f"context.pre-v2-{digest[:12]}.sqlite3"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    if backup.exists():
+        if archive_x.sha256_file(backup) != digest:
+            raise ContextError("context migration backup exists with changed bytes")
+        return backup
+    temporary = backup.with_name(f".{backup.name}.tmp-{os.getpid()}")
+    try:
+        shutil.copyfile(path, temporary)
+        os.chmod(temporary, 0o600)
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        if archive_x.sha256_file(temporary) != digest:
+            raise ContextError("context migration backup verification failed")
+        os.replace(temporary, backup)
+        directory_fd = os.open(backup.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return backup
 
 
 @contextlib.contextmanager
@@ -138,6 +242,9 @@ class ContextDB:
             raise ContextError(f"context database does not exist: {path}")
         if create:
             path.parent.mkdir(parents=True, exist_ok=True)
+        self.migration_backup: Path | None = None
+        if existing_schema_version(path) == 1:
+            self.migration_backup = backup_context_before_v2(path)
         self.connection = sqlite3.connect(path, timeout=30, isolation_level=None)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
@@ -179,10 +286,50 @@ class ContextDB:
             version = int(row[0]) if row else 0
         except (TypeError, ValueError):
             version = 0
+        if version == 1:
+            self._migrate_v1_to_v2()
+            return
         if version != SCHEMA_VERSION:
             raise ContextError(
                 f"unsupported context schema {version}; expected {SCHEMA_VERSION}"
             )
+
+    def _migrate_v1_to_v2(self) -> None:
+        try:
+            self.connection.executescript(
+                """BEGIN IMMEDIATE;
+                CREATE TABLE seed_sources (
+                    relative_path TEXT PRIMARY KEY,
+                    sha256 TEXT NOT NULL
+                        CHECK(length(sha256)=64
+                              AND sha256 NOT GLOB '*[^0-9a-f]*'),
+                    source_kind TEXT NOT NULL
+                        CHECK(source_kind IN ('modern','legacy')),
+                    run_id TEXT NOT NULL,
+                    processed_at TEXT NOT NULL,
+                    record_count INTEGER NOT NULL CHECK(record_count >= 0),
+                    edge_count INTEGER NOT NULL CHECK(edge_count >= 0)
+                );
+                CREATE TABLE local_posts (
+                    post_id TEXT PRIMARY KEY
+                        CHECK(post_id <> '' AND post_id NOT GLOB '*[^0-9]*'),
+                    raw_json TEXT NOT NULL,
+                    sha256 TEXT NOT NULL
+                        CHECK(length(sha256)=64
+                              AND sha256 NOT GLOB '*[^0-9a-f]*'),
+                    relative_path TEXT NOT NULL,
+                    source_kind TEXT NOT NULL
+                        CHECK(source_kind IN ('modern','legacy')),
+                    run_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL
+                );
+                CREATE INDEX local_posts_source ON local_posts(relative_path);
+                UPDATE context_meta SET value='2' WHERE key='schema_version';
+                COMMIT;"""
+            )
+        except BaseException:
+            self.connection.rollback()
+            raise
 
     def _create_schema(self) -> None:
         states = ",".join(f"'{state}'" for state in VALID_STATES)
@@ -244,6 +391,34 @@ class ContextDB:
                     capture_count INTEGER NOT NULL DEFAULT 1
                         CHECK(capture_count >= 1)
                 );
+
+                CREATE TABLE seed_sources (
+                    relative_path TEXT PRIMARY KEY,
+                    sha256 TEXT NOT NULL
+                        CHECK(length(sha256)=64
+                              AND sha256 NOT GLOB '*[^0-9a-f]*'),
+                    source_kind TEXT NOT NULL
+                        CHECK(source_kind IN ('modern','legacy')),
+                    run_id TEXT NOT NULL,
+                    processed_at TEXT NOT NULL,
+                    record_count INTEGER NOT NULL CHECK(record_count >= 0),
+                    edge_count INTEGER NOT NULL CHECK(edge_count >= 0)
+                );
+
+                CREATE TABLE local_posts (
+                    post_id TEXT PRIMARY KEY
+                        CHECK(post_id <> '' AND post_id NOT GLOB '*[^0-9]*'),
+                    raw_json TEXT NOT NULL,
+                    sha256 TEXT NOT NULL
+                        CHECK(length(sha256)=64
+                              AND sha256 NOT GLOB '*[^0-9a-f]*'),
+                    relative_path TEXT NOT NULL,
+                    source_kind TEXT NOT NULL
+                        CHECK(source_kind IN ('modern','legacy')),
+                    run_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL
+                );
+                CREATE INDEX local_posts_source ON local_posts(relative_path);
 
                 CREATE TABLE pacing (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -574,6 +749,53 @@ class ContextDB:
                 self._set_meta("active_steps", str(active_steps))
             return row
 
+    def work_availability(
+        self, *, now: float, lease_seconds: float, media: bool = False
+    ) -> dict[str, Any]:
+        """Describe remaining work when no target is immediately claimable."""
+        ready = 0
+        manual_review = 0
+        next_at: float | None = None
+        if media:
+            rows = self.connection.execute(
+                """SELECT media_state AS state,media_next_attempt_at AS eligible,
+                          lease_started_at FROM targets
+                   WHERE state='captured'
+                     AND media_state IN
+                         ('pending','retryable','leased','manual_review')"""
+            )
+        else:
+            rows = self.connection.execute(
+                """SELECT state,next_attempt_at AS eligible,lease_started_at
+                     FROM targets
+                    WHERE state IN
+                        ('pending','retryable','leased','manual_review')"""
+            )
+        total = 0
+        for row in rows:
+            total += 1
+            state = row["state"]
+            if state == "manual_review":
+                manual_review += 1
+                continue
+            if state == "pending" or (
+                state == "retryable" and float(row["eligible"] or 0) <= now
+            ):
+                ready += 1
+                continue
+            eligible = (
+                float(row["lease_started_at"] or now) + lease_seconds
+                if state == "leased"
+                else float(row["eligible"] or now)
+            )
+            next_at = eligible if next_at is None else min(next_at, eligible)
+        return {
+            "total": total,
+            "ready": ready,
+            "manual_review": manual_review,
+            "next_eligible_at": next_at,
+        }
+
     def _set_meta(self, key: str, value: str | None) -> None:
         if value is None:
             self.connection.execute("DELETE FROM context_meta WHERE key=?", (key,))
@@ -767,12 +989,91 @@ def target_identity(user_dir: Path) -> tuple[str, str]:
     return target_id, handle
 
 
-def timeline_raw_paths(user_dir: Path) -> list[Path]:
-    return sorted(
-        path
-        for path in (user_dir / "runs").glob("*/raw/timeline.posts*.jsonl*")
-        if path.is_file() and not path.name.endswith(".tmp")
+@dataclass(frozen=True)
+class SeedSource:
+    path: Path
+    relative_path: str
+    sha256: str
+    source_kind: str
+    run_id: str
+
+
+def _seed_source(
+    user_dir: Path, path_value: Any, *, source_kind: str, run_id: str
+) -> SeedSource:
+    relative = Path(str(path_value or ""))
+    if relative.is_absolute() or not relative.parts:
+        raise ContextError("context seed source path is invalid")
+    path = (user_dir / relative).resolve()
+    runs_dir = (user_dir / "runs").resolve()
+    if (
+        not path.is_file()
+        or runs_dir not in path.parents
+        or path.name.endswith(".tmp")
+    ):
+        raise ContextError(f"canonical context seed source is missing: {relative}")
+    return SeedSource(
+        path=path,
+        relative_path=str(path.relative_to(user_dir.resolve())),
+        sha256=archive_x.sha256_file(path),
+        source_kind=source_kind,
+        run_id=run_id,
     )
+
+
+def canonical_seed_sources(user_dir: Path) -> list[SeedSource]:
+    by_path: dict[str, SeedSource] = {}
+    for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
+        manifest = archive_x.load_json(manifest_path, None)
+        if not isinstance(manifest, dict) or manifest.get("status") == "running":
+            continue
+        run_id = str(manifest.get("run_id") or manifest_path.parent.name)
+        candidates: list[SeedSource] = []
+        if manifest.get("mode") == "legacy_backfill":
+            for window in manifest.get("windows", ()):
+                if not isinstance(window, dict) or not (
+                    window.get("status") == "success"
+                    and window.get("metadata_confirmed") is True
+                    and window.get("state_committed") is True
+                ):
+                    continue
+                candidates.append(
+                    _seed_source(
+                        user_dir,
+                        window.get("canonical_raw_path"),
+                        source_kind="legacy",
+                        run_id=run_id,
+                    )
+                )
+        elif isinstance(manifest.get("post_dataset"), dict):
+            for endpoint in manifest.get("endpoints", ()):
+                if not isinstance(endpoint, dict) or endpoint.get("endpoint") != "timeline":
+                    continue
+                candidates.append(
+                    _seed_source(
+                        user_dir,
+                        endpoint.get("raw_path"),
+                        source_kind="modern",
+                        run_id=run_id,
+                    )
+                )
+        for source in candidates:
+            previous = by_path.get(source.relative_path)
+            if previous is not None and previous != source:
+                raise ContextError(
+                    f"conflicting canonical context source: {source.relative_path}"
+                )
+            by_path[source.relative_path] = source
+    return [by_path[key] for key in sorted(by_path)]
+
+
+def timeline_raw_paths(user_dir: Path) -> list[Path]:
+    """Compatibility view of manifest-authoritative modern raw sources."""
+    return [
+        source.path
+        for source in canonical_seed_sources(user_dir)
+        if source.source_kind == "modern"
+    ]
 
 
 def is_target_reply_candidate(metadata: dict[str, Any], target_id: str) -> bool:
@@ -794,14 +1095,24 @@ def seed_context(
     raw_paths: list[Path] | None = None,
 ) -> dict[str, int]:
     target_id, _handle = target_identity(user_dir)
-    paths = timeline_raw_paths(user_dir) if raw_paths is None else sorted(raw_paths)
-    runs_dir = (user_dir / "runs").resolve()
-    for path in paths:
-        resolved = path.resolve()
-        if not resolved.is_file() or runs_dir not in resolved.parents:
-            raise ContextError(f"timeline raw path is outside this archive: {path}")
+    authoritative = canonical_seed_sources(user_dir)
+    by_resolved = {source.path: source for source in authoritative}
+    if raw_paths is None:
+        sources = authoritative
+    else:
+        sources = []
+        for path in sorted(raw_paths):
+            resolved = path.resolve()
+            source = by_resolved.get(resolved)
+            if source is None:
+                raise ContextError(
+                    f"raw path is not a committed canonical source: {path}"
+                )
+            sources.append(source)
     stats = {
-        "files": len(paths),
+        "files": len(sources),
+        "files_processed": 0,
+        "files_skipped": 0,
         "records": 0,
         "reply_edges": 0,
         "unique_parents": 0,
@@ -812,9 +1123,8 @@ def seed_context(
     edges: dict[str, tuple[str, str | None, str | None]] = {}
     parents: set[str] = set()
     local_post_ids: set[str] = set()
-    for path in paths:
-        run_id = path.parents[1].name
-        for metadata in archive_x.iter_jsonl(path):
+    for source in sources:
+        for metadata in archive_x.iter_jsonl(source.path):
             stats["records"] += 1
             record_id = id_string(metadata.get("tweet_id"))
             author_id = id_string((metadata.get("author") or {}).get("id"))
@@ -827,7 +1137,11 @@ def seed_context(
             if not child or not parent:
                 stats["malformed"] += 1
                 continue
-            value = (parent, id_string(metadata.get("conversation_id")), run_id)
+            value = (
+                parent,
+                id_string(metadata.get("conversation_id")),
+                source.run_id,
+            )
             previous = edges.get(child)
             if previous and previous[0] != parent:
                 raise ContextError(
@@ -844,43 +1158,106 @@ def seed_context(
     observed_at = iso_now()
     with ContextDB(db_path) as context:
         context.bind_identity(target_id, _handle)
-        with transaction(context.connection):
-            for child, (parent, conversation, run_id) in edges.items():
-                context.add_edge(
-                    child,
-                    parent,
-                    conversation_id=conversation,
-                    depth=0,
-                    run_id=run_id,
-                    observed_at=observed_at,
-                    max_depth=max_depth,
-                )
-        unresolved = {
-            row[0]
-            for row in context.connection.execute(
-                "SELECT post_id FROM targets WHERE state != 'captured'"
-            )
-        }
-        needed_local = parents & unresolved
-        if needed_local:
-            for path in paths:
-                for metadata in archive_x.iter_jsonl(path):
+        for source in sources:
+            previous = context.connection.execute(
+                "SELECT sha256 FROM seed_sources WHERE relative_path=?",
+                (source.relative_path,),
+            ).fetchone()
+            if previous is not None:
+                if previous[0] != source.sha256:
+                    raise ContextError(
+                        "previously seeded canonical source changed: "
+                        + source.relative_path
+                    )
+                stats["files_skipped"] += 1
+                continue
+            source_records = list(archive_x.iter_jsonl(source.path))
+            source_edges = 0
+            with transaction(context.connection):
+                for metadata in source_records:
                     post_id = id_string(metadata.get("tweet_id"))
                     author_id = id_string((metadata.get("author") or {}).get("id"))
-                    if post_id in needed_local and author_id == target_id:
-                        context.capture(
-                            post_id,
-                            metadata,
-                            source_kind=f"timeline:{path.parents[1].name}",
-                            target_user_id=target_id,
-                            max_depth=max_depth,
+                    if post_id and author_id == target_id:
+                        raw_json = json.dumps(
+                            metadata, ensure_ascii=False, sort_keys=True
                         )
-                        stats["local_parents"] += 1
-                        needed_local.remove(post_id)
-                        if not needed_local:
-                            break
-                if not needed_local:
-                    break
+                        digest = hashlib.sha256(raw_json.encode()).hexdigest()
+                        source_observed = str(
+                            metadata.get("archived_at") or observed_at
+                        )
+                        context.connection.execute(
+                            """INSERT INTO local_posts(
+                                   post_id,raw_json,sha256,relative_path,
+                                   source_kind,run_id,observed_at
+                               ) VALUES (?,?,?,?,?,?,?)
+                               ON CONFLICT(post_id) DO UPDATE SET
+                                   raw_json=excluded.raw_json,
+                                   sha256=excluded.sha256,
+                                   relative_path=excluded.relative_path,
+                                   source_kind=excluded.source_kind,
+                                   run_id=excluded.run_id,
+                                   observed_at=excluded.observed_at
+                               WHERE excluded.observed_at >= local_posts.observed_at""",
+                            (
+                                post_id,
+                                raw_json,
+                                digest,
+                                source.relative_path,
+                                source.source_kind,
+                                source.run_id,
+                                source_observed,
+                            ),
+                        )
+                    if not is_target_reply_candidate(metadata, target_id):
+                        continue
+                    child = id_string(metadata.get("tweet_id"))
+                    parent = id_string(metadata.get("reply_id"))
+                    if not child or not parent:
+                        continue
+                    if context.add_edge(
+                        child,
+                        parent,
+                        conversation_id=id_string(metadata.get("conversation_id")),
+                        depth=0,
+                        run_id=source.run_id,
+                        observed_at=observed_at,
+                        max_depth=max_depth,
+                    ):
+                        source_edges += 1
+                context.connection.execute(
+                    """INSERT INTO seed_sources(
+                           relative_path,sha256,source_kind,run_id,processed_at,
+                           record_count,edge_count
+                       ) VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        source.relative_path,
+                        source.sha256,
+                        source.source_kind,
+                        source.run_id,
+                        observed_at,
+                        len(source_records),
+                        source_edges,
+                    ),
+                )
+            stats["files_processed"] += 1
+
+        local_candidates = list(
+            context.connection.execute(
+                """SELECT t.post_id,l.raw_json,l.source_kind,l.run_id
+                     FROM targets t JOIN local_posts l ON l.post_id=t.post_id
+                    WHERE t.state != 'captured' ORDER BY t.depth_min,t.post_id"""
+            )
+        )
+        stats["local_parent_candidates"] = len(local_candidates)
+        for row in local_candidates:
+            context.capture(
+                row["post_id"],
+                json.loads(row["raw_json"]),
+                source_kind=f"timeline:{row['source_kind']}:{row['run_id']}",
+                target_user_id=target_id,
+                max_depth=max_depth,
+            )
+            stats["local_parents"] += 1
     return stats
 
 
@@ -1121,7 +1498,7 @@ def run_worker(
     db_path: Path,
     handle: str,
     cookie_file: Path,
-    max_posts: int,
+    max_posts: int | None,
     request_delay: str,
     retry_delay: float,
     max_attempts: int,
@@ -1130,7 +1507,11 @@ def run_worker(
     max_depth: int,
     media: bool,
     fetcher: Callable[..., FetchResult] = fetch_post,
+    clock: Callable[[], float] = time.time,
+    idle_sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, int]:
+    if max_posts is not None and max_posts < 1:
+        raise ContextError("context post limit must be positive")
     target_id, canonical_handle = target_identity(user_dir)
     counts = {"attempted": 0, "captured": 0, "unavailable": 0, "retryable": 0,
               "manual_review": 0}
@@ -1139,15 +1520,29 @@ def run_worker(
         errors = context.integrity_errors()
         if errors:
             raise ContextError("; ".join(errors))
-        for _ in range(max_posts):
+        while max_posts is None or counts["attempted"] < max_posts:
+            current = clock()
             row = context.claim(
-                now=time.time(),
+                now=current,
                 lease_seconds=lease_seconds,
                 fairness_quantum=fairness_quantum,
                 media=media,
             )
             if row is None:
-                break
+                if max_posts is not None:
+                    break
+                availability = context.work_availability(
+                    now=current, lease_seconds=lease_seconds, media=media
+                )
+                next_at = availability["next_eligible_at"]
+                if availability["ready"]:
+                    raise ContextError(
+                        "context queue reported ready work that could not be claimed"
+                    )
+                if next_at is None:
+                    break
+                idle_sleep(max(0.01, min(float(next_at) - current, 60.0)))
+                continue
             post_id = row["post_id"]
             counts["attempted"] += 1
             if media and context_media_complete(user_dir, post_id):
@@ -1172,7 +1567,7 @@ def run_worker(
                     post_id,
                     error_class="interrupted",
                     detail="operator interrupt",
-                    now=time.time(),
+                    now=clock(),
                     max_attempts=max_attempts,
                     retry_delay=0,
                     media=media,
@@ -1184,7 +1579,7 @@ def run_worker(
                     post_id,
                     error_class="interrupted",
                     detail=result.log,
-                    now=time.time(),
+                    now=clock(),
                     max_attempts=max_attempts,
                     retry_delay=0,
                     media=media,
@@ -1201,7 +1596,7 @@ def run_worker(
                             post_id,
                             error_class="media_download",
                             detail=result.log,
-                            now=time.time(),
+                            now=clock(),
                             max_attempts=max_attempts,
                             retry_delay=retry_delay,
                             media=True,
@@ -1226,7 +1621,7 @@ def run_worker(
                 post_id,
                 error_class=error_class,
                 detail=result.log,
-                now=time.time(),
+                now=clock(),
                 max_attempts=max_attempts,
                 retry_delay=retry_delay,
                 terminal=terminal,
@@ -1234,7 +1629,7 @@ def run_worker(
             )
             counts[state] = counts.get(state, 0) + 1
             if global_stop:
-                raise ContextError(
+                raise ContextAuthenticationError(
                     "context worker stopped on authentication/account state; "
                     "credentials require operator inspection"
                 )
@@ -1381,10 +1776,22 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
         action="append",
         help="seed only this timeline raw file; intended for timeline integration",
     )
-    run = commands.add_parser("run", help="resolve a bounded number of parents")
-    run.add_argument("--max-posts", type=archive_x.positive_int, required=True)
-    media = commands.add_parser("media", help="download media for captured context")
-    media.add_argument("--max-posts", type=archive_x.positive_int, required=True)
+    run = commands.add_parser(
+        "run", help="resolve parents to closure; optional diagnostic bound"
+    )
+    run.add_argument(
+        "--max-posts",
+        type=archive_x.positive_int,
+        help="advanced: stop after this many parent attempts",
+    )
+    media = commands.add_parser(
+        "media", help="download captured context media; optional diagnostic bound"
+    )
+    media.add_argument(
+        "--max-posts",
+        type=archive_x.positive_int,
+        help="advanced: stop after this many media attempts",
+    )
     commands.add_parser("status", help="print queue and coverage status")
     commands.add_parser("integrity", help="verify SQLite and graph invariants")
     commands.add_parser("export", help="atomically rebuild context datasets")

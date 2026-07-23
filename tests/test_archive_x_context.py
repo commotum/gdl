@@ -50,6 +50,7 @@ def post(
 
 
 def make_archive(root: Path, records=()):
+    records = tuple(records)
     user_dir = root / "users" / "alice"
     state_dir = user_dir / "_state"
     raw_dir = user_dir / "runs" / "run-a" / "raw"
@@ -70,7 +71,57 @@ def make_archive(root: Path, records=()):
         "".join(json.dumps(record) + "\n" for record in records),
         encoding="utf-8",
     )
+    (raw_dir.parent / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-a",
+                "status": "success",
+                "completed_at": "2026-01-02T00:00:00Z",
+                "post_dataset": {"dataset_posts": len(records)},
+                "endpoints": [
+                    {
+                        "endpoint": "timeline",
+                        "raw_path": str(raw.relative_to(user_dir)),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     return user_dir, state_dir / "context.sqlite3"
+
+
+def add_legacy_run(user_dir: Path, records=()):
+    records = tuple(records)
+    run_dir = user_dir / "runs" / "run-legacy"
+    canonical = run_dir / "raw" / "legacy-window.posts.jsonl"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    walk = run_dir / "raw" / "legacy-window-walk-1.posts.jsonl"
+    walk.write_text(canonical.read_text(encoding="utf-8"), encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-legacy",
+                "mode": "legacy_backfill",
+                "status": "limited",
+                "completed_at": "2026-01-03T00:00:00Z",
+                "windows": [
+                    {
+                        "status": "success",
+                        "metadata_confirmed": True,
+                        "state_committed": True,
+                        "canonical_raw_path": str(canonical.relative_to(user_dir)),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return canonical, walk
 
 
 class ContextStateTests(unittest.TestCase):
@@ -91,6 +142,49 @@ class ContextStateTests(unittest.TestCase):
             connection.close()
             with self.assertRaises(context_x.ContextError):
                 context_x.ContextDB(path, create=False)
+
+    def test_v1_migration_is_private_exact_and_preserves_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "_state" / "context.sqlite3"
+            with context_x.ContextDB(path) as database:
+                database.bind_identity("1", "alice")
+                database.add_edge(
+                    "300",
+                    "200",
+                    conversation_id="100",
+                    depth=0,
+                    run_id="run-a",
+                    observed_at="2026-01-01T00:00:00Z",
+                    max_depth=10,
+                )
+            connection = sqlite3.connect(path)
+            connection.execute("DROP TABLE local_posts")
+            connection.execute("DROP TABLE seed_sources")
+            connection.execute(
+                "UPDATE context_meta SET value='1' WHERE key='schema_version'"
+            )
+            connection.commit()
+            connection.close()
+            before = context_x.archive_x.sha256_file(path)
+
+            with context_x.ContextDB(path, create=False) as migrated:
+                backup = migrated.migration_backup
+                self.assertIsNotNone(backup)
+                self.assertEqual(migrated.status()["edges"], 1)
+                tables = {
+                    row[0]
+                    for row in migrated.connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                self.assertIn("seed_sources", tables)
+                self.assertIn("local_posts", tables)
+
+            self.assertEqual(context_x.archive_x.sha256_file(backup), before)
+            if os.name == "posix":
+                self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+            with context_x.ContextDB(path, create=False) as reopened:
+                self.assertIsNone(reopened.migration_backup)
 
     def test_captured_requires_observation_and_transaction_rolls_back(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -155,6 +249,120 @@ class ContextStateTests(unittest.TestCase):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_default_seed_includes_committed_legacy_but_excludes_walk_raw(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, db_path = make_archive(
+                Path(directory), [post("300", reply_id="200")]
+            )
+            _canonical, walk = add_legacy_run(
+                user_dir, [post("600", reply_id="500")]
+            )
+
+            result = context_x.seed_context(
+                user_dir, db_path, dry_run=False, max_depth=10
+            )
+
+            self.assertEqual(result["files_processed"], 2)
+            with context_x.ContextDB(db_path, create=False) as database:
+                edges = {
+                    tuple(row)
+                    for row in database.connection.execute(
+                        "SELECT child_id,parent_id FROM reply_edges"
+                    )
+                }
+                kinds = {
+                    row[0]
+                    for row in database.connection.execute(
+                        "SELECT source_kind FROM seed_sources"
+                    )
+                }
+            self.assertEqual(edges, {("300", "200"), ("600", "500")})
+            self.assertEqual(kinds, {"modern", "legacy"})
+            with self.assertRaisesRegex(
+                context_x.ContextError, "not a committed canonical source"
+            ):
+                context_x.seed_context(
+                    user_dir,
+                    db_path,
+                    dry_run=True,
+                    max_depth=10,
+                    raw_paths=[walk],
+                )
+
+    def test_seed_ledger_rejects_changed_source_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, db_path = make_archive(
+                Path(directory), [post("300", reply_id="200")]
+            )
+            context_x.seed_context(user_dir, db_path, dry_run=False, max_depth=10)
+            raw = next((user_dir / "runs").glob("*/raw/timeline.posts*.jsonl"))
+            with raw.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(post("301", reply_id="201")) + "\n")
+
+            with self.assertRaisesRegex(
+                context_x.ContextError, "previously seeded canonical source changed"
+            ):
+                context_x.seed_context(
+                    user_dir, db_path, dry_run=False, max_depth=10
+                )
+
+    def test_new_edge_captures_parent_from_previously_seeded_local_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, db_path = make_archive(Path(directory), [post("200")])
+            first = context_x.seed_context(
+                user_dir, db_path, dry_run=False, max_depth=10
+            )
+            self.assertEqual(first["local_parents"], 0)
+            add_legacy_run(user_dir, [post("300", reply_id="200")])
+
+            second = context_x.seed_context(
+                user_dir, db_path, dry_run=False, max_depth=10
+            )
+
+            self.assertEqual(second["files_skipped"], 1)
+            self.assertEqual(second["files_processed"], 1)
+            self.assertEqual(second["local_parents"], 1)
+            with context_x.ContextDB(db_path, create=False) as database:
+                state = database.connection.execute(
+                    "SELECT state FROM targets WHERE post_id='200'"
+                ).fetchone()[0]
+            self.assertEqual(state, "captured")
+
+    def test_failed_source_transaction_does_not_write_seed_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, db_path = make_archive(
+                Path(directory), [post("300", reply_id="200")]
+            )
+            with mock.patch.object(
+                context_x.ContextDB,
+                "add_edge",
+                side_effect=context_x.ContextError("injected seed failure"),
+            ):
+                with self.assertRaisesRegex(
+                    context_x.ContextError, "injected seed failure"
+                ):
+                    context_x.seed_context(
+                        user_dir, db_path, dry_run=False, max_depth=10
+                    )
+            with context_x.ContextDB(db_path, create=False) as database:
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM seed_sources"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM local_posts"
+                    ).fetchone()[0],
+                    0,
+                )
+
+            recovered = context_x.seed_context(
+                user_dir, db_path, dry_run=False, max_depth=10
+            )
+            self.assertEqual(recovered["files_processed"], 1)
+
     def test_seed_is_idempotent_deduplicates_and_captures_local_parent(self):
         records = [
             post("300", reply_id="200", conversation_id="100"),
@@ -519,7 +727,7 @@ class WorkerAndDatasetTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(tuple(row), ("retryable", "authentication"))
 
-    def test_worker_closes_an_ancestor_chain_one_post_at_a_time(self):
+    def test_no_budget_worker_closes_an_ancestor_chain_one_post_at_a_time(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             user_dir, db_path = make_archive(
@@ -548,7 +756,7 @@ class WorkerAndDatasetTests(unittest.TestCase):
                 db_path=db_path,
                 handle="alice",
                 cookie_file=Path("unused"),
-                max_posts=2,
+                max_posts=None,
                 request_delay="0",
                 retry_delay=1,
                 max_attempts=3,
@@ -560,6 +768,67 @@ class WorkerAndDatasetTests(unittest.TestCase):
             )
             self.assertEqual(seen, ["200", "100"])
             self.assertEqual(counts["captured"], 2)
+
+    def test_standalone_worker_limits_are_optional(self):
+        parser = context_x.build_parser(REPO)
+        run = parser.parse_args(["--user", "alice", "run"])
+        media = parser.parse_args(["--user", "alice", "media"])
+        self.assertIsNone(run.max_posts)
+        self.assertIsNone(media.max_posts)
+
+    def test_no_budget_worker_waits_for_bounded_retry_then_closes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, db_path = make_archive(
+                root, [post("300", reply_id="200")]
+            )
+            context_x.seed_context(user_dir, db_path, dry_run=False, max_depth=10)
+            current = [100.0]
+            calls = []
+            sleeps = []
+
+            def fetcher(**kwargs):
+                calls.append(kwargs["post_id"])
+                if len(calls) == 1:
+                    return context_x.FetchResult(
+                        1, None, "RemoteDisconnected", False, [], None
+                    )
+                return context_x.FetchResult(
+                    0,
+                    post("200", author_id="2", author="bob"),
+                    "ok",
+                    False,
+                    [],
+                    None,
+                )
+
+            def idle_sleep(seconds):
+                sleeps.append(seconds)
+                current[0] += seconds
+
+            counts = context_x.run_worker(
+                repo_dir=REPO,
+                archive_root=root,
+                user_dir=user_dir,
+                db_path=db_path,
+                handle="alice",
+                cookie_file=Path("unused"),
+                max_posts=None,
+                request_delay="0",
+                retry_delay=10,
+                max_attempts=3,
+                lease_seconds=10,
+                fairness_quantum=5,
+                max_depth=10,
+                media=False,
+                fetcher=fetcher,
+                clock=lambda: current[0],
+                idle_sleep=idle_sleep,
+            )
+
+            self.assertEqual(calls, ["200", "200"])
+            self.assertTrue(sleeps)
+            self.assertEqual(counts["captured"], 1)
 
     def test_export_is_deterministic_and_uses_stable_id_authorship(self):
         with tempfile.TemporaryDirectory() as directory:

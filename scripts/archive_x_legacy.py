@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -20,11 +21,70 @@ import archive_x
 
 
 LEGACY_SCHEMA_VERSION = 1
+MODERN_HEAD_SCHEMA_VERSION = 1
 LEGACY_STATUSES = {"pending", "active", "manual_review", "complete"}
 TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
 SHA256_RE = TOKEN_RE
 CURSOR_RE = re.compile(r"3_(\d+)/\Z")
 LEGACY_TERMINAL_REASONS = {"no_cursor", "distinct_empty_tail"}
+# Twitter's documented Snowflake epoch. Returned metadata before this instant
+# is evidence about the ID domain only; it is never used to paginate legacy IDs.
+SNOWFLAKE_EPOCH = datetime(2010, 11, 4, 1, 42, 54, 657000, tzinfo=timezone.utc)
+
+
+@dataclass(frozen=True)
+class LegacyRunOptions:
+    cookies: Path
+    max_root_windows: int | None = None
+    request_limit: int = 6
+    walk_attempts: int = 3
+    window_attempts: int = 3
+    max_leaves: int = 64
+    request_delay: str = "4-8"
+    walk_delay: str = "10-20"
+    window_delay: str = "30-60"
+    retries: int = 1
+    http_timeout: int = 60
+    stalled_rate_limit_cycles: int = 3
+
+    def validate(self) -> "LegacyRunOptions":
+        if self.max_root_windows is not None and self.max_root_windows < 1:
+            raise archive_x.ArchiveError("legacy root-window limit must be positive")
+        for name in (
+            "request_limit",
+            "walk_attempts",
+            "window_attempts",
+            "max_leaves",
+            "retries",
+            "http_timeout",
+            "stalled_rate_limit_cycles",
+        ):
+            if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
+                raise archive_x.ArchiveError(f"legacy {name} must be positive")
+        if self.walk_attempts < 2:
+            raise archive_x.ArchiveError(
+                "legacy run requires at least two walk attempts"
+            )
+        for value in (self.request_delay, self.walk_delay, self.window_delay):
+            archive_x.parse_duration(value)
+        return self
+
+    @classmethod
+    def from_namespace(cls, args: argparse.Namespace) -> "LegacyRunOptions":
+        return cls(
+            cookies=args.cookies,
+            max_root_windows=args.windows,
+            request_limit=args.request_limit,
+            walk_attempts=args.walk_attempts,
+            window_attempts=args.window_attempts,
+            max_leaves=args.max_leaves,
+            request_delay=args.request_delay,
+            walk_delay=args.walk_delay,
+            window_delay=args.window_delay,
+            retries=args.retries,
+            http_timeout=args.http_timeout,
+            stalled_rate_limit_cycles=args.stalled_rate_limit_cycles,
+        ).validate()
 
 
 def canonical_sha256(value: Any) -> str:
@@ -353,6 +413,287 @@ def initialize_state(
     updated = copy.deepcopy(state)
     updated["legacy_backfill"] = legacy
     return updated, True
+
+
+def _legacy_source_manifest(
+    user_dir: Path, source: dict[str, Any]
+) -> tuple[Path, dict[str, Any]]:
+    run_id_value = str(source.get("run_id") or "")
+    if not run_id_value or Path(run_id_value).name != run_id_value:
+        raise archive_x.ArchiveError("legacy source run ID is invalid")
+    path = user_dir / "runs" / run_id_value / "manifest.json"
+    runs_dir = (user_dir / "runs").resolve()
+    resolved = path.resolve()
+    if not resolved.is_file() or runs_dir not in resolved.parents:
+        raise archive_x.ArchiveError("legacy source manifest is missing")
+    if archive_x.sha256_file(resolved) != source.get("manifest_sha256"):
+        raise archive_x.ArchiveError("legacy source manifest hash changed")
+    manifest = archive_x.load_json(resolved, None)
+    if not isinstance(manifest, dict):
+        raise archive_x.ArchiveError("legacy source manifest is invalid")
+    if str(manifest.get("run_id") or resolved.parent.name) != run_id_value:
+        raise archive_x.ArchiveError("legacy source manifest run ID changed")
+    return resolved, manifest
+
+
+def classify_legacy_transition(
+    user_dir: Path,
+    *,
+    expected_run_id: str | None = None,
+    minimum_stalled_cycles: int = 3,
+) -> dict[str, Any]:
+    """Classify durable modern evidence without mutating state or contacting X."""
+    state_path = user_dir / "_state" / "state.json"
+    state = archive_x.load_json(state_path, None)
+    if not isinstance(state, dict):
+        return {"decision": "ambiguous", "reason": "invalid_archive_state"}
+    existing = state.get("legacy_backfill")
+    if existing is not None:
+        try:
+            validate_legacy_state(
+                existing,
+                expected_user_id=str(state.get("requested_user_id") or ""),
+            )
+        except archive_x.ArchiveError:
+            return {"decision": "ambiguous", "reason": "invalid_legacy_state"}
+        return {
+            "decision": "not_applicable",
+            "reason": "legacy_already_initialized",
+            "source_run_id": existing["source"]["run_id"],
+        }
+    if minimum_stalled_cycles < 1:
+        raise archive_x.ArchiveError("transition stalled-cycle minimum is invalid")
+    try:
+        plan = initialization_plan(user_dir)
+        source = plan["source"]
+        manifest_path, manifest = _legacy_source_manifest(user_dir, source)
+    except (archive_x.ArchiveError, KeyError, TypeError):
+        return {"decision": "ambiguous", "reason": "initialization_evidence_incomplete"}
+    run_id_value = str(source["run_id"])
+    if expected_run_id is not None and run_id_value != expected_run_id:
+        return {"decision": "ambiguous", "reason": "source_run_mismatch"}
+    timeline = next(
+        (
+            item
+            for item in manifest.get("endpoints", ())
+            if isinstance(item, dict)
+            and item.get("endpoint") == "timeline"
+            and item.get("resume_cursor") == source["cursor"]
+        ),
+        None,
+    )
+    strict_manifest = (
+        manifest.get("status") == "stalled"
+        and manifest.get("failure_stage") == "timeline_no_progress_watchdog"
+        and manifest.get("limited_run") is False
+        and manifest.get("retry_failed_only") is False
+        and manifest.get("date_after") in {None, ""}
+    )
+    strict_timeline = bool(
+        isinstance(timeline, dict)
+        and timeline.get("status") == "stalled"
+        and timeline.get("stalled") is True
+        and timeline.get("interrupted") is False
+        and timeline.get("metadata_complete") is False
+        and timeline.get("raw_has_record") is True
+        and timeline.get("other_error_count") == 0
+        and isinstance(timeline.get("exit_code"), int)
+        and timeline.get("exit_code") != 0
+        and isinstance(timeline.get("stalled_rate_limit_cycles"), int)
+        and timeline.get("stalled_rate_limit_cycles") >= minimum_stalled_cycles
+    )
+    if not strict_manifest or not strict_timeline:
+        return {"decision": "ambiguous", "reason": "not_exact_watchdog_boundary"}
+    raw_relative = str(timeline.get("raw_path") or "")
+    raw_path = (user_dir / raw_relative).resolve()
+    runs_dir = (user_dir / "runs").resolve()
+    if (
+        not raw_relative
+        or not raw_path.is_file()
+        or runs_dir not in raw_path.parents
+        or raw_path.name.endswith(".tmp")
+    ):
+        return {"decision": "ambiguous", "reason": "boundary_raw_missing"}
+    if archive_x.synthetic_search_cursor(raw_path) != source["cursor"]:
+        return {"decision": "ambiguous", "reason": "raw_cursor_mismatch"}
+    boundary = next(
+        (
+            record
+            for record in archive_x.iter_jsonl(raw_path)
+            if archive_x.id_string(record.get("tweet_id"))
+            == source["oldest_post_id"]
+        ),
+        None,
+    )
+    if not isinstance(boundary, dict):
+        return {"decision": "ambiguous", "reason": "boundary_record_missing"}
+    try:
+        boundary_at = archive_x.parse_datetime(str(boundary.get("date") or ""))
+        source_at = parse_utc(source["oldest_post_at"], "source oldest_post_at")
+    except (argparse.ArgumentTypeError, archive_x.ArchiveError):
+        return {"decision": "ambiguous", "reason": "boundary_timestamp_invalid"}
+    if second_utc(boundary_at) != second_utc(source_at):
+        return {"decision": "ambiguous", "reason": "boundary_timestamp_mismatch"}
+    if boundary_at >= SNOWFLAKE_EPOCH:
+        return {"decision": "not_applicable", "reason": "snowflake_domain"}
+    requested_user_id = str(state.get("requested_user_id") or "")
+    boundary_user_id = archive_x.id_string((boundary.get("user") or {}).get("id"))
+    boundary_author_id = archive_x.id_string(
+        (boundary.get("author") or {}).get("id")
+    )
+    if requested_user_id not in {boundary_user_id, boundary_author_id}:
+        return {"decision": "ambiguous", "reason": "boundary_identity_mismatch"}
+    return {
+        "decision": "proven",
+        "reason": "exact_pre_snowflake_watchdog_boundary",
+        "source_run_id": run_id_value,
+        "source_manifest_sha256": archive_x.sha256_file(manifest_path),
+        "source_raw_sha256": archive_x.sha256_file(raw_path),
+        "oldest_post_id": source["oldest_post_id"],
+        "oldest_post_at": source["oldest_post_at"],
+        "confirmation_token": plan["confirmation_token"],
+    }
+
+
+def validate_modern_head(
+    modern_head: Any, *, source: dict[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(modern_head, dict):
+        raise archive_x.ArchiveError("modern_head must be an object")
+    if modern_head.get("schema_version") != MODERN_HEAD_SCHEMA_VERSION:
+        raise archive_x.ArchiveError("unsupported modern_head schema version")
+    if modern_head.get("source_run_id") != source.get("run_id"):
+        raise archive_x.ArchiveError("modern_head source run changed")
+    if modern_head.get("source_manifest_sha256") != source.get("manifest_sha256"):
+        raise archive_x.ArchiveError("modern_head source manifest changed")
+    baseline = parse_utc(modern_head.get("baseline_started_at"), "modern head baseline")
+    successful = parse_utc(
+        modern_head.get("last_successful_started_at"),
+        "modern head last_successful_started_at",
+    )
+    completed = parse_utc(
+        modern_head.get("last_successful_completed_at"),
+        "modern head last_successful_completed_at",
+    )
+    if successful < baseline or completed < successful:
+        raise archive_x.ArchiveError("modern_head timestamp order is invalid")
+    active = modern_head.get("active")
+    if active is not None:
+        if not isinstance(active, dict):
+            raise archive_x.ArchiveError("modern_head active state is invalid")
+        cursor = str(active.get("cursor") or "")
+        if not CURSOR_RE.fullmatch(cursor):
+            raise archive_x.ArchiveError("modern_head active cursor is invalid")
+        started = parse_utc(active.get("started_at"), "modern head active started_at")
+        cutoff = parse_utc(active.get("date_after"), "modern head active date_after")
+        parse_utc(active.get("saved_at"), "modern head active saved_at")
+        if cutoff > started:
+            raise archive_x.ArchiveError("modern_head active cutoff is invalid")
+    return modern_head
+
+
+def derive_modern_head(
+    user_dir: Path, state: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    legacy = validate_legacy_state(
+        state.get("legacy_backfill"),
+        expected_user_id=str(state.get("requested_user_id") or ""),
+    )
+    source = legacy["source"]
+    _path, manifest = _legacy_source_manifest(user_dir, source)
+    try:
+        started = archive_x.parse_datetime(str(manifest.get("started_at") or ""))
+        completed = archive_x.parse_datetime(str(manifest.get("completed_at") or ""))
+    except argparse.ArgumentTypeError as exc:
+        raise archive_x.ArchiveError(
+            "legacy source manifest lacks valid modern-head timestamps"
+        ) from exc
+    existing = state.get("modern_head")
+    if existing is not None:
+        validate_modern_head(existing, source=source)
+        return copy.deepcopy(existing), False
+    baseline = second_utc(started)
+    modern_head = {
+        "schema_version": MODERN_HEAD_SCHEMA_VERSION,
+        "source_run_id": source["run_id"],
+        "source_manifest_sha256": source["manifest_sha256"],
+        "baseline_started_at": baseline,
+        "last_successful_started_at": baseline,
+        "last_successful_completed_at": second_utc(completed),
+        "active": None,
+    }
+    validate_modern_head(modern_head, source=source)
+    return modern_head, True
+
+
+def legacy_backup_path(user_dir: Path, source: dict[str, Any]) -> Path:
+    token = require_sha256(source.get("confirmation_token"), "confirmation token")
+    return user_dir / "_state" / "backups" / f"state.pre-legacy-init-{token[:12]}.json"
+
+
+def automatic_initialize_legacy(
+    user_dir: Path,
+    *,
+    initialized_at: str,
+    expected_run_id: str | None = None,
+    writer: Any = archive_x.atomic_write_json,
+) -> dict[str, Any]:
+    """Initialize/migrate under the caller's archive locks; never contacts X."""
+    state_path = user_dir / "_state" / "state.json"
+    state = archive_x.load_json(state_path, None)
+    if not isinstance(state, dict):
+        raise archive_x.ArchiveError("archive state is missing or invalid")
+    changed = False
+    if state.get("legacy_backfill") is None:
+        classification = classify_legacy_transition(
+            user_dir, expected_run_id=expected_run_id
+        )
+        if classification.get("decision") != "proven":
+            raise archive_x.ArchiveError(
+                "automatic legacy transition is not proven: "
+                + str(classification.get("reason") or "ambiguous")
+            )
+        plan = initialization_plan(user_dir)
+        updated, changed = initialize_state(
+            state, plan, plan["confirmation_token"], initialized_at
+        )
+    else:
+        updated = copy.deepcopy(state)
+        validate_legacy_state(
+            updated["legacy_backfill"],
+            expected_user_id=str(updated.get("requested_user_id") or ""),
+        )
+    source = updated["legacy_backfill"]["source"]
+    backup_path = legacy_backup_path(user_dir, source)
+    expected_backup_hash = source["state_sha256_before_init"]
+    if backup_path.exists():
+        if archive_x.sha256_file(backup_path) != expected_backup_hash:
+            raise archive_x.ArchiveError(
+                "legacy initialization backup hash does not match source state"
+            )
+    elif changed:
+        if archive_x.sha256_file(state_path) != expected_backup_hash:
+            raise archive_x.ArchiveError(
+                "archive state changed before automatic legacy backup"
+            )
+        writer(backup_path, state)
+        if archive_x.sha256_file(backup_path) != expected_backup_hash:
+            raise archive_x.ArchiveError("automatic legacy backup verification failed")
+    else:
+        raise archive_x.ArchiveError(
+            "existing legacy state is missing its exact pre-init backup"
+        )
+    modern_head, head_changed = derive_modern_head(user_dir, updated)
+    if head_changed:
+        updated["modern_head"] = modern_head
+    if changed or head_changed:
+        writer(state_path, updated)
+    return {
+        "state": updated,
+        "legacy_initialized": changed,
+        "modern_head_initialized": head_changed,
+        "backup_path": str(backup_path),
+    }
 
 
 def window_id(since: str, until: str) -> str:
@@ -1020,12 +1361,13 @@ def recover_legacy_manifests(
 
 
 def run_legacy_archive(
-    args: argparse.Namespace,
+    options: LegacyRunOptions,
     repo_dir: Path,
     archive_root: Path,
     handle: str,
     version: str,
 ) -> dict[str, Any]:
+    options.validate()
     user_dir, state_path = state_paths(archive_root, handle)
     state = archive_x.load_json(state_path, None)
     if not isinstance(state, dict):
@@ -1062,11 +1404,11 @@ def run_legacy_archive(
         "started_at": second_utc(started),
         "status": "running",
         "gallery_dl_version": version,
-        "window_limit": args.windows,
-        "request_limit": args.request_limit,
-        "walk_attempt_limit": args.walk_attempts,
-        "window_attempt_limit": args.window_attempts,
-        "max_leaves": args.max_leaves,
+        "window_limit": options.max_root_windows,
+        "request_limit": options.request_limit,
+        "walk_attempt_limit": options.walk_attempts,
+        "window_attempt_limit": options.window_attempts,
+        "max_leaves": options.max_leaves,
         "recovered_manifests": recovered_manifests,
         "windows": [],
     }
@@ -1082,7 +1424,7 @@ def run_legacy_archive(
             legacy,
             owner_run_id=current_run_id,
             resumed_at=second_utc(started),
-            attempt_limit=args.window_attempts,
+            attempt_limit=options.window_attempts,
         )
         state["legacy_backfill"] = legacy
         archive_x.atomic_write_json(state_path, state)
@@ -1093,7 +1435,10 @@ def run_legacy_archive(
             return manifest
 
     completed_count = 0
-    while completed_count < args.windows:
+    while (
+        options.max_root_windows is None
+        or completed_count < options.max_root_windows
+    ):
         legacy = state["legacy_backfill"]
         if legacy["status"] == "complete":
             break
@@ -1134,10 +1479,10 @@ def run_legacy_archive(
             previous_valid = None
             confirmed_records = None
             split = False
-            for attempt in range(1, args.walk_attempts + 1):
+            for attempt in range(1, options.walk_attempts + 1):
                 if attempt > 1:
                     archive_x.sleep_random(
-                        args.walk_delay,
+                        options.walk_delay,
                         f"before independent legacy confirmation {attempt}",
                     )
                 leaf_token = canonical_sha256(
@@ -1155,13 +1500,13 @@ def run_legacy_archive(
                     walk_id=f"{leaf_token}-walk-{attempt}",
                     since=leaf["since"],
                     until=leaf["until"],
-                    cookie_file=args.cookies,
-                    request_delay=args.request_delay,
+                    cookie_file=options.cookies,
+                    request_delay=options.request_delay,
                     include_reposts=legacy["source"]["reposts_included"],
-                    request_limit=args.request_limit,
-                    retries=args.retries,
-                    http_timeout=args.http_timeout,
-                    stalled_rate_limit_cycles=args.stalled_rate_limit_cycles,
+                    request_limit=options.request_limit,
+                    retries=options.retries,
+                    http_timeout=options.http_timeout,
+                    stalled_rate_limit_cycles=options.stalled_rate_limit_cycles,
                 )
                 window_result["walks"].append(public_walk_result(result))
                 archive_x.atomic_write_json(manifest_path, manifest)
@@ -1176,7 +1521,7 @@ def run_legacy_archive(
                             legacy,
                             leaf_since=leaf["since"],
                             leaf_until=leaf["until"],
-                            max_leaves=args.max_leaves,
+                            max_leaves=options.max_leaves,
                         )
                     except archive_x.ArchiveError as exc:
                         updated = mark_manual_review(
@@ -1222,7 +1567,7 @@ def run_legacy_archive(
             if confirmed_records is None:
                 reason = (
                     f"no two consecutive matching valid walks after "
-                    f"{args.walk_attempts} attempts"
+                    f"{options.walk_attempts} attempts"
                 )
                 updated = mark_manual_review(
                     state["legacy_backfill"],
@@ -1291,15 +1636,21 @@ def run_legacy_archive(
         window_result["status"] = "success"
         archive_x.atomic_write_json(manifest_path, manifest)
         completed_count += 1
-        if completed_count < args.windows and state["legacy_backfill"][
-            "status"
-        ] != "complete":
-            archive_x.sleep_random(args.window_delay, "before next legacy window")
+        if (
+            (
+                options.max_root_windows is None
+                or completed_count < options.max_root_windows
+            )
+            and state["legacy_backfill"]["status"] != "complete"
+        ):
+            archive_x.sleep_random(
+                options.window_delay, "before next legacy window"
+            )
 
     manifest["status"] = (
         "complete"
         if state["legacy_backfill"]["status"] == "complete"
-        else "success"
+        else "limited"
     )
     manifest["completed_at"] = second_utc(archive_x.utc_now())
     manifest["next_until"] = state["legacy_backfill"]["next_until"]
@@ -1445,7 +1796,7 @@ def legacy_status_summary(state: dict[str, Any], handle: str) -> dict[str, Any]:
     elif status == "complete":
         next_command = None
     else:
-        next_command = f"scripts/archive-x-legacy --user {handle} run --windows 1"
+        next_command = f"scripts/archive-x-legacy --user {handle} run"
     source = legacy["source"]
     return {
         "handle": handle,
@@ -1508,8 +1859,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retry.add_argument("--window-id", required=True)
     retry.add_argument("--reason", required=True)
-    run = commands.add_parser("run", help="run bounded initialized legacy windows")
-    run.add_argument("--windows", type=archive_x.positive_int, required=True)
+    run = commands.add_parser(
+        "run", help="resume initialized legacy history; optional diagnostic bound"
+    )
+    run.add_argument(
+        "--windows",
+        type=archive_x.positive_int,
+        help="advanced: stop after this many committed root UTC windows",
+    )
     run.add_argument("--request-limit", type=archive_x.positive_int, default=6)
     run.add_argument("--walk-attempts", type=archive_x.positive_int, default=3)
     run.add_argument("--window-attempts", type=archive_x.positive_int, default=3)
@@ -1580,7 +1937,11 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 try:
                     result = run_legacy_archive(
-                        args, repo_dir, archive_root, handle, version
+                        LegacyRunOptions.from_namespace(args),
+                        repo_dir,
+                        archive_root,
+                        handle,
+                        version,
                     )
                 except KeyboardInterrupt:
                     print(
@@ -1595,7 +1956,7 @@ def main(argv: list[str] | None = None) -> int:
                     "next_until": result.get("next_until"),
                 }
             )
-            return 0 if result["status"] in {"success", "complete"} else 1
+            return 0 if result["status"] in {"limited", "complete"} else 1
 
         repo_dir = Path(__file__).resolve().parent.parent
         archive_root = archive_x.resolve_output_root(args.output_root, plan_only=False)

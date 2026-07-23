@@ -299,6 +299,100 @@ class StateAndIdentityTests(unittest.TestCase):
         self.assertEqual(started, "2026-07-10T00:00:00Z")
         self.assertEqual(archive_x.iso_utc(cutoff), "2026-07-08T00:00:00Z")
 
+    def test_legacy_archive_uses_separate_modern_head_checkpoint(self):
+        state = {
+            "resume": {
+                "cursor": "3_29116490825/",
+                "started_at": "2026-07-20T00:00:00Z",
+                "date_after": None,
+            },
+            "legacy_backfill": {"status": "pending"},
+            "modern_head": {
+                "last_successful_started_at": "2026-07-20T02:39:18Z",
+                "active": None,
+            },
+        }
+        cursor, started, cutoff = archive_x.select_timeline_state(
+            self.args(overlap_hours=48),
+            state,
+            datetime(2026, 7, 22, 12, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(cursor)
+        self.assertEqual(started, "2026-07-22T12:00:00Z")
+        self.assertEqual(archive_x.iso_utc(cutoff), "2026-07-18T02:39:18Z")
+
+        boundary = json.loads(json.dumps(state["resume"]))
+        archive_x.update_timeline_state(
+            state,
+            limited_run=False,
+            metadata_complete=True,
+            resume_cursor=None,
+            handle="alice",
+            chain_started_at=started,
+            date_after=cutoff,
+            observed_at="2026-07-22T12:05:00Z",
+            modern_head_mode=True,
+        )
+        self.assertEqual(state["resume"], boundary)
+        self.assertEqual(
+            state["modern_head"]["last_successful_started_at"], started
+        )
+        self.assertIsNone(state["modern_head"]["active"])
+
+    def test_existing_legacy_full_rescan_and_early_since_stay_in_modern_domain(self):
+        state = {
+            "resume": {"cursor": "3_29116490825/"},
+            "legacy_backfill": {"status": "pending"},
+            "modern_head": {
+                "last_successful_started_at": "2026-07-20T02:39:18Z",
+                "active": None,
+            },
+        }
+        started_at = datetime(2026, 7, 22, 12, tzinfo=timezone.utc)
+        cursor, _started, cutoff = archive_x.select_timeline_state(
+            self.args(full_rescan=True), state, started_at
+        )
+        self.assertIsNone(cursor)
+        self.assertEqual(cutoff, archive_x.SNOWFLAKE_EPOCH)
+
+        cursor, _started, cutoff = archive_x.select_timeline_state(
+            self.args(since=datetime(2009, 1, 1, tzinfo=timezone.utc)),
+            state,
+            started_at,
+        )
+        self.assertIsNone(cursor)
+        self.assertEqual(cutoff, archive_x.SNOWFLAKE_EPOCH)
+
+        requested = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        _cursor, _started, cutoff = archive_x.select_timeline_state(
+            self.args(since=requested), state, started_at
+        )
+        self.assertEqual(cutoff, requested)
+
+    def test_interrupted_modern_head_has_its_own_cursor(self):
+        state = {
+            "resume": {"cursor": "3_29116490825/"},
+            "legacy_backfill": {"status": "pending"},
+            "modern_head": {"active": None},
+        }
+        cutoff = datetime(2026, 7, 20, tzinfo=timezone.utc)
+        archive_x.update_timeline_state(
+            state,
+            limited_run=False,
+            metadata_complete=False,
+            resume_cursor="3_2000000000000000000/head-token",
+            handle="alice",
+            chain_started_at="2026-07-22T12:00:00Z",
+            date_after=cutoff,
+            observed_at="2026-07-22T12:01:00Z",
+            modern_head_mode=True,
+        )
+        self.assertEqual(state["resume"]["cursor"], "3_29116490825/")
+        self.assertEqual(
+            state["modern_head"]["active"]["cursor"],
+            "3_2000000000000000000/head-token",
+        )
+
     def test_identity_guard_rejects_a_recycled_handle(self):
         state = {"requested_user_id": "111"}
         with self.assertRaises(archive_x.ArchiveError):
