@@ -73,4 +73,3 @@ existing state, retry, evidence, and maintenance-command behavior.
   and optional parser behavior. Twenty-three tested legacy non-state paths
   passed; one retry CLI test remained blocked solely by the real archive lock.
 - Compilation and `git diff --check` pass.
-

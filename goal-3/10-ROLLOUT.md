@@ -2,12 +2,12 @@
 
 ## Current Facts
 
-- Offline implementation and verification are complete; all 175 tests pass.
+- Offline implementation and verification are complete; all 176 tests pass.
 - Visakanv remains exactly at the frozen pre-smoke state: legacy frontier
   `2010-10-29T00:00:00Z`, historical cursor preserved, two shared pending media
   items, and no context database.
-- A real preexisting `airkatakana` archive still owns the global lock. It must
-  finish naturally before any smoke; this goal does not authorize stopping it.
+- The preexisting `airkatakana` archive finished naturally. Tmux `x` is back
+  at a Bash prompt and no archive worker is running.
 - The host mount is healthy/read-write (`/dev/sdb`, ext4) with about 13 TB
   free; filtered kernel history shows no ext4 error/remount. Codex's default
   filesystem sandbox intentionally exposes `/mnt` read-only, so its dry-run
@@ -39,7 +39,7 @@ remaining work stopped and resumable.
 
 ## Detailed Implementation Plan
 
-- Wait for tmux `x` / `airkatakana` to release the real lock naturally.
+- Confirm tmux `x` / `airkatakana` released the real lock naturally (complete).
 - Recheck the host mount read-write immediately before launch; no remount or
   filesystem repair is currently indicated or authorized.
 - Recheck mount, cookies, runner fingerprints, process/locks, identity, free
@@ -94,7 +94,7 @@ remaining work stopped and resumable.
   state, and dataset modes are private (`0600`); the host mount has 13 TB free.
 - Host/kernel inspection distinguished the Codex sandbox's read-only bind from
   the healthy host `rw` ext4 mount; no repair/remount is indicated.
-- Tmux `x` still has a live `uv` process and retains the real global archive
-  lock. It was not interrupted.
-- Blocked pending explicit bounded-production authorization and natural release
-  of the existing `airkatakana` lock. No smoke has started.
+- Tmux `x` is back at a Bash prompt after `airkatakana` finished naturally; no
+  archive worker is running.
+- Blocked only pending explicit bounded-production authorization. No smoke has
+  started.

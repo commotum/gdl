@@ -191,4 +191,3 @@ unified lifecycle must refactor without changing production or live behavior.
   shared direct-call engines, a post-legacy modern-head mode, complete raw
   seeding across both ID eras, closure-aware no-budget context loops, and a
   multi-user fairness policy.
-

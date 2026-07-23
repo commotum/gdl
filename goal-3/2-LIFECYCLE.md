@@ -308,4 +308,3 @@ manual review, failed, and interrupted return nonzero (interrupt remains 130).
   budgets.
 - Defined exact phase, option, status, failure, and retry behavior for
   implementation and tests.
-
