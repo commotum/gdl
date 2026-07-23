@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib
 import importlib.metadata
@@ -46,6 +47,9 @@ RATE_LIMIT_WAIT_RE = re.compile(
 DOWNLOAD_ERROR_RE = re.compile(
     r"\[download\]\[error\]\s+Failed to download\s+(.+?)\s*$"
 )
+HTTP_DOWNLOAD_WARNING_RE = re.compile(
+    r"\[downloader\.http\]\[warning\]\s+'(\d{3})[^']*'\s+for\s+'[^']+'"
+)
 LOG_ERROR_RE = re.compile(r"\[[^\]]+\]\[error\]")
 MEDIA_FILENAME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}_(\d{5,25})_(\d+)_"
@@ -87,6 +91,11 @@ EXIT_FLAGS = {
 }
 CHILD_INTERRUPT_GRACE_SECONDS = 15
 CHILD_TERMINATE_GRACE_SECONDS = 10
+MEDIA_UNAVAILABLE_HTTP_STATUSES = {404, 410}
+MEDIA_UNAVAILABLE_MIN_ATTEMPTS = 2
+MEDIA_UNAVAILABLE_MIN_AGE = timedelta(hours=24)
+MEDIA_RETRY_BASE_DELAY = timedelta(hours=6)
+MEDIA_RETRY_MAX_DELAY = timedelta(days=7)
 
 
 class ArchiveError(RuntimeError):
@@ -910,6 +919,9 @@ proof, then resumed through bounded internal UTC windows. Its frontier means
 repeat-confirmed contiguous windows visible through X search; it is not proof
 that deleted, private, withheld, or unindexed posts were recovered. Legacy
 metadata may advance while its media remains in the shared pending-media queue.
+Transient media receives a durable retry time; repeated refreshed 404/410
+responses become explicit unavailable evidence. An otherwise complete archive
+reports `complete_with_unavailable_media` without retrying those assets forever.
 """
     path.write_text(text, encoding="utf-8")
     os.chmod(path, 0o600)
@@ -1006,7 +1018,10 @@ def build_gallery_config(
         "expand": False,
         "showreplies": False,
         "cards": True,
-        "videos": True,
+        # Recovery delegates video selection to yt-dlp so it can choose among
+        # the post's current variants instead of repeating gallery-dl's single
+        # highest-bitrate CDN URL.
+        "videos": "ytdl" if endpoint.startswith("retry-media-") else True,
         "previews": False,
         "articles": ["metadata", "html", "cover", "media"],
         "metadata-user": False,
@@ -1080,15 +1095,24 @@ def download_failure_from_line(line: str) -> dict[str, Any] | None:
 def analyze_gallery_log(path: Path) -> tuple[list[dict[str, Any]], int]:
     failed_downloads: list[dict[str, Any]] = []
     other_error_count = 0
+    pending_http_statuses: list[int] = []
     try:
         lines = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
         return failed_downloads, other_error_count
     with lines:
         for line in lines:
+            if line.startswith("command: "):
+                continue
+            if match := HTTP_DOWNLOAD_WARNING_RE.search(line):
+                pending_http_statuses.append(int(match.group(1)))
             failure = download_failure_from_line(line)
             if failure:
+                if pending_http_statuses:
+                    failure["http_statuses"] = sorted(set(pending_http_statuses))
+                    failure["http_error_count"] = len(pending_http_statuses)
                 failed_downloads.append(failure)
+                pending_http_statuses = []
             elif LOG_ERROR_RE.search(line):
                 other_error_count += 1
     return failed_downloads, other_error_count
@@ -1279,6 +1303,10 @@ def run_gallery_dl(
         resume_cursor = prefer_advanced_search_cursor(
             resume_cursor, checkpoint_cursor
         )
+    analyzed_failures, analyzed_other_errors = analyze_gallery_log(log_path)
+    if analyzed_failures:
+        failed_downloads = analyzed_failures
+    other_error_count = analyzed_other_errors
     return (
         status,
         resume_cursor,
@@ -1673,15 +1701,56 @@ def merge_pending_media(
     source_run_id: str,
     observed_at: str,
 ) -> None:
+    def record_key(record: dict[str, Any]) -> str:
+        if record.get("filename"):
+            return "filename:" + Path(str(record["filename"])).name
+        return "key:" + str(record.get("key") or "")
+
+    def normalized_statuses(failure: dict[str, Any]) -> list[int]:
+        statuses = failure.get("http_statuses")
+        if not isinstance(statuses, list):
+            return []
+        return sorted(
+            {
+                status
+                for status in statuses
+                if isinstance(status, int) and 100 <= status <= 599
+            }
+        )
+
+    def retry_at(attempts: int, *, unavailable_candidate: bool) -> str:
+        if unavailable_candidate:
+            delay = MEDIA_UNAVAILABLE_MIN_AGE
+        else:
+            multiplier = 2 ** max(0, min(attempts - 1, 8))
+            delay = min(
+                MEDIA_RETRY_BASE_DELAY * multiplier,
+                MEDIA_RETRY_MAX_DELAY,
+            )
+        return iso_utc(parse_datetime(observed_at) + delay)
+
+    def old_enough(record: dict[str, Any]) -> bool:
+        try:
+            first = parse_datetime(str(record.get("first_failed_at") or ""))
+            latest = parse_datetime(observed_at)
+        except argparse.ArgumentTypeError:
+            return False
+        return latest - first >= MEDIA_UNAVAILABLE_MIN_AGE
+
     current = state.get("pending_media")
     records = current if isinstance(current, list) else []
     by_key = {
-        (
-            "filename:" + str(record.get("filename"))
-            if record.get("filename")
-            else "key:" + str(record.get("key"))
-        ): record.copy()
+        record_key(record): record.copy()
         for record in records
+        if isinstance(record, dict) and (record.get("filename") or record.get("key"))
+    }
+    unavailable_value = state.get("unavailable_media")
+    unavailable_records = (
+        unavailable_value if isinstance(unavailable_value, list) else []
+    )
+    unavailable_by_key = {
+        record_key(record): record.copy()
+        for record in unavailable_records
         if isinstance(record, dict) and (record.get("filename") or record.get("key"))
     }
     for failure in failures:
@@ -1689,8 +1758,15 @@ def merge_pending_media(
         if not filename:
             continue
         key = "filename:" + filename
-        record = by_key.get(key, {})
+        record = by_key.get(key, unavailable_by_key.get(key, {}))
         previous_source = record.get("last_source_run_id")
+        attempts = int(record.get("attempts") or 0) + (
+            0 if previous_source == source_run_id else 1
+        )
+        statuses = normalized_statuses(failure)
+        unavailable_candidate = bool(statuses) and all(
+            status in MEDIA_UNAVAILABLE_HTTP_STATUSES for status in statuses
+        )
         record.update(
             {
                 "filename": filename,
@@ -1704,18 +1780,89 @@ def merge_pending_media(
                 "first_failed_at": record.get("first_failed_at") or observed_at,
                 "last_failed_at": observed_at,
                 "last_source_run_id": source_run_id,
-                "attempts": int(record.get("attempts") or 0)
-                + (0 if previous_source == source_run_id else 1),
+                "attempts": attempts,
+                "last_http_statuses": statuses,
+                "last_http_error_count": int(
+                    failure.get("http_error_count") or len(statuses)
+                ),
+                "failure_class": (
+                    "unavailable_candidate"
+                    if unavailable_candidate
+                    else "transient"
+                ),
             }
         )
-        by_key[key] = record
+        if (
+            unavailable_candidate
+            and attempts >= MEDIA_UNAVAILABLE_MIN_ATTEMPTS
+            and old_enough(record)
+        ):
+            record.update(
+                {
+                    "status": "unavailable",
+                    "unavailable_at": observed_at,
+                    "unavailable_reason": "repeated_http_404_or_410",
+                    "next_retry_at": None,
+                }
+            )
+            by_key.pop(key, None)
+            unavailable_by_key[key] = record
+        else:
+            record.update(
+                {
+                    "status": "pending",
+                    "unavailable_at": None,
+                    "unavailable_reason": None,
+                    "next_retry_at": retry_at(
+                        attempts,
+                        unavailable_candidate=unavailable_candidate,
+                    ),
+                }
+            )
+            unavailable_by_key.pop(key, None)
+            by_key[key] = record
+
+        post_id = id_string(failure.get("post_id"))
+        post_key = "key:post:" + post_id if post_id else ""
+        post_record = by_key.get(post_key)
+        if post_record is not None:
+            post_previous_source = post_record.get("last_source_run_id")
+            post_attempts = int(post_record.get("attempts") or 0) + (
+                0 if post_previous_source == source_run_id else 1
+            )
+            post_record.update(
+                {
+                    "last_failed_at": observed_at,
+                    "last_source_run_id": source_run_id,
+                    "attempts": post_attempts,
+                    "last_http_statuses": statuses,
+                    "failure_class": (
+                        "unavailable_candidate"
+                        if unavailable_candidate
+                        else "transient"
+                    ),
+                    "next_retry_at": retry_at(
+                        post_attempts,
+                        unavailable_candidate=unavailable_candidate,
+                    ),
+                }
+            )
+            by_key[post_key] = post_record
     state["pending_media"] = sorted(
         by_key.values(),
         key=lambda record: str(record.get("filename") or record.get("key") or ""),
     )
+    state["unavailable_media"] = sorted(
+        unavailable_by_key.values(),
+        key=lambda record: str(record.get("filename") or record.get("key") or ""),
+    )
 
 
-def pending_media_is_complete(user_dir: Path, record: dict[str, Any]) -> bool:
+def pending_media_is_complete(
+    user_dir: Path,
+    record: dict[str, Any],
+    unavailable_media: Iterable[dict[str, Any]] = (),
+) -> bool:
     def asset_is_complete(path: Path) -> bool:
         if not path.is_file() or path.stat().st_size <= 0:
             return False
@@ -1726,6 +1873,18 @@ def pending_media_is_complete(user_dir: Path, record: dict[str, Any]) -> bool:
             and isinstance(load_json(sidecar, None), dict)
         )
 
+    unavailable = [
+        item for item in unavailable_media if isinstance(item, dict)
+    ]
+
+    def asset_is_unavailable(post_id: str, media_number: int) -> bool:
+        return any(
+            id_string(item.get("post_id")) == post_id
+            and item.get("media_number") == media_number
+            and item.get("status") == "unavailable"
+            for item in unavailable
+        )
+
     media_root = user_dir / "media"
     if record.get("kind") == "post":
         post_id = id_string(record.get("post_id"))
@@ -1734,7 +1893,10 @@ def pending_media_is_complete(user_dir: Path, record: dict[str, Any]) -> bool:
             return False
         for media_number in range(1, expected + 1):
             pattern = f"*_{post_id}_{media_number}_*"
-            if not any(asset_is_complete(path) for path in media_root.rglob(pattern)):
+            if not (
+                any(asset_is_complete(path) for path in media_root.rglob(pattern))
+                or asset_is_unavailable(post_id, media_number)
+            ):
                 return False
         return True
     filename = Path(str(record.get("filename") or "")).name
@@ -1751,16 +1913,135 @@ def pending_media_is_complete(user_dir: Path, record: dict[str, Any]) -> bool:
 def prune_completed_pending_media(
     state: dict[str, Any], user_dir: Path
 ) -> list[dict[str, Any]]:
+    unavailable_value = state.get("unavailable_media")
+    unavailable = [
+        record
+        for record in (
+            unavailable_value if isinstance(unavailable_value, list) else []
+        )
+        if isinstance(record, dict)
+        and not pending_media_is_complete(user_dir, record)
+    ]
+    state["unavailable_media"] = unavailable
     current = state.get("pending_media")
     records = current if isinstance(current, list) else []
     remaining = [
         record
         for record in records
         if isinstance(record, dict)
-        and not pending_media_is_complete(user_dir, record)
+        and not pending_media_is_complete(user_dir, record, unavailable)
     ]
     state["pending_media"] = remaining
     return remaining
+
+
+def pending_media_due(
+    state: dict[str, Any],
+    user_dir: Path,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    current = prune_completed_pending_media(state, user_dir)
+    observed = now or utc_now()
+    due = []
+    for record in current:
+        value = record.get("next_retry_at")
+        if not value:
+            due.append(record)
+            continue
+        try:
+            next_retry = parse_datetime(str(value))
+        except argparse.ArgumentTypeError:
+            due.append(record)
+            continue
+        if next_retry <= observed:
+            due.append(record)
+    return due
+
+
+def media_queue_summary(
+    state: dict[str, Any],
+    user_dir: Path,
+    *,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    pending = prune_completed_pending_media(state, user_dir)
+    due = pending_media_due(state, user_dir, now=now)
+    unavailable = state.get("unavailable_media")
+    return {
+        "pending": len(pending),
+        "due": len(due),
+        "deferred": len(pending) - len(due),
+        "unavailable": len(unavailable) if isinstance(unavailable, list) else 0,
+    }
+
+
+def reclassify_pending_media_from_logs(
+    state: dict[str, Any],
+    user_dir: Path,
+) -> int:
+    """Enrich old pending records from their last immutable run log."""
+    before = len(
+        state.get("unavailable_media")
+        if isinstance(state.get("unavailable_media"), list)
+        else []
+    )
+    pending = list(
+        state.get("pending_media")
+        if isinstance(state.get("pending_media"), list)
+        else []
+    )
+    for record in pending:
+        if not isinstance(record, dict):
+            continue
+        source_run_id = str(record.get("last_source_run_id") or "")
+        post_id = id_string(record.get("post_id"))
+        if (
+            not source_run_id
+            or Path(source_run_id).name != source_run_id
+            or not post_id
+        ):
+            continue
+        run_dir = user_dir / "runs" / source_run_id
+        candidates = [
+            run_dir / f"retry-media-{post_id}.log",
+            run_dir / "timeline.log",
+        ]
+        match = None
+        for log_path in candidates:
+            failures, _ = analyze_gallery_log(log_path)
+            match = next(
+                (
+                    failure
+                    for failure in failures
+                    if (
+                        failure.get("filename") == record.get("filename")
+                        or (
+                            id_string(failure.get("post_id")) == post_id
+                            and failure.get("media_number")
+                            == record.get("media_number")
+                        )
+                    )
+                ),
+                None,
+            )
+            if match is not None:
+                break
+        if match is None or not match.get("http_statuses"):
+            continue
+        merge_pending_media(
+            state,
+            [match],
+            source_run_id=source_run_id,
+            observed_at=str(record.get("last_failed_at") or iso_utc(utc_now())),
+        )
+    prune_completed_pending_media(state, user_dir)
+    after = len(
+        state.get("unavailable_media")
+        if isinstance(state.get("unavailable_media"), list)
+        else []
+    )
+    return max(0, after - before)
 
 
 def recover_download_only_runs(
@@ -2099,7 +2380,16 @@ def archive_user(
     recovered_runs = recover_download_only_runs(
         state, user_dir, modern_head_mode=modern_head_mode
     )
-    if recovered_stalled_runs or recovered_runs:
+    media_state_before_reclassification = copy.deepcopy(state)
+    newly_unavailable_media = reclassify_pending_media_from_logs(state, user_dir)
+    media_reclassification_changed = (
+        state != media_state_before_reclassification
+    )
+    if (
+        recovered_stalled_runs
+        or recovered_runs
+        or media_reclassification_changed
+    ):
         atomic_write_json(state_path, state)
     if recovered_stalled_runs:
         print(
@@ -2110,6 +2400,11 @@ def archive_user(
         print(
             f"Recovered completed timeline state for @{handle} from "
             f"download-only run(s): {', '.join(recovered_runs)}"
+        )
+    if newly_unavailable_media:
+        print(
+            f"Classified {newly_unavailable_media} repeatedly missing media "
+            f"item(s) for @{handle} as unavailable; normal runs will not retry them."
         )
     cursor, chain_started_at, date_after = select_timeline_state(
         args, state, started
@@ -2142,6 +2437,8 @@ def archive_user(
         "finalized_abandoned_runs": finalized_abandoned_runs,
         "recovered_stalled_runs": recovered_stalled_runs,
         "recovered_download_only_runs": recovered_runs,
+        "newly_unavailable_media": newly_unavailable_media,
+        "media_reclassification_changed": media_reclassification_changed,
         "endpoints": [],
     }
     manifest_path = run_dir / "manifest.json"
@@ -2209,12 +2506,13 @@ def archive_user(
     )
 
     pending_before = prune_completed_pending_media(state, user_dir)
+    due_before = pending_media_due(state, user_dir, now=started)
     retried_post_ids: list[str] = []
-    if pending_before:
+    if due_before:
         retry_post_ids = sorted(
             {
                 str(record["post_id"])
-                for record in pending_before
+                for record in due_before
                 if record.get("post_id")
             }
         )
@@ -2271,17 +2569,31 @@ def archive_user(
                 raise KeyboardInterrupt
 
     remaining_pending = prune_completed_pending_media(state, user_dir)
+    recovery_summary = media_queue_summary(state, user_dir)
     manifest["media_recovery"] = {
         "pending_before": len(pending_before),
+        "due_before": len(due_before),
         "retried_post_ids": retried_post_ids,
         "pending_after": len(remaining_pending),
+        "due_after": recovery_summary["due"],
+        "deferred_after": recovery_summary["deferred"],
+        "unavailable_after": recovery_summary["unavailable"],
     }
     atomic_write_json(state_path, state)
 
     if args.retry_failed_only:
         manifest["media_dataset"] = update_media_dataset(user_dir, handle)
         manifest["pending_media"] = remaining_pending
-        manifest["status"] = "success" if not remaining_pending else "partial"
+        manifest["unavailable_media"] = state.get("unavailable_media", [])
+        manifest["status"] = (
+            "partial"
+            if remaining_pending
+            else (
+                "complete_with_unavailable_media"
+                if recovery_summary["unavailable"]
+                else "success"
+            )
+        )
         manifest["completed_at"] = iso_utc(utc_now())
         atomic_write_json(manifest_path, manifest)
         return manifest
@@ -2413,13 +2725,24 @@ def archive_user(
                 profile_partial = True
                 break
         remaining_pending = prune_completed_pending_media(state, user_dir)
+        unavailable_media = state.get("unavailable_media")
+        unavailable_count = (
+            len(unavailable_media) if isinstance(unavailable_media, list) else 0
+        )
         manifest["pending_media"] = remaining_pending
         manifest["status"] = (
-            "partial" if profile_partial or remaining_pending else "success"
+            "partial"
+            if profile_partial or remaining_pending
+            else (
+                "complete_with_unavailable_media"
+                if unavailable_count
+                else "success"
+            )
         )
 
     manifest["media_dataset"] = update_media_dataset(user_dir, handle)
     manifest["pending_media"] = prune_completed_pending_media(state, user_dir)
+    manifest["unavailable_media"] = state.get("unavailable_media", [])
     atomic_write_json(state_path, state)
     manifest["completed_at"] = iso_utc(utc_now())
     atomic_write_json(manifest_path, manifest)
@@ -2466,6 +2789,10 @@ def dry_run_summary(
     else:
         print("phase 1: modern timeline/profile/media update")
         print("phase 2: guarded automatic legacy detection/resume to source-visible floor")
+        print(
+            "legacy protocol: 3-day roots with safe subdivision; "
+            "2 matching walks and 2 distinct empty tail pages per walk"
+        )
         print("phase 3: seed and drain ancestor-only reply context plus context media")
         print("profile media endpoints after timeline: avatar, background")
     print(f"reposts: {'included and labeled' if not args.no_reposts else 'excluded'}")
@@ -2524,11 +2851,18 @@ def dry_run_summary(
                     "  context: bootstrap from committed sources, then drain to closure"
                 )
             continue
-        pending = state.get("pending_media")
-        pending_count = len(pending) if isinstance(pending, list) else 0
+        # Preview legacy pending records using their immutable last-run logs,
+        # but keep the dry run strictly in-memory.
+        reclassify_pending_media_from_logs(state, user_dir)
+        media_summary = media_queue_summary(state, user_dir)
         if args.retry_failed_only:
             print("  modern/legacy/context metadata: skipped by retry-only mode")
-            print(f"  shared media: {pending_count} pending item(s) to retry")
+            print(
+                "  shared media: "
+                f"{media_summary['due']} due, "
+                f"{media_summary['deferred']} deferred, "
+                f"{media_summary['unavailable']} confirmed unavailable"
+            )
             summary = context_module.readonly_context_summary(
                 user_dir / "_state" / "context.sqlite3"
             )
@@ -2570,7 +2904,12 @@ def dry_run_summary(
             print("  legacy: not initialized; strict transition evidence required")
             if args.modern_max_posts:
                 print("  legacy/context network: skipped; legacy is not initialized")
-        print(f"  shared media: {pending_count} pending item(s)")
+        print(
+            "  shared media: "
+            f"{media_summary['due']} due, "
+            f"{media_summary['deferred']} deferred, "
+            f"{media_summary['unavailable']} confirmed unavailable"
+        )
         summary = context_module.readonly_context_summary(
             user_dir / "_state" / "context.sqlite3"
         )
@@ -2935,6 +3274,7 @@ def main(argv: list[str] | None = None) -> int:
                     checkpoint_invocation()
                     if result["status"] not in {
                         "success",
+                        "complete_with_unavailable_media",
                         "partial",
                         "limited",
                         "stalled",
@@ -2985,12 +3325,20 @@ def main(argv: list[str] | None = None) -> int:
         unsuccessful = [
             result
             for result in results
-            if result["status"] not in {"success", "limited"}
+            if result["status"]
+            not in {"success", "limited", "complete_with_unavailable_media"}
         ]
         final_status = "failed" if unsuccessful else (
             "limited"
             if any(result["status"] == "limited" for result in results)
-            else "success"
+            else (
+                "complete_with_unavailable_media"
+                if any(
+                    result["status"] == "complete_with_unavailable_media"
+                    for result in results
+                )
+                else "success"
+            )
         )
         checkpoint_invocation(combined, status=final_status)
         print_invocation_summary(results)

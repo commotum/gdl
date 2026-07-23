@@ -76,18 +76,18 @@ class LegacyRunnerTests(unittest.TestCase):
             ):
                 runner.require_supported_legacy_gallery_dl()
 
-    def test_terminal_requires_no_cursor_or_four_distinct_empty_pages(self):
+    def test_terminal_requires_no_cursor_or_configured_distinct_empty_pages(self):
         data = page_telemetry(1, tweets=3, returned="data")
         empty = [
             page_telemetry(index, returned=f"empty-{index}")
             for index in range(2, 6)
         ]
         self.assertEqual(
-            runner.terminal_reason([data, *empty], 0, False),
+            runner.terminal_reason([data, *empty[:2]], 0, False, 2),
             "distinct_empty_tail",
         )
         self.assertEqual(
-            runner.terminal_reason([data, *empty[:3]], 0, False),
+            runner.terminal_reason([data, *empty[:1]], 0, False, 2),
             "ambiguous",
         )
         repeated = empty.copy()
@@ -95,19 +95,21 @@ class LegacyRunnerTests(unittest.TestCase):
             5, returned="same", submitted="same"
         )
         self.assertEqual(
-            runner.terminal_reason([data, *repeated], 0, False),
+            runner.terminal_reason([data, *repeated], 0, False, 2),
             "repeated_cursor",
         )
         self.assertEqual(
             runner.terminal_reason(
-                [page_telemetry(1, tweets=1, returned=None)], 0, False
+                [page_telemetry(1, tweets=1, returned=None)], 0, False, 2
             ),
             "no_cursor",
         )
 
     def test_recorder_hashes_cursors_and_enforces_search_cap(self):
         with tempfile.TemporaryDirectory() as directory:
-            recorder = runner.TelemetryRecorder(Path(directory) / "telemetry.json", 1)
+            recorder = runner.TelemetryRecorder(
+                Path(directory) / "telemetry.json", 1, 1
+            )
             api = types.SimpleNamespace(
                 exc=types.SimpleNamespace(AbortExtraction=RuntimeError)
             )
@@ -146,17 +148,20 @@ class LegacyRunnerTests(unittest.TestCase):
             self.assertEqual(recorder.path.stat().st_mode & 0o777, 0o600)
 
     def test_runner_options_are_removed_before_gallery(self):
-        path, limit, remaining = runner.parse_runner_options(
+        path, limit, empty_tail_pages, remaining = runner.parse_runner_options(
             [
                 "--archive-x-legacy-telemetry",
                 "/tmp/t.json",
                 "--archive-x-legacy-request-limit",
                 "6",
+                "--archive-x-legacy-empty-tail-pages",
+                "2",
                 "--version",
             ]
         )
         self.assertEqual(path, Path("/tmp/t.json"))
         self.assertEqual(limit, 6)
+        self.assertEqual(empty_tail_pages, 2)
         self.assertEqual(remaining, ["--version"])
 
     def test_profile_identity_is_extracted_without_profile_content(self):
@@ -218,12 +223,13 @@ class LegacyFetcherTests(unittest.TestCase):
                 archived_at="2026-07-22T00:00:00Z",
                 request_delay="4-8",
                 include_reposts=False,
+                empty_tail_pages=2,
             )
             twitter = config["extractor"]["twitter"]
             self.assertNotIn("archive", twitter)
             self.assertFalse(twitter["cookies-update"])
             self.assertEqual(twitter["search-pagination"], "cursor")
-            self.assertEqual(twitter["search-stop"], 3)
+            self.assertEqual(twitter["search-stop"], 1)
             self.assertFalse(twitter["quoted"])
             self.assertNotIn("post-filter", twitter)
             command = legacy.legacy_gallery_command(
@@ -231,6 +237,7 @@ class LegacyFetcherTests(unittest.TestCase):
                 root / "config.json",
                 root / "telemetry.json",
                 request_limit=6,
+                empty_tail_pages=2,
                 retries=1,
                 http_timeout=60,
                 url="https://x.com/search?q=test",
@@ -300,6 +307,7 @@ class LegacyFetcherTests(unittest.TestCase):
         telemetry = {
             "schema_version": 1,
             "request_limit": 6,
+            "empty_tail_pages": 2,
             "api_requests": 2,
             "search_requests": 1,
             "request_cap_reached": False,
@@ -314,6 +322,7 @@ class LegacyFetcherTests(unittest.TestCase):
                 telemetry,
                 expected_query=query,
                 request_limit=6,
+                empty_tail_pages=2,
                 exit_code=0,
                 expected_user_id="12345",
             ),
@@ -326,6 +335,7 @@ class LegacyFetcherTests(unittest.TestCase):
                 changed,
                 expected_query=query,
                 request_limit=6,
+                empty_tail_pages=2,
                 exit_code=0,
                 expected_user_id="12345",
             )
@@ -336,6 +346,7 @@ class LegacyFetcherTests(unittest.TestCase):
                 ambiguous,
                 expected_query=query,
                 request_limit=6,
+                empty_tail_pages=2,
                 exit_code=0,
                 expected_user_id="12345",
             )
@@ -377,6 +388,7 @@ class LegacyFetcherTests(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "request_limit": 6,
+                        "empty_tail_pages": 2,
                         "api_requests": 2,
                         "search_requests": 1,
                         "request_cap_reached": False,
@@ -413,6 +425,7 @@ class LegacyFetcherTests(unittest.TestCase):
                     request_delay="4-8",
                     include_reposts=False,
                     request_limit=6,
+                    empty_tail_pages=2,
                     retries=1,
                     http_timeout=60,
                     stalled_rate_limit_cycles=3,
@@ -464,6 +477,7 @@ class LegacyFetcherTests(unittest.TestCase):
                     request_delay="4-8",
                     include_reposts=False,
                     request_limit=6,
+                    empty_tail_pages=2,
                     retries=1,
                     http_timeout=60,
                     stalled_rate_limit_cycles=3,

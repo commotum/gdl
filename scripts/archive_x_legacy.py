@@ -27,6 +27,8 @@ TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
 SHA256_RE = TOKEN_RE
 CURSOR_RE = re.compile(r"3_(\d+)/\Z")
 LEGACY_TERMINAL_REASONS = {"no_cursor", "distinct_empty_tail"}
+DEFAULT_ROOT_WINDOW_DAYS = 3
+DEFAULT_EMPTY_TAIL_PAGES = 2
 # Twitter's documented Snowflake epoch. Returned metadata before this instant
 # is evidence about the ID domain only; it is never used to paginate legacy IDs.
 SNOWFLAKE_EPOCH = datetime(2010, 11, 4, 1, 42, 54, 657000, tzinfo=timezone.utc)
@@ -37,12 +39,14 @@ class LegacyRunOptions:
     cookies: Path
     max_root_windows: int | None = None
     request_limit: int = 6
+    root_window_days: int = DEFAULT_ROOT_WINDOW_DAYS
+    empty_tail_pages: int = DEFAULT_EMPTY_TAIL_PAGES
     walk_attempts: int = 3
     window_attempts: int = 3
     max_leaves: int = 64
     request_delay: str = "4-8"
     walk_delay: str = "10-20"
-    window_delay: str = "30-60"
+    window_delay: str = "5-15"
     retries: int = 1
     http_timeout: int = 60
     stalled_rate_limit_cycles: int = 3
@@ -52,6 +56,8 @@ class LegacyRunOptions:
             raise archive_x.ArchiveError("legacy root-window limit must be positive")
         for name in (
             "request_limit",
+            "root_window_days",
+            "empty_tail_pages",
             "walk_attempts",
             "window_attempts",
             "max_leaves",
@@ -65,6 +71,10 @@ class LegacyRunOptions:
             raise archive_x.ArchiveError(
                 "legacy run requires at least two walk attempts"
             )
+        if self.empty_tail_pages >= self.request_limit:
+            raise archive_x.ArchiveError(
+                "legacy empty-tail pages must be below the request limit"
+            )
         for value in (self.request_delay, self.walk_delay, self.window_delay):
             archive_x.parse_duration(value)
         return self
@@ -75,6 +85,8 @@ class LegacyRunOptions:
             cookies=args.cookies,
             max_root_windows=args.windows,
             request_limit=args.request_limit,
+            root_window_days=args.root_window_days,
+            empty_tail_pages=args.empty_tail_pages,
             walk_attempts=args.walk_attempts,
             window_attempts=args.window_attempts,
             max_leaves=args.max_leaves,
@@ -733,7 +745,12 @@ def build_legacy_gallery_config(
     archived_at: str,
     request_delay: str,
     include_reposts: bool,
+    empty_tail_pages: int,
 ) -> dict[str, Any]:
+    if empty_tail_pages < 1:
+        raise archive_x.ArchiveError(
+            "legacy empty-tail page count must be positive"
+        )
     config = archive_x.build_gallery_config(
         handle=handle,
         endpoint=endpoint,
@@ -760,7 +777,10 @@ def build_legacy_gallery_config(
             "search-pagination": "cursor",
             "search-results": "Latest",
             "search-limit": 20,
-            "search-stop": 3,
+            # gallery-dl stops on the next empty response after this counter
+            # reaches zero. A value of N-1 therefore records exactly N empty
+            # tail pages before successful termination.
+            "search-stop": empty_tail_pages - 1,
             "quoted": False,
             "expand": False,
             "showreplies": False,
@@ -779,12 +799,17 @@ def legacy_gallery_command(
     telemetry_path: Path,
     *,
     request_limit: int,
+    empty_tail_pages: int,
     retries: int,
     http_timeout: int,
     url: str,
 ) -> list[str]:
     if request_limit < 1:
         raise archive_x.ArchiveError("legacy request limit must be positive")
+    if not 1 <= empty_tail_pages < request_limit:
+        raise archive_x.ArchiveError(
+            "legacy empty-tail page count must be below the request limit"
+        )
     return [
         sys.executable,
         str(repo_dir / "scripts" / "gallery_dl_x_legacy_runner.py"),
@@ -792,6 +817,8 @@ def legacy_gallery_command(
         str(telemetry_path),
         "--archive-x-legacy-request-limit",
         str(request_limit),
+        "--archive-x-legacy-empty-tail-pages",
+        str(empty_tail_pages),
         "--config-ignore",
         "-c",
         str(repo_dir / "gallery-dl.conf"),
@@ -910,6 +937,7 @@ def validate_walk_telemetry(
     *,
     expected_query: str,
     request_limit: int,
+    empty_tail_pages: int,
     exit_code: int,
     expected_user_id: str,
 ) -> dict[str, Any]:
@@ -919,6 +947,8 @@ def validate_walk_telemetry(
         raise archive_x.ArchiveError("legacy walk telemetry may contain opaque cursors")
     if telemetry.get("request_limit") != request_limit:
         raise archive_x.ArchiveError("legacy walk telemetry request limit changed")
+    if telemetry.get("empty_tail_pages") != empty_tail_pages:
+        raise archive_x.ArchiveError("legacy walk empty-tail proof changed")
     search_requests = telemetry.get("search_requests")
     if not isinstance(search_requests, int) or not 1 <= search_requests <= request_limit:
         raise archive_x.ArchiveError("legacy walk request count is invalid")
@@ -965,6 +995,7 @@ def run_legacy_walk(
     request_delay: str,
     include_reposts: bool,
     request_limit: int,
+    empty_tail_pages: int,
     retries: int,
     http_timeout: int,
     stalled_rate_limit_cycles: int,
@@ -988,6 +1019,7 @@ def run_legacy_walk(
         archived_at=second_utc(archive_x.utc_now()),
         request_delay=request_delay,
         include_reposts=include_reposts,
+        empty_tail_pages=empty_tail_pages,
     )
     archive_x.atomic_write_json(config_path, config)
     command = legacy_gallery_command(
@@ -995,6 +1027,7 @@ def run_legacy_walk(
         config_path,
         telemetry_path,
         request_limit=request_limit,
+        empty_tail_pages=empty_tail_pages,
         retries=retries,
         http_timeout=http_timeout,
         url=url,
@@ -1034,6 +1067,7 @@ def run_legacy_walk(
             telemetry,
             expected_query=query,
             request_limit=request_limit,
+            empty_tail_pages=empty_tail_pages,
             exit_code=status,
             expected_user_id=requested_user_id,
         )
@@ -1405,7 +1439,9 @@ def run_legacy_archive(
         "status": "running",
         "gallery_dl_version": version,
         "window_limit": options.max_root_windows,
+        "root_window_days": options.root_window_days,
         "request_limit": options.request_limit,
+        "empty_tail_pages": options.empty_tail_pages,
         "walk_attempt_limit": options.walk_attempts,
         "window_attempt_limit": options.window_attempts,
         "max_leaves": options.max_leaves,
@@ -1447,6 +1483,7 @@ def run_legacy_archive(
                 legacy,
                 owner_run_id=current_run_id,
                 claimed_at=second_utc(archive_x.utc_now()),
+                root_window_days=options.root_window_days,
             )
             state["legacy_backfill"] = legacy
             archive_x.atomic_write_json(state_path, state)
@@ -1504,6 +1541,7 @@ def run_legacy_archive(
                     request_delay=options.request_delay,
                     include_reposts=legacy["source"]["reposts_included"],
                     request_limit=options.request_limit,
+                    empty_tail_pages=options.empty_tail_pages,
                     retries=options.retries,
                     http_timeout=options.http_timeout,
                     stalled_rate_limit_cycles=options.stalled_rate_limit_cycles,
@@ -1659,16 +1697,22 @@ def run_legacy_archive(
 
 
 def claim_window(
-    legacy: dict[str, Any], *, owner_run_id: str, claimed_at: str
+    legacy: dict[str, Any],
+    *,
+    owner_run_id: str,
+    claimed_at: str,
+    root_window_days: int = 1,
 ) -> dict[str, Any]:
     validate_legacy_state(legacy, expected_user_id=legacy.get("requested_user_id"))
     if legacy["status"] != "pending":
         raise archive_x.ArchiveError("legacy frontier is not ready to claim")
+    if not isinstance(root_window_days, int) or root_window_days < 1:
+        raise archive_x.ArchiveError("legacy root-window day count must be positive")
     until = parse_utc(legacy["next_until"], "next_until")
     floor = parse_utc(legacy["floor_since"], "floor_since")
     if until == floor:
         raise archive_x.ArchiveError("legacy frontier is already at its floor")
-    since = max(floor, until - timedelta(days=1))
+    since = max(floor, until - timedelta(days=root_window_days))
     since_text, until_text = second_utc(since), second_utc(until)
     updated = copy.deepcopy(legacy)
     updated["status"] = "active"
@@ -1781,7 +1825,9 @@ def legacy_status_summary(state: dict[str, Any], handle: str) -> dict[str, Any]:
     floor = parse_utc(legacy["floor_since"], "floor_since")
     next_window = None
     if frontier > floor:
-        next_since = max(floor, frontier - timedelta(days=1))
+        next_since = max(
+            floor, frontier - timedelta(days=DEFAULT_ROOT_WINDOW_DAYS)
+        )
         next_window = {
             "since": second_utc(next_since),
             "until": second_utc(frontier),
@@ -1868,6 +1914,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="advanced: stop after this many committed root UTC windows",
     )
     run.add_argument("--request-limit", type=archive_x.positive_int, default=6)
+    run.add_argument(
+        "--root-window-days",
+        type=archive_x.positive_int,
+        default=DEFAULT_ROOT_WINDOW_DAYS,
+        help="advanced: target root-window width; saturated windows split safely",
+    )
+    run.add_argument(
+        "--empty-tail-pages",
+        type=archive_x.positive_int,
+        default=DEFAULT_EMPTY_TAIL_PAGES,
+        help="advanced: distinct empty pages required per independent walk",
+    )
     run.add_argument("--walk-attempts", type=archive_x.positive_int, default=3)
     run.add_argument("--window-attempts", type=archive_x.positive_int, default=3)
     run.add_argument("--max-leaves", type=archive_x.positive_int, default=64)
@@ -1876,7 +1934,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--walk-delay", type=archive_x.duration_arg, default="10-20")
     run.add_argument(
-        "--window-delay", type=archive_x.duration_arg, default="30-60"
+        "--window-delay", type=archive_x.duration_arg, default="5-15"
     )
     run.add_argument("--retries", type=archive_x.positive_int, default=1)
     run.add_argument("--http-timeout", type=archive_x.positive_int, default=60)
@@ -1894,6 +1952,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "run" and args.walk_attempts < 2:
         parser.error("legacy run requires at least two walk attempts")
+    if (
+        args.command == "run"
+        and args.empty_tail_pages >= args.request_limit
+    ):
+        parser.error("legacy empty-tail pages must be below the request limit")
     args.cookies = args.cookies.expanduser().resolve()
     try:
         handle = archive_x.normalize_handle(args.user)

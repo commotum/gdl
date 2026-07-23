@@ -14,7 +14,11 @@ import archive_x_context as context_x
 import archive_x_legacy as legacy_x
 
 
-SUCCESSFUL_MODERN = {"success", "partial"}
+SUCCESSFUL_MODERN = {
+    "success",
+    "partial",
+    "complete_with_unavailable_media",
+}
 
 
 def user_dir_for(archive_root: Path, handle: str) -> Path:
@@ -62,12 +66,14 @@ def legacy_options(args: Namespace, max_root_windows: int | None) -> legacy_x.Le
         cookies=args.cookies,
         max_root_windows=max_root_windows,
         request_limit=6,
+        root_window_days=legacy_x.DEFAULT_ROOT_WINDOW_DAYS,
+        empty_tail_pages=legacy_x.DEFAULT_EMPTY_TAIL_PAGES,
         walk_attempts=3,
         window_attempts=3,
         max_leaves=64,
         request_delay=args.request_delay,
         walk_delay="10-20",
-        window_delay="30-60",
+        window_delay="5-15",
         retries=args.retries,
         http_timeout=args.http_timeout,
         stalled_rate_limit_cycles=args.stalled_rate_limit_cycles,
@@ -190,13 +196,33 @@ def retry_shared_media(
     handle: str,
     version: str,
 ) -> dict[str, Any]:
-    state = archive_x.load_json(
-        user_dir_for(archive_root, handle) / "_state" / "state.json", {}
-    )
-    pending = state.get("pending_media")
-    before = len(pending) if isinstance(pending, list) else 0
+    user_dir = user_dir_for(archive_root, handle)
+    state_path = user_dir / "_state" / "state.json"
+    state = archive_x.load_json(state_path, {})
+    state_before = copy.deepcopy(state)
+    archive_x.reclassify_pending_media_from_logs(state, user_dir)
+    if state != state_before:
+        archive_x.atomic_write_json(state_path, state)
+    summary = archive_x.media_queue_summary(state, user_dir)
+    before = summary["pending"]
     if not before:
-        return {"status": "complete", "pending_before": 0, "pending_after": 0}
+        return {
+            "status": (
+                "complete_with_unavailable_media"
+                if summary["unavailable"]
+                else "complete"
+            ),
+            "pending_before": 0,
+            "pending_after": 0,
+            **summary,
+        }
+    if not summary["due"]:
+        return {
+            "status": "partial",
+            "pending_before": before,
+            "pending_after": before,
+            **summary,
+        }
     retry_args = copy.copy(args)
     retry_args.retry_failed_only = True
     retry_args.full_rescan = False
@@ -205,16 +231,23 @@ def retry_shared_media(
     run = archive_x.archive_user(
         retry_args, repo_dir, archive_root, handle, version
     )
-    state = archive_x.load_json(
-        user_dir_for(archive_root, handle) / "_state" / "state.json", {}
-    )
-    remaining = state.get("pending_media")
-    after = len(remaining) if isinstance(remaining, list) else 0
+    state = archive_x.load_json(state_path, {})
+    after_summary = archive_x.media_queue_summary(state, user_dir)
+    after = after_summary["pending"]
     return {
-        "status": "complete" if after == 0 else "partial",
+        "status": (
+            "partial"
+            if after
+            else (
+                "complete_with_unavailable_media"
+                if after_summary["unavailable"]
+                else "complete"
+            )
+        ),
         "run_id": run["run_id"],
         "pending_before": before,
         "pending_after": after,
+        **after_summary,
     }
 
 
@@ -230,7 +263,7 @@ def context_phase_status(db_path: Path, *, media: bool) -> dict[str, Any]:
     elif availability["manual_review"]:
         phase = "manual_review"
     elif media and status["media"].get("unavailable", 0):
-        phase = "partial"
+        phase = "complete_with_unavailable_media"
     else:
         phase = "complete"
     return {"status": phase, "availability": availability, "queue": status}
@@ -338,7 +371,12 @@ def run_context_scheduler(
             count = int(result["counts"].get("attempted", 0))
             attempted[handle] += count
             progress = progress or count > 0
-            if result["status"] in {"complete", "partial", "manual_review"}:
+            if result["status"] in {
+                "complete",
+                "complete_with_unavailable_media",
+                "partial",
+                "manual_review",
+            }:
                 results[handle] = result
                 active.remove(handle)
             elif requested_limit is not None and attempted[handle] >= requested_limit:
@@ -376,7 +414,13 @@ def overall_status(phases: dict[str, Any]) -> str:
         if status in {"failed", "interrupted", "stalled", "ambiguous"}:
             return "failed"
         statuses.append(status)
-    for candidate in ("failed", "manual_review", "partial", "limited"):
+    for candidate in (
+        "failed",
+        "manual_review",
+        "partial",
+        "limited",
+        "complete_with_unavailable_media",
+    ):
         if candidate in statuses:
             return candidate
     return "success"
@@ -485,9 +529,13 @@ def run_unified_followups(
             recovery = modern_results[handle].get("media_recovery") or {}
             combined[handle]["shared_media"] = {
                 "status": (
-                    "complete"
-                    if int(recovery.get("pending_after") or 0) == 0
-                    else "partial"
+                    "partial"
+                    if int(recovery.get("pending_after") or 0)
+                    else (
+                        "complete_with_unavailable_media"
+                        if int(recovery.get("unavailable_after") or 0)
+                        else "complete"
+                    )
                 ),
                 **recovery,
             }

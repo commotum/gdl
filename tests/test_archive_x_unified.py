@@ -177,6 +177,21 @@ def transition_archive(root: Path):
 
 
 class UnifiedOrchestrationTests(unittest.TestCase):
+    def test_unavailable_media_is_a_successful_warning_status(self):
+        self.assertEqual(
+            unified_x.overall_status(
+                {
+                    "modern": {"status": "complete_with_unavailable_media"},
+                    "legacy": {"status": "complete"},
+                    "shared_media": {
+                        "status": "complete_with_unavailable_media"
+                    },
+                    "context_media": {"status": "complete"},
+                }
+            ),
+            "complete_with_unavailable_media",
+        )
+
     def test_overall_status_accepts_only_the_exact_initialized_boundary_stall(self):
         self.assertEqual(
             unified_x.overall_status(

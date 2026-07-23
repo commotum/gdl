@@ -108,8 +108,17 @@ instead of silently filling the local disk.
 A download-only media error does not force another historical timeline
 backfill. When timeline enumeration otherwise completed, the archiver advances
 the timeline state, records the incomplete asset as pending, and marks the run
-`partial`. A normal later run retries recorded pending media before refreshing
-the timeline, avatar, and background.
+`partial`. Transient failures receive a durable `next_retry_at` and are skipped
+until due rather than retried by every invocation. Video recovery delegates
+variant selection to yt-dlp instead of repeating only gallery-dl's original
+highest-bitrate CDN URL.
+
+Two refreshed attempts at least 24 hours apart that return only HTTP `404` or
+`410` across the available variants classify an asset as source-unavailable.
+It leaves the automatic queue but retains its post identity, failure history,
+and evidence. An otherwise complete run reports
+`complete_with_unavailable_media`, exits successfully with a warning, and does
+not pretend the missing bytes were recovered.
 
 To retry only recorded incomplete media without crawling the timeline, run:
 
@@ -150,15 +159,18 @@ or generic failures never trigger the handoff.
 
 Once initialized, the same normal command resumes bounded internal UTC windows
 until the source-visible account-creation floor or an explicit manual-review
-stop. Operators do not calculate or supply a window count.
+stop. Operators do not calculate or supply a window count. New roots target
+three UTC days and split recursively when dense; an interrupted active window
+always retains its original exact bounds.
 
 Each UTC interval is queried with exact epoch-second bounds, never by decoding
 or decrementing a legacy ID. Coverage advances only after two independent,
-bounded cursor walks return the same numeric-identity-checked ID set and valid
-terminal telemetry, their raw observations are durable, and the dataset merge
-has completed. A saturated query splits into smaller contiguous intervals. An
-empty page, repeated cursor, API error, timeout, request cap, mismatched repeat,
-or interruption cannot advance the frontier.
+bounded cursor walks return the same numeric-identity-checked ID set and each
+ends with two distinct empty cursor pages (or no cursor). Their raw observations
+must be durable and the dataset merge complete. A saturated query splits into
+smaller contiguous intervals. An ambiguous tail, repeated cursor, API error,
+timeout, request cap, mismatched repeat, or interruption cannot advance the
+frontier.
 
 The status phrase `source_visible_to_account_creation` means every contiguous
 window in this protocol was repeat-confirmed against X. It does **not** prove

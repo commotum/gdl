@@ -816,7 +816,7 @@ class LegacyStateTests(unittest.TestCase):
             self.assertEqual(
                 pending["next_window"],
                 {
-                    "since": "2010-10-29T00:00:00Z",
+                    "since": "2010-10-27T00:00:00Z",
                     "until": "2010-10-30T00:00:00Z",
                 },
             )
@@ -884,6 +884,8 @@ def legacy_run_args(root: Path, **overrides):
     values = {
         "max_root_windows": 1,
         "request_limit": 6,
+        "root_window_days": 1,
+        "empty_tail_pages": 2,
         "walk_attempts": 3,
         "window_attempts": 3,
         "max_leaves": 64,
@@ -980,6 +982,42 @@ class LegacyOrchestrationTests(unittest.TestCase):
         parser = archive_x_legacy.build_parser()
         args = parser.parse_args(["--user", "alice", "run"])
         self.assertIsNone(args.windows)
+        self.assertEqual(args.root_window_days, 3)
+        self.assertEqual(args.empty_tail_pages, 2)
+        self.assertEqual(args.window_delay, "5-15")
+
+    def test_normal_run_claims_three_days_but_existing_active_bounds_are_stable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, state_path, _ = initialized_fixture_archive(root)
+            state = archive_x.load_json(state_path, {})
+            claimed = archive_x_legacy.claim_window(
+                state["legacy_backfill"],
+                owner_run_id="run-a",
+                claimed_at="2026-07-22T13:00:00Z",
+                root_window_days=3,
+            )
+            self.assertEqual(claimed["active_window"]["since"], (
+                "2010-10-27T00:00:00Z"
+            ))
+            self.assertEqual(claimed["active_window"]["until"], (
+                "2010-10-30T00:00:00Z"
+            ))
+
+            resumed = archive_x_legacy.resume_active_window(
+                claimed,
+                owner_run_id="run-b",
+                resumed_at="2026-07-22T14:00:00Z",
+                attempt_limit=3,
+            )
+            self.assertEqual(
+                resumed["active_window"]["since"],
+                claimed["active_window"]["since"],
+            )
+            self.assertEqual(
+                resumed["active_window"]["until"],
+                claimed["active_window"]["until"],
+            )
 
     def test_two_matching_walks_merge_then_advance_and_queue_media(self):
         with tempfile.TemporaryDirectory() as directory:

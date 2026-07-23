@@ -153,7 +153,12 @@ def profile_user_ids(value: Any) -> list[str]:
     return sorted(found, key=int)
 
 
-def terminal_reason(pages: list[dict[str, Any]], status: int, capped: bool) -> str:
+def terminal_reason(
+    pages: list[dict[str, Any]],
+    status: int,
+    capped: bool,
+    empty_tail_pages: int,
+) -> str:
     if capped:
         return "request_cap"
     if any(page["api_error_count"] for page in pages):
@@ -166,23 +171,29 @@ def terminal_reason(pages: list[dict[str, Any]], status: int, capped: bool) -> s
         return "no_search_response"
     if pages[-1]["returned_cursor_sha256"] is None:
         return "no_cursor"
-    tail = pages[-4:]
+    tail = pages[-empty_tail_pages:]
     returned = [page["returned_cursor_sha256"] for page in tail]
     if (
-        len(tail) == 4
+        len(tail) == empty_tail_pages
         and all(page["tweet_entry_count"] == 0 for page in tail)
         and all(page["api_error_count"] == 0 for page in tail)
         and all(returned)
-        and len(set(returned)) == 4
+        and len(set(returned)) == empty_tail_pages
     ):
         return "distinct_empty_tail"
     return "ambiguous"
 
 
 class TelemetryRecorder:
-    def __init__(self, path: Path, request_limit: int):
+    def __init__(
+        self,
+        path: Path,
+        request_limit: int,
+        empty_tail_pages: int,
+    ):
         self.path = path
         self.request_limit = request_limit
+        self.empty_tail_pages = empty_tail_pages
         self.api_requests = 0
         self.search_requests = 0
         self.capped = False
@@ -233,10 +244,16 @@ class TelemetryRecorder:
         return {
             "schema_version": TELEMETRY_SCHEMA_VERSION,
             "request_limit": self.request_limit,
+            "empty_tail_pages": self.empty_tail_pages,
             "api_requests": self.api_requests,
             "search_requests": self.search_requests,
             "request_cap_reached": self.capped,
-            "terminal_reason": terminal_reason(self.pages, status, self.capped),
+            "terminal_reason": terminal_reason(
+                self.pages,
+                status,
+                self.capped,
+                self.empty_tail_pages,
+            ),
             "exit_code": status,
             "pages": self.pages,
             "profile_user_ids": sorted(self.profile_user_ids, key=int),
@@ -255,36 +272,69 @@ class TelemetryRecorder:
         os.replace(temporary, self.path)
 
 
-def parse_runner_options(argv: list[str]) -> tuple[Path | None, int | None, list[str]]:
+def parse_runner_options(
+    argv: list[str],
+) -> tuple[Path | None, int | None, int | None, list[str]]:
     telemetry = None
     request_limit = None
+    empty_tail_pages = None
     remaining = []
     index = 0
     while index < len(argv):
         value = argv[index]
-        if value in {"--archive-x-legacy-telemetry", "--archive-x-legacy-request-limit"}:
+        if value in {
+            "--archive-x-legacy-telemetry",
+            "--archive-x-legacy-request-limit",
+            "--archive-x-legacy-empty-tail-pages",
+        }:
             if index + 1 >= len(argv):
                 raise ValueError(f"{value} requires a value")
             option = argv[index + 1]
             if value.endswith("telemetry"):
                 telemetry = Path(option)
+            elif value.endswith("empty-tail-pages"):
+                empty_tail_pages = int(option)
             else:
                 request_limit = int(option)
             index += 2
             continue
         remaining.append(value)
         index += 1
-    if (telemetry is None) != (request_limit is None):
-        raise ValueError("legacy telemetry path and request limit are required together")
+    provided = (
+        telemetry is not None,
+        request_limit is not None,
+        empty_tail_pages is not None,
+    )
+    if any(provided) and not all(provided):
+        raise ValueError(
+            "legacy telemetry path, request limit, and empty-tail pages "
+            "are required together"
+        )
     if request_limit is not None and request_limit < 1:
         raise ValueError("legacy request limit must be positive")
-    return telemetry, request_limit, remaining
+    if (
+        empty_tail_pages is not None
+        and (
+            empty_tail_pages < 1
+            or request_limit is None
+            or empty_tail_pages >= request_limit
+        )
+    ):
+        raise ValueError(
+            "legacy empty-tail pages must be positive and below the request limit"
+        )
+    return telemetry, request_limit, empty_tail_pages, remaining
 
 
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
     try:
-        telemetry_path, request_limit, gallery_args = parse_runner_options(values)
+        (
+            telemetry_path,
+            request_limit,
+            empty_tail_pages,
+            gallery_args,
+        ) = parse_runner_options(values)
         require_supported_legacy_gallery_dl()
         base_runner.install_patch()
     except (
@@ -302,7 +352,11 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             sys.argv = original_argv
 
-    recorder = TelemetryRecorder(telemetry_path, request_limit)
+    recorder = TelemetryRecorder(
+        telemetry_path,
+        request_limit,
+        empty_tail_pages,
+    )
     original_call = TwitterAPI._call
     original_checkpoint = base_runner._checkpoint_cursor
 

@@ -133,10 +133,14 @@ For a normal invocation, execute:
 4. **Transition:** for an eligible watchdog stop only, classify and atomically
    initialize. A proven transition is a phase transition, not an overall
    modern failure.
-5. **Legacy metadata:** resume active/pending work through one-day root windows
-   until account floor, manual review, interruption, or advanced limit.
-6. **Shared media:** drain newly enqueued legacy/timeline media with bounded
-   per-item attempts. Metadata remains committed if assets remain pending.
+5. **Legacy metadata:** resume the exact active window first, then use
+   three-day root windows with recursive saturation splits until account
+   floor, manual review, interruption, or advanced limit. Every leaf still
+   requires two matching walks, with two distinct empty tail pages per walk.
+6. **Shared media:** drain due legacy/timeline media with bounded per-item
+   attempts and yt-dlp variant recovery. Transient failures persist a retry
+   time; repeated refreshed 404/410 evidence becomes unavailable and yields
+   `complete_with_unavailable_media` instead of perpetual partial status.
 7. **Context seed:** inventory all authoritative canonical modern and committed
    legacy raws, update SQLite source ledger/local-post index/edges, and capture
    locally available parent posts.

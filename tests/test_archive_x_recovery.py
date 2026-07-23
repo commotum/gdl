@@ -130,6 +130,27 @@ class DownloadLogTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(other_errors, 0)
 
+    def test_analyzer_attaches_http_evidence_to_the_failed_asset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "retry.log"
+            log_path.write_text(
+                "command: python -c \"print('[download][error] Failed')\"\n"
+                "[downloader.http][warning] '404 Not Found' for "
+                "'https://pbs.twimg.com/media/test?name=orig'\n"
+                "[download][info] Trying fallback URL #1\n"
+                "[downloader.http][warning] '404 Not Found' for "
+                "'https://pbs.twimg.com/media/test?name=large'\n"
+                + DOWNLOAD_ERROR,
+                encoding="utf-8",
+            )
+
+            failures, other_errors = archive_x.analyze_gallery_log(log_path)
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["http_statuses"], [404])
+        self.assertEqual(failures[0]["http_error_count"], 2)
+        self.assertEqual(other_errors, 0)
+
     def test_metadata_classifier_accepts_only_exact_download_only_failure(self):
         valid = [failed_download()]
         self.assertTrue(
@@ -231,6 +252,7 @@ class ArchiveEndpointRecoveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "media_partial")
         self.assertTrue(result["metadata_complete"])
         self.assertTrue(config["extractor"]["twitter"]["retweets"])
+        self.assertEqual(config["extractor"]["twitter"]["videos"], "ytdl")
         command = result["command"]
         self.assertTrue(command[1].endswith("scripts/gallery_dl_x_runner.py"))
         self.assertEqual(command[command.index("--retries") + 1], "8")
@@ -419,6 +441,106 @@ class PendingMediaTests(unittest.TestCase):
             self.assertEqual(
                 archive_x.prune_completed_pending_media(state, user_dir), []
             )
+
+    def test_repeated_terminal_http_failure_becomes_unavailable(self):
+        state = {}
+        terminal = {
+            **failed_download(),
+            "http_statuses": [404],
+            "http_error_count": 5,
+        }
+        archive_x.merge_pending_media(
+            state,
+            [terminal],
+            source_run_id="run-a",
+            observed_at="2026-07-20T00:00:00Z",
+        )
+        self.assertEqual(len(state["pending_media"]), 1)
+        self.assertEqual(state["pending_media"][0]["next_retry_at"], (
+            "2026-07-21T00:00:00Z"
+        ))
+
+        archive_x.merge_pending_media(
+            state,
+            [terminal],
+            source_run_id="run-b",
+            observed_at="2026-07-21T00:00:00Z",
+        )
+
+        self.assertEqual(state["pending_media"], [])
+        self.assertEqual(len(state["unavailable_media"]), 1)
+        unavailable = state["unavailable_media"][0]
+        self.assertEqual(unavailable["status"], "unavailable")
+        self.assertEqual(
+            unavailable["unavailable_reason"], "repeated_http_404_or_410"
+        )
+
+    def test_transient_failure_is_deferred_instead_of_retried_every_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir = Path(directory) / "tszzl"
+            state = {}
+            archive_x.merge_pending_media(
+                state,
+                [
+                    {
+                        **failed_download(),
+                        "http_statuses": [500],
+                        "http_error_count": 9,
+                    }
+                ],
+                source_run_id="run-a",
+                observed_at="2026-07-20T00:00:00Z",
+            )
+
+            self.assertEqual(
+                archive_x.pending_media_due(
+                    state,
+                    user_dir,
+                    now=archive_x.parse_datetime("2026-07-20T05:59:59Z"),
+                ),
+                [],
+            )
+            self.assertEqual(
+                len(
+                    archive_x.pending_media_due(
+                        state,
+                        user_dir,
+                        now=archive_x.parse_datetime("2026-07-20T06:00:00Z"),
+                    )
+                ),
+                1,
+            )
+
+    def test_old_pending_record_is_reclassified_from_immutable_retry_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir = Path(directory) / "tszzl"
+            run_dir = user_dir / "runs" / "run-b"
+            run_dir.mkdir(parents=True)
+            (run_dir / f"retry-media-{POST_ID}.log").write_text(
+                "[downloader.http][warning] '404 Not Found' for "
+                "'https://pbs.twimg.com/media/test?name=orig'\n"
+                + DOWNLOAD_ERROR,
+                encoding="utf-8",
+            )
+            state = {
+                "pending_media": [
+                    {
+                        **failed_download(),
+                        "attempts": 2,
+                        "first_failed_at": "2026-07-20T00:00:00Z",
+                        "last_failed_at": "2026-07-22T00:00:00Z",
+                        "last_source_run_id": "run-b",
+                    }
+                ]
+            }
+
+            changed = archive_x.reclassify_pending_media_from_logs(
+                state, user_dir
+            )
+
+            self.assertEqual(changed, 1)
+            self.assertEqual(state["pending_media"], [])
+            self.assertEqual(state["unavailable_media"][0]["post_id"], POST_ID)
 
 
 class StallRecoveryTests(unittest.TestCase):
@@ -777,18 +899,18 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(state["last_successful_completed_at"], COMPLETED_AT)
             self.assertIsNone(state["resume"])
             self.assertEqual(state["recovered_download_only_runs"], [RUN_ID])
-            self.assertEqual(state["pending_media"], [
-                {
-                    "attempts": 1,
-                    "filename": FILENAME,
-                    "first_failed_at": COMPLETED_AT,
-                    "last_failed_at": COMPLETED_AT,
-                    "last_source_run_id": RUN_ID,
-                    "media_number": MEDIA_NUMBER,
-                    "post_id": POST_ID,
-                    "source_url": f"https://x.com/i/web/status/{POST_ID}",
-                }
-            ])
+            self.assertEqual(len(state["pending_media"]), 1)
+            pending = state["pending_media"][0]
+            self.assertEqual(pending["attempts"], 1)
+            self.assertEqual(pending["filename"], FILENAME)
+            self.assertEqual(pending["post_id"], POST_ID)
+            self.assertEqual(pending["media_number"], MEDIA_NUMBER)
+            self.assertEqual(pending["status"], "pending")
+            self.assertEqual(pending["failure_class"], "transient")
+            self.assertEqual(
+                pending["next_retry_at"], "2026-07-15T06:21:00Z"
+            )
+            self.assertEqual(state["unavailable_media"], [])
 
             once = copy.deepcopy(state)
             self.assertEqual(
