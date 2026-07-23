@@ -886,6 +886,12 @@ Reply context is ancestor-only and opt-in. It excludes sibling replies,
 descendants, whole-conversation expansion, and quoted sources. Context state is
 durable in `../_state/context.sqlite3`; use
 `scripts/archive-x-context --user HANDLE export` to rebuild these views.
+
+Pre-Snowflake history is an explicit, separate operation through
+`scripts/archive-x-legacy`. Its UTC frontier means repeat-confirmed contiguous
+windows visible through X search; it is not proof that deleted, private,
+withheld, or unindexed posts were recovered. Legacy metadata may advance while
+its media remains in the shared pending-media queue.
 """
     path.write_text(text, encoding="utf-8")
     os.chmod(path, 0o600)
@@ -1594,16 +1600,21 @@ def merge_pending_media(
 ) -> None:
     current = state.get("pending_media")
     records = current if isinstance(current, list) else []
-    by_filename = {
-        str(record.get("filename")): record.copy()
+    by_key = {
+        (
+            "filename:" + str(record.get("filename"))
+            if record.get("filename")
+            else "key:" + str(record.get("key"))
+        ): record.copy()
         for record in records
-        if isinstance(record, dict) and record.get("filename")
+        if isinstance(record, dict) and (record.get("filename") or record.get("key"))
     }
     for failure in failures:
         filename = Path(str(failure.get("filename") or "")).name
         if not filename:
             continue
-        record = by_filename.get(filename, {})
+        key = "filename:" + filename
+        record = by_key.get(key, {})
         previous_source = record.get("last_source_run_id")
         record.update(
             {
@@ -1622,9 +1633,10 @@ def merge_pending_media(
                 + (0 if previous_source == source_run_id else 1),
             }
         )
-        by_filename[filename] = record
+        by_key[key] = record
     state["pending_media"] = sorted(
-        by_filename.values(), key=lambda record: record["filename"]
+        by_key.values(),
+        key=lambda record: str(record.get("filename") or record.get("key") or ""),
     )
 
 
@@ -1640,6 +1652,16 @@ def pending_media_is_complete(user_dir: Path, record: dict[str, Any]) -> bool:
         )
 
     media_root = user_dir / "media"
+    if record.get("kind") == "post":
+        post_id = id_string(record.get("post_id"))
+        expected = record.get("expected_media_count")
+        if not post_id or not isinstance(expected, int) or expected < 1:
+            return False
+        for media_number in range(1, expected + 1):
+            pattern = f"*_{post_id}_{media_number}_*"
+            if not any(asset_is_complete(path) for path in media_root.rglob(pattern)):
+                return False
+        return True
     filename = Path(str(record.get("filename") or "")).name
     if filename and any(asset_is_complete(path) for path in media_root.rglob(filename)):
         return True

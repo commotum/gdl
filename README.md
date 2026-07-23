@@ -128,6 +128,59 @@ still return non-monotonic thread modules. Periodic `--full-rescan` runs are
 the maximum-completeness option; gallery-dl and X themselves can still impose
 historical visibility limits.
 
+### Pre-Snowflake history
+
+Twitter changed from sequential post IDs to Snowflake IDs in November 2010.
+The normal timeline crawler deliberately stops if gallery-dl's Snowflake
+pagination arithmetic stalls at that boundary. Do not delete its saved
+`3_POST_ID/` cursor or increase the no-progress watchdog to force it onward.
+
+Pre-Snowflake recovery is a separate, opt-in command. First inspect the local,
+network-free plan:
+
+```bash
+scripts/archive-x-legacy --user USER status
+scripts/archive-x-legacy --user USER plan
+```
+
+`plan` reads the saved cursor, matching stopped manifest, oldest dataset row,
+numeric account identity, and account-creation timestamp. It makes no request
+and no write, and prints a stale-guarded initialization command. Review those
+fields before running that exact `init --token TOKEN` command. Installing the
+code, running `status`/`plan`, or using ordinary `scripts/archive-x` never
+initializes or launches legacy work.
+
+After initialization, every network invocation requires an explicit window
+bound:
+
+```bash
+scripts/archive-x-legacy --user USER run --windows 1
+scripts/archive-x-legacy --user USER status
+```
+
+Each UTC interval is queried with exact epoch-second bounds, never by decoding
+or decrementing a legacy ID. Coverage advances only after two independent,
+bounded cursor walks return the same numeric-identity-checked ID set and valid
+terminal telemetry, their raw observations are durable, and the dataset merge
+has completed. A saturated query splits into smaller contiguous intervals. An
+empty page, repeated cursor, API error, timeout, request cap, mismatched repeat,
+or interruption cannot advance the frontier.
+
+The status phrase `source_visible_to_account_creation` means every contiguous
+window in this protocol was repeat-confirmed against X. It does **not** prove
+recovery of deleted, private, withheld, or search-index-omitted posts. Ambiguous
+windows enter `manual_review`; after inspection, replay only the exact guarded
+window shown by `status`:
+
+```bash
+scripts/archive-x-legacy --user USER retry \
+  --window-id LEGACY_WINDOW_ID --reason 'operator review reason'
+```
+
+Legacy metadata completion is independent of media completion. Media-bearing
+posts enter the existing pending-media queue and are retried through the normal
+individual-post recovery path.
+
 ### Reply-context ancestors
 
 The timeline archive intentionally saves a reply itself without automatically

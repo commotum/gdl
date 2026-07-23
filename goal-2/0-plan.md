@@ -18,9 +18,9 @@ characterization, offline fixtures, and a tightly bounded live diagnostic
 prove the actual search behavior. If another strategy is demonstrably safer,
 the evidence and decision must be recorded before implementation proceeds.
 
-This goal is scaffolding only until explicitly started. Creating these files
-does not authorize code changes, live X requests, production state migration,
-or restarting Visakanv.
+This goal was explicitly started and implemented on 2026-07-22. Its bounded
+production rollout is complete; the remaining long backfill is still an
+explicit operator decision and has not been started.
 
 ## Scope and Completion Boundary
 
@@ -96,6 +96,14 @@ Out of scope unless evidence makes it essential to this repair:
 
 ## Confirmed Current Facts
 
+- Evidence was refreshed on 2026-07-22 before implementation. Tmux session
+  `x` is an idle bash shell; no archive process is running. The production
+  state, stopped manifest, and incomplete raw stream are private mode `0600`
+  and their hashes are recorded in `1-EVIDENCE.md`.
+- The pre-change offline baseline was 88 passing tests with gallery-dl 1.32.4.
+  Stage 1 added three passing characterization tests. A pre-existing `x.txt`
+  modification was observed and left untouched; it no longer appears in
+  `git status`, and no goal command wrote to or restored it.
 - Visakanv's latest run is
   `20260720T023918Z-cf57e4`; it ended `stalled`, and tmux session `x` is an idle
   bash shell.
@@ -124,21 +132,38 @@ Out of scope unless evidence makes it essential to this repair:
   `max_id:TWEET_ID`. Its search paginator updates a Snowflake boundary using
   `(id - 0x400000) | 0x3fffff`, while its date conversion also derives time
   from Snowflake bits. Neither behavior is valid for old sequential IDs.
+- Two bounded disposable probes completed on 2026-07-22 without changing
+  production state. Plain `since`/`until` dates used a non-UTC boundary and
+  are rejected. Exact `since_time`/`until_time` epoch bounds returned 16
+  target-account posts inside October 28 UTC, including IDs older than the
+  stalled boundary. X therefore still exposes at least some legacy history.
+- The search endpoint kept returning distinct opaque cursors for four empty
+  pages; gallery-dl stopped via `search-stop`, not a cursor-less terminal
+  response. A single exit-code-zero walk is therefore not sufficient evidence
+  to advance a window.
 - The existing main archiver already provides stable numeric identity,
   exclusive locks, private files, bounded retries, immutable run evidence,
   rate-limit checkpoint logging, dataset deduplication, pending-media recovery,
   cursor recovery, and a no-progress watchdog.
 - Goal 1's optional reply-context resolver is separate and must not be started
   or changed by this repair.
+- The bounded rollout initialized legacy state with an exact pre-init backup
+  and committed only the October 29 UTC window. Five older unique posts were
+  added, bringing the dataset to 258,070 rows. The source-visible frontier is
+  `2010-10-29T00:00:00Z`; the next window is October 28 UTC. The modern cursor
+  remains `3_29116490825/`, pending media remains two, and no long backfill is
+  running.
 
 ## Assumptions Requiring Proof
 
-- X's current SearchTimeline path still exposes at least some Visakanv posts
-  before October 29, 2010.
-- A query bounded by `since:YYYY-MM-DD until:YYYY-MM-DD` avoids the legacy-ID
-  failure and can terminate reliably using server cursors within that window.
-- `until` is exclusive and `since` is inclusive in the actual endpoint used;
-  fixtures alone cannot establish server semantics.
+- Exact-epoch SearchTimeline queries expose at least some Visakanv posts
+  before October 29, 2010; this is now proven.
+- Plain date operators do not map to UTC day boundaries. Use exact UTC epoch
+  seconds with a small safe query overlap and enforce `[since, until)` locally.
+- Opaque cursors avoid legacy-ID math, but current live behavior terminates by
+  a multi-empty-page heuristic. Safe completion therefore requires bounded
+  page telemetry and repeat-confirmed identical enumeration, not process
+  status alone.
 - A one-day UTC window is small enough to enumerate completely for this
   account. If not, the design needs an explicit smaller-window or manual-review
   fallback rather than silently truncating a busy day.
@@ -178,12 +203,19 @@ array.
 
 Use a dedicated legacy endpoint/query rather than the normal timeline stage:
 
-- Query the canonical handle within explicit UTC `[since, until)` dates.
+- Query the canonical handle with exact UTC `since_time`/`until_time` epoch
+  seconds and a one-second server-query overlap; enforce the logical
+  `[since, until)` interval locally from returned metadata.
 - Default to one-day windows for the first proven implementation. Larger
   adaptive windows are permitted only after tests show they cannot hide a
-  per-query cap or gap.
+  per-query cap or gap. A bounded day that saturates must split into exact
+  half-open children rather than raising limits or truncating.
 - Use X's returned cursor only inside one fixed date query. Never carry that
   opaque cursor into a different interval.
+- Enumerate each leaf twice from no cursor and require identical accepted ID
+  sets plus independently valid bounded terminal telemetry. The observed
+  gallery-dl terminal pattern is four successful empty pages with distinct
+  cursors; one empty page or one exit-code-zero walk is insufficient.
 - Reapply the stable numeric-author filter and existing repost policy.
 - Preserve raw JSONL, config, log, manifest, checksums, and pending-media
   evidence under the normal run structure with an unambiguous legacy-window
@@ -251,6 +283,9 @@ must never initialize or launch it.
 
 ### 1-EVIDENCE
 
+Status: complete on 2026-07-22. Evidence and exact verification are recorded
+in `1-EVIDENCE.md`; production state and processes were unchanged.
+
 #### Big Picture Objective
 
 Freeze and independently verify the production boundary before changing any
@@ -279,6 +314,10 @@ pagination or state behavior.
   this stage.
 
 ### 2-CHARACTERIZE
+
+Status: complete on 2026-07-22. Exact results, fingerprints, rejected
+alternatives, and the selected primitive are recorded in
+`2-CHARACTERIZE.md`; production state was unchanged.
 
 #### Big Picture Objective
 
@@ -314,6 +353,10 @@ history without guessing.
 
 ### 3-SPEC
 
+Status: complete on 2026-07-22. The state machine, exact UTC query semantics,
+two-walk evidence rule, subdivision, commit order, recovery behavior, media
+separation, and operator commands are fixed in `3-SPEC.md`.
+
 #### Big Picture Objective
 
 Turn the selected primitive into precise coverage, state-transition, and
@@ -346,6 +389,10 @@ completion semantics before implementation.
 
 ### 4-STATE
 
+Status: complete on 2026-07-22. A separate fail-closed CLI, stale-guarded
+planning/initialization, nested validation, and pure guarded transitions are
+implemented and verified in `4-STATE.md`; production is not initialized.
+
 #### Big Picture Objective
 
 Implement durable, versioned, stale-guarded legacy progress without disturbing
@@ -372,6 +419,10 @@ the authoritative modern timeline evidence.
 - Initialization remains opt-in and dry-run remains write-free.
 
 ### 5-FETCHER
+
+Status: complete on 2026-07-22. The dedicated fingerprinted runner, capped
+hashed telemetry, exact UTC query/config, local identity/time validation, and
+state-authority-free walk are implemented and verified in `5-FETCHER.md`.
 
 #### Big Picture Objective
 
@@ -401,6 +452,10 @@ semantics and immutable evidence.
 - Ordinary tests perform no live requests and use no production paths.
 
 ### 6-ORCHESTRATE
+
+Status: complete on 2026-07-22. The explicit bounded driver, two-walk compare,
+newest-first exact subdivision, merge-before-frontier order, and separate media
+queue are implemented and verified in `6-ORCHESTRATE.md`.
 
 #### Big Picture Objective
 
@@ -433,6 +488,10 @@ the main archive's one-worker and metadata-before-media behavior.
 
 ### 7-RECOVERY
 
+Status: complete on 2026-07-22. Replay, exact post-commit reconciliation,
+bounded attempts, manual retry, and durability fault tests are implemented and
+verified in `7-RECOVERY.md`.
+
 #### Big Picture Objective
 
 Make every interruption point replay-safe and prevent stale shutdown cursors
@@ -462,6 +521,10 @@ or partial windows from corrupting legacy progress.
 
 ### 8-READOUT
 
+Status: complete on 2026-07-22. Network/write-free lifecycle summaries, exact
+next commands, and qualified source-visible documentation are implemented and
+verified in `8-READOUT.md`.
+
 #### Big Picture Objective
 
 Make legacy coverage, remaining dates, failures, and historical uncertainty
@@ -490,6 +553,10 @@ obvious to the operator and downstream dataset users.
 
 ### 9-VERIFY
 
+Status: complete on 2026-07-22. The 126-test offline suite, compatibility,
+dry-run, readout, static safety, permission, artifact, and production-hash
+audits pass as recorded in `9-VERIFY.md`; production remains uninitialized.
+
 #### Big Picture Objective
 
 Prove the integrated repair offline and establish that existing archive
@@ -515,6 +582,12 @@ behavior has not regressed.
 - `git diff --check` and credential/permission audits pass.
 
 ### 10-ROLLOUT
+
+Status: complete on 2026-07-22. The final runner passed a disposable live
+probe, stale-guarded initialization created an exact private backup, and one
+repeat-confirmed production UTC window durably added five older posts. The
+frontier, hashes, telemetry, permissions, tests, stopped process state, and
+next bounded command are recorded in `10-ROLLOUT.md`.
 
 #### Big Picture Objective
 
@@ -559,4 +632,3 @@ operational work honestly. It is not complete merely because a query returned
 zero items, a cursor changed, tests passed without exercising the transition,
 or the watchdog was disabled. It does not implicitly authorize the full
 2008–2010 production backfill.
-

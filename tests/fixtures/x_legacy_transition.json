@@ -1,0 +1,29 @@
+{
+  "account_id": "16884623",
+  "records": [
+    {
+      "date": "2010-11-05 04:23:03",
+      "tweet_id": "402691293450240",
+      "id_domain": "snowflake"
+    },
+    {
+      "date": "2010-11-04 15:15:43",
+      "tweet_id": "29675373972",
+      "id_domain": "legacy-sequential"
+    },
+    {
+      "date": "2010-10-29 19:30:34",
+      "tweet_id": "29116490825",
+      "id_domain": "legacy-sequential"
+    }
+  ],
+  "checkpoints": [
+    "3_29116490825/",
+    "3_29116490825/",
+    "3_29116490825/",
+    "3_29116490825/"
+  ],
+  "final_status": "stalled",
+  "saved_cursor": "3_29116490825/",
+  "stale_shutdown_cursor": "3_1173685814485643265/"
+}
