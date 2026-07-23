@@ -125,6 +125,20 @@ def second_utc(value: datetime) -> str:
     return value.isoformat().replace("+00:00", "Z")
 
 
+def parse_modern_timestamp(value: Any, field: str) -> datetime:
+    """Parse normal archive timestamps without legacy-window truncation."""
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise archive_x.ArchiveError(
+            f"legacy modern head {field} must be a UTC Z timestamp"
+        )
+    try:
+        return archive_x.parse_datetime(value)
+    except argparse.ArgumentTypeError as exc:
+        raise archive_x.ArchiveError(
+            f"invalid legacy modern head {field}: {value!r}"
+        ) from exc
+
+
 def require_sha256(value: Any, field: str) -> str:
     text = str(value or "")
     if not SHA256_RE.fullmatch(text):
@@ -578,14 +592,16 @@ def validate_modern_head(
         raise archive_x.ArchiveError("modern_head source run changed")
     if modern_head.get("source_manifest_sha256") != source.get("manifest_sha256"):
         raise archive_x.ArchiveError("modern_head source manifest changed")
-    baseline = parse_utc(modern_head.get("baseline_started_at"), "modern head baseline")
-    successful = parse_utc(
-        modern_head.get("last_successful_started_at"),
-        "modern head last_successful_started_at",
+    baseline = parse_modern_timestamp(
+        modern_head.get("baseline_started_at"), "baseline"
     )
-    completed = parse_utc(
+    successful = parse_modern_timestamp(
+        modern_head.get("last_successful_started_at"),
+        "last_successful_started_at",
+    )
+    completed = parse_modern_timestamp(
         modern_head.get("last_successful_completed_at"),
-        "modern head last_successful_completed_at",
+        "last_successful_completed_at",
     )
     if successful < baseline or completed < successful:
         raise archive_x.ArchiveError("modern_head timestamp order is invalid")
@@ -596,9 +612,9 @@ def validate_modern_head(
         cursor = str(active.get("cursor") or "")
         if not CURSOR_RE.fullmatch(cursor):
             raise archive_x.ArchiveError("modern_head active cursor is invalid")
-        started = parse_utc(active.get("started_at"), "modern head active started_at")
-        cutoff = parse_utc(active.get("date_after"), "modern head active date_after")
-        parse_utc(active.get("saved_at"), "modern head active saved_at")
+        started = parse_modern_timestamp(active.get("started_at"), "active started_at")
+        cutoff = parse_modern_timestamp(active.get("date_after"), "active date_after")
+        parse_modern_timestamp(active.get("saved_at"), "active saved_at")
         if cutoff > started:
             raise archive_x.ArchiveError("modern_head active cutoff is invalid")
     return modern_head

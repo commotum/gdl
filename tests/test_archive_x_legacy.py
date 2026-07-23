@@ -472,6 +472,34 @@ class AutomaticLegacyTransitionTests(unittest.TestCase):
             self.assertFalse(repeated["modern_head_initialized"])
             self.assertEqual(repeated["state"], state)
 
+    def test_existing_modern_head_accepts_fractional_archive_timestamps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, state_path, _ = strict_transition_archive(Path(directory))
+            initialized = archive_x_legacy.automatic_initialize_legacy(
+                user_dir,
+                initialized_at="2026-07-22T12:00:00Z",
+                expected_run_id="20260720T023918Z-fixture",
+            )
+            state = initialized["state"]
+            state["modern_head"]["last_successful_started_at"] = (
+                "2026-07-23T06:41:54.531516Z"
+            )
+            state["modern_head"]["last_successful_completed_at"] = (
+                "2026-07-23T06:45:17.511594Z"
+            )
+            archive_x.atomic_write_json(state_path, state)
+
+            repeated = archive_x_legacy.automatic_initialize_legacy(
+                user_dir, initialized_at="2026-07-23T07:00:00Z"
+            )
+
+            self.assertFalse(repeated["legacy_initialized"])
+            self.assertFalse(repeated["modern_head_initialized"])
+            self.assertEqual(
+                repeated["state"]["modern_head"],
+                state["modern_head"],
+            )
+
     def test_failed_state_write_leaves_prior_state_and_verified_backup(self):
         with tempfile.TemporaryDirectory() as directory:
             user_dir, state_path, original = strict_transition_archive(Path(directory))
