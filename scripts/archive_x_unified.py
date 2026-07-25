@@ -277,6 +277,7 @@ def run_context_worker(
     *,
     media: bool,
     max_posts: int | None,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
     user_dir, db_path = context_x.user_paths(archive_root, handle)
     counts = context_x.run_worker(
@@ -294,6 +295,15 @@ def run_context_worker(
         fairness_quantum=50,
         max_depth=1000,
         media=media,
+        progress=(
+            None
+            if progress is None
+            else lambda state, post_id, durable: progress.event(
+                handle,
+                activity=f"{state} {post_id}",
+                progress=durable,
+            )
+        ),
     )
     result = context_phase_status(db_path, media=media)
     if max_posts is not None and result["status"] == "pending":
@@ -309,6 +319,7 @@ def run_context_scheduler(
     handles: list[str],
     *,
     media: bool,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
     requested_limit = getattr(
         args, "context_media_max_posts" if media else "context_max_posts", None
@@ -317,13 +328,11 @@ def run_context_scheduler(
         results = {}
         for handle in handles:
             try:
+                kwargs = {"media": media, "max_posts": requested_limit}
+                if progress is not None:
+                    kwargs["progress"] = progress
                 results[handle] = run_context_worker(
-                    args,
-                    repo_dir,
-                    archive_root,
-                    handle,
-                    media=media,
-                    max_posts=requested_limit,
+                    args, repo_dir, archive_root, handle, **kwargs
                 )
             except context_x.ContextAuthenticationError:
                 raise
@@ -334,7 +343,7 @@ def run_context_scheduler(
     attempted = {handle: 0 for handle in handles}
     active = set(handles)
     while active:
-        progress = False
+        made_progress = False
         future: list[float] = []
         for handle in handles:
             if handle not in active:
@@ -354,13 +363,11 @@ def run_context_scheduler(
                 continue
             quantum = 50 if remaining is None else min(50, remaining)
             try:
+                kwargs = {"media": media, "max_posts": quantum}
+                if progress is not None:
+                    kwargs["progress"] = progress
                 result = run_context_worker(
-                    args,
-                    repo_dir,
-                    archive_root,
-                    handle,
-                    media=media,
-                    max_posts=quantum,
+                    args, repo_dir, archive_root, handle, **kwargs
                 )
             except context_x.ContextAuthenticationError:
                 raise
@@ -370,7 +377,7 @@ def run_context_scheduler(
                 continue
             count = int(result["counts"].get("attempted", 0))
             attempted[handle] += count
-            progress = progress or count > 0
+            made_progress = made_progress or count > 0
             if result["status"] in {
                 "complete",
                 "complete_with_unavailable_media",
@@ -387,7 +394,7 @@ def run_context_scheduler(
                 next_at = result["availability"].get("next_eligible_at")
                 if next_at is not None:
                     future.append(float(next_at))
-        if active and not progress:
+        if active and not made_progress:
             if not future:
                 raise context_x.ContextError(
                     "context scheduler made no progress and has no retry time"
@@ -434,6 +441,7 @@ def run_unified_followups(
     modern_results: dict[str, dict[str, Any]],
     *,
     checkpoint: Callable[[dict[str, dict[str, Any]]], None] | None = None,
+    progress: Any | None = None,
 ) -> dict[str, dict[str, Any]]:
     combined: dict[str, dict[str, Any]] = {
         handle: {"modern": result} for handle, result in modern_results.items()
@@ -442,6 +450,14 @@ def run_unified_followups(
     def emit() -> None:
         if checkpoint is not None:
             checkpoint(combined)
+
+    def phase(handle: str, name: str, status: str, activity: str) -> None:
+        if progress is not None:
+            progress.event(
+                handle, phase=name, phase_status=status,
+                activity=activity, progress=status not in {"running", "pending"},
+                force=status not in {"running", "pending"},
+            )
 
     eligible: list[str] = []
     newly_initialized: list[str] = []
@@ -519,12 +535,19 @@ def run_unified_followups(
         return combined
 
     if not args.retry_failed_only:
+        for handle in eligible:
+            phase(handle, "legacy", "running", "checking legacy coverage")
         legacy = run_legacy_scheduler(args, repo_dir, archive_root, version, eligible)
         for handle in eligible:
             combined[handle]["legacy"] = legacy[handle]
+            phase(
+                handle, "legacy", str(legacy[handle].get("status", "complete")),
+                "legacy coverage recorded",
+            )
             emit()
 
     for handle in eligible:
+        phase(handle, "shared_media", "running", "checking authored media")
         if args.retry_failed_only:
             recovery = modern_results[handle].get("media_recovery") or {}
             combined[handle]["shared_media"] = {
@@ -550,6 +573,11 @@ def run_unified_followups(
                     "error": str(exc),
                 }
         emit()
+        phase(
+            handle, "shared_media",
+            str(combined[handle]["shared_media"].get("status", "complete")),
+            "authored media checked",
+        )
 
     if args.retry_failed_only:
         context_handles = [
@@ -560,6 +588,7 @@ def run_unified_followups(
     else:
         context_handles = []
         for handle in eligible:
+            phase(handle, "context_seed", "running", "discovering reply parents")
             try:
                 user_dir, db_path = context_x.user_paths(archive_root, handle)
                 combined[handle]["context_seed"] = {
@@ -576,18 +605,43 @@ def run_unified_followups(
             else:
                 context_handles.append(handle)
             emit()
+            phase(
+                handle, "context_seed",
+                str(combined[handle]["context_seed"].get("status", "complete")),
+                "reply-parent queue seeded",
+            )
+        for handle in context_handles:
+            phase(
+                handle, "context_metadata", "running",
+                "fetching reply-parent context",
+            )
         metadata = run_context_scheduler(
-            args, repo_dir, archive_root, context_handles, media=False
+            args, repo_dir, archive_root, context_handles, media=False,
+            progress=progress,
         )
         for handle in context_handles:
             combined[handle]["context_metadata"] = metadata[handle]
+            phase(
+                handle, "context_metadata",
+                str(metadata[handle].get("status", "complete")),
+                "reply-parent context recorded",
+            )
             emit()
 
+    for handle in context_handles:
+        phase(handle, "context_media", "running", "fetching context media")
     media = run_context_scheduler(
-        args, repo_dir, archive_root, context_handles, media=True
+        args, repo_dir, archive_root, context_handles, media=True,
+        progress=progress,
     ) if context_handles else {}
     for handle in context_handles:
         combined[handle]["context_media"] = media[handle]
+        phase(
+            handle, "context_media",
+            str(media[handle].get("status", "complete")),
+            "context media checked",
+        )
+        phase(handle, "context_export", "running", "exporting context datasets")
         try:
             user_dir, db_path = context_x.user_paths(archive_root, handle)
             with context_x.ContextDB(db_path, create=False) as database:
@@ -604,6 +658,11 @@ def run_unified_followups(
                 "error": str(exc),
             }
         emit()
+        phase(
+            handle, "context_export",
+            str(combined[handle]["context_export"].get("status", "complete")),
+            "context datasets exported",
+        )
 
     for handle in combined:
         combined[handle]["status"] = overall_status(combined[handle])

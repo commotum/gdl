@@ -245,6 +245,38 @@ For a deliberately bounded unified production smoke, use the advanced
 `--context-media-max-posts` controls. A bounded result remains resumable and is
 never reported as full completion.
 
+### Calm progress dashboard
+
+The ordinary command now maintains a private atomic progress snapshot with
+lifetime totals, this-run gains, active phase, health, known remaining context
+work, rolling throughput, and a confidence-labeled phase-local estimate:
+
+```bash
+uv run scripts/archive-x --user USERNAME
+```
+
+When launched interactively inside tmux at 80x24 or larger, it automatically
+opens a small pane titled `archive-x-dashboard:RUN_ID`. The original pane keeps
+the complete event stream. The dashboard pane owns no archive state and exits
+when the invocation reaches a final status; failure of that pane cannot stop
+the worker. Set `ARCHIVE_X_DASHBOARD=off` to suppress automatic pane creation.
+
+Outside tmux the worker emits a compact heartbeat at the slower telemetry
+cadence. A snapshot can also be inspected once, or watched, without contacting
+X or opening the SQLite database:
+
+```bash
+scripts/archive-x-dashboard --archive-root /mnt/Bibliotheque/gdl/x-archive
+scripts/archive-x-dashboard --archive-root /mnt/Bibliotheque/gdl/x-archive --watch
+```
+
+`known remaining` is the currently discovered actionable context queue, not a
+promise that discovery is finished. ETA is deliberately omitted while the
+queue grows, before enough wall-clock evidence exists, or when work is blocked.
+Deleted, protected, and suspended parents count as neutral unavailable
+boundaries; manual review and authentication/integrity failures remain
+actionable.
+
 ### X archive contents
 
 Each account is self-contained under `users/HANDLE/`:

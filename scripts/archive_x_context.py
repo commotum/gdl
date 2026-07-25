@@ -1492,6 +1492,7 @@ def reserve_request(
     *,
     now: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
+    announce: bool = True,
 ) -> float:
     low, high = archive_x.parse_duration(delay)
     current = now()
@@ -1508,8 +1509,9 @@ def reserve_request(
             (reserved, current),
         )
     wait = max(0.0, reserved - current)
-    if wait:
+    if wait and announce:
         print(f"Waiting {wait:.1f}s before context request.")
+    if wait:
         sleep(wait)
     return reserved
 
@@ -1573,6 +1575,7 @@ def run_worker(
     fetcher: Callable[..., FetchResult] = fetch_post,
     clock: Callable[[], float] = time.time,
     idle_sleep: Callable[[float], None] = time.sleep,
+    progress: Callable[[str, str, bool], None] | None = None,
 ) -> dict[str, int]:
     if max_posts is not None and max_posts < 1:
         raise ContextError("context post limit must be positive")
@@ -1612,15 +1615,21 @@ def run_worker(
                 idle_sleep(max(0.01, min(float(next_at) - current, 60.0)))
                 continue
             post_id = row["post_id"]
+            if progress is not None:
+                progress("fetching", post_id, False)
             counts["attempted"] += 1
             if media and context_media_complete(user_dir, post_id):
                 context.media_succeeded(post_id)
                 counts["captured"] += 1
+                if progress is not None:
+                    progress("captured", post_id, True)
                 continue
             try:
                 if media:
                     ensure_context_media_space(archive_root)
-                reserve_request(context, request_delay)
+                reserve_request(
+                    context, request_delay, announce=progress is None
+                )
                 result = fetcher(
                     repo_dir=repo_dir,
                     archive_root=archive_root,
@@ -1670,9 +1679,13 @@ def run_worker(
                             media=True,
                         )
                         counts[state] = counts.get(state, 0) + 1
+                        if progress is not None:
+                            progress(state, post_id, True)
                     else:
                         context.media_succeeded(post_id)
                         counts["captured"] += 1
+                        if progress is not None:
+                            progress("captured", post_id, True)
                     continue
                 parent = context.capture(
                     post_id,
@@ -1683,6 +1696,8 @@ def run_worker(
                 )
                 context.continue_chain(parent, fairness_quantum)
                 counts["captured"] += 1
+                if progress is not None:
+                    progress("captured", post_id, True)
                 continue
             error_class, terminal, global_stop = classify_failure(result)
             state = context.fail(
@@ -1696,6 +1711,8 @@ def run_worker(
                 media=media,
             )
             counts[state] = counts.get(state, 0) + 1
+            if progress is not None:
+                progress(state, post_id, True)
             if global_stop:
                 raise ContextAuthenticationError(
                     "context worker stopped on authentication/account state; "

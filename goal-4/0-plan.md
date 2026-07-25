@@ -229,6 +229,9 @@ Prioritized in this order:
   renderer must not contend for or reacquire the writer lock.
 - Tmux is available, but accessing or manipulating its socket is an external
   presentation concern and must not be required for archive correctness.
+- A live read-only aggregate benchmark took 1.408 seconds on the production
+  Visakanv context database. Full conversation closure is therefore sampled
+  every five minutes by the producer, never at renderer refresh frequency.
 
 ## Assumptions Requiring Proof
 
@@ -401,6 +404,20 @@ The goal is complete only when all of the following are demonstrated:
     whitespace/diff checks, and a bounded live smoke all pass.
 17. Documentation explains metric meanings, ETA confidence, unavailable
     boundaries, raw-log access, tmux behavior, and fallback behavior.
+
+## Implementation Outcome
+
+Implemented on branch `goal-4-x-dashboard`. Stages 1 through 7 are complete;
+their evidence is recorded in the corresponding indexed stage files.
+
+- The normal command now produces safe telemetry and, when appropriate, an
+  optional tmux scorecard with no required new argument.
+- All 17 success metrics have implementation or verification evidence.
+- The full 200-test suite, compilation, diff checks, production-scale read-only
+  benchmark, and temporary live-data render smoke pass.
+- No production archive command was started, restarted, stopped, or otherwise
+  manipulated during implementation, and the user's tmux layout was not
+  changed.
 
 ## Indexed Stages
 
@@ -622,4 +639,3 @@ damage archive work.
   qualifiers.
 - The final plan records limitations and explicit future work rather than
   hiding unresolved issues.
-

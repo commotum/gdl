@@ -3197,6 +3197,20 @@ def main(argv: list[str] | None = None) -> int:
             "results": [],
         }
         invocation_path = archive_root / "runs" / f"{invocation_id}.json"
+        progress_path = (
+            archive_root / "_state" / "progress" / f"{invocation_id}.json"
+        )
+        progress_module = importlib.import_module("archive_x_progress")
+        progress = progress_module.create_tracker(
+            progress_path,
+            archive_root,
+            invocation_id,
+            targets,
+            invocation["started_at"],
+        )
+        progress_module.start_tmux_dashboard(
+            progress.path, invocation_id, repo_dir
+        )
         modern_results: dict[str, dict[str, Any]] = {}
         latest_combined: dict[str, dict[str, Any]] = {}
 
@@ -3257,6 +3271,10 @@ def main(argv: list[str] | None = None) -> int:
                     checkpoint_invocation()
                 for index, handle in enumerate(targets):
                     current_handle = handle
+                    progress.event(
+                        handle, phase="modern", phase_status="running",
+                        activity="archiving authored timeline", force=True,
+                    )
                     if index:
                         sleep_random(args.user_delay, f"before user {handle}")
                     try:
@@ -3270,6 +3288,12 @@ def main(argv: list[str] | None = None) -> int:
                             "error": str(exc),
                         }
                     modern_results[handle] = result
+                    progress.event(
+                        handle, phase="modern",
+                        phase_status=str(result.get("status", "failed")),
+                        activity="authored timeline checkpointed",
+                        progress=True, force=True,
+                    )
                     current_handle = None
                     checkpoint_invocation()
                     if result["status"] not in {
@@ -3291,6 +3315,7 @@ def main(argv: list[str] | None = None) -> int:
                     version,
                     modern_results,
                     checkpoint=checkpoint_invocation,
+                    progress=progress,
                 )
         except KeyboardInterrupt:
             if current_handle and current_handle not in modern_results:
@@ -3298,10 +3323,14 @@ def main(argv: list[str] | None = None) -> int:
                     "status": "interrupted",
                     "failure_stage": "modern",
                 }
+            progress.finalize("interrupted")
+            invocation["progress"] = progress.snapshot()
             checkpoint_invocation(latest_combined or None, status="interrupted")
             print("Interrupted; partial phase state, logs, and invocation were retained.")
             return 130
         except (ArchiveError, OSError) as exc:
+            progress.finalize("failed")
+            invocation["progress"] = progress.snapshot()
             checkpoint_invocation(
                 latest_combined or None,
                 status="failed",
@@ -3340,6 +3369,8 @@ def main(argv: list[str] | None = None) -> int:
                 else "success"
             )
         )
+        progress.finalize(final_status)
+        invocation["progress"] = progress.snapshot()
         checkpoint_invocation(combined, status=final_status)
         print_invocation_summary(results)
         return 1 if unsuccessful or len(results) < len(targets) else 0
