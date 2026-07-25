@@ -602,9 +602,16 @@ class PacingAndFailureTests(unittest.TestCase):
         cases = {
             "Tweet unavailable ('Deleted')": ("deleted", True, False),
             "Tweets are protected": ("private", True, False),
+            "AuthRequired: Protected Tweet": ("private", True, False),
             "User has been suspended": ("suspended", True, False),
+            "Tweet unavailable ('Suspended')": ("suspended", True, False),
             "withheld in your country": ("withheld", True, False),
             "Could not authenticate you": ("authentication", False, True),
+            "KeyError - 'result'": (
+                "ambiguous_response_shape",
+                False,
+                False,
+            ),
             "Dependency: Unspecified": ("transient", False, False),
             "surprising failure": ("unknown", False, False),
         }
@@ -652,6 +659,74 @@ class PacingAndFailureTests(unittest.TestCase):
                 self.assertEqual(state, "manual_review")
                 self.assertNotIn("secret", row)
                 self.assertIn("ordinary error", row)
+
+    def test_reconcile_known_failures_is_exact_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with context_x.ContextDB(Path(directory) / "context.sqlite3") as database:
+                for post_id in ("100", "200", "300", "400"):
+                    database.upsert_target(
+                        post_id,
+                        conversation_id=post_id,
+                        depth=0,
+                        observed_at="now",
+                    )
+                database.connection.execute(
+                    """UPDATE targets SET state='manual_review',attempts=3,
+                           last_error_class='transient',
+                           last_error_detail='AuthRequired: Protected Tweet'
+                       WHERE post_id='100'"""
+                )
+                database.connection.execute(
+                    """UPDATE targets SET state='retryable',attempts=1,
+                           last_error_class='transient',
+                           last_error_detail='Tweet unavailable (''Suspended'')'
+                       WHERE post_id='200'"""
+                )
+                database.connection.execute(
+                    """UPDATE targets SET state='manual_review',attempts=3,
+                           last_error_class='transient',
+                           last_error_detail='KeyError - ''result'''
+                       WHERE post_id='300'"""
+                )
+                database.connection.execute(
+                    """UPDATE targets SET state='retryable',attempts=1,
+                           last_error_class='transient',
+                           last_error_detail='RemoteDisconnected'
+                       WHERE post_id='400'"""
+                )
+
+                changed = database.reconcile_known_failures()
+                repeated = database.reconcile_known_failures()
+                rows = {
+                    row["post_id"]: (
+                        row["state"],
+                        row["last_error_class"],
+                        row["unavailable_at"],
+                    )
+                    for row in database.connection.execute(
+                        """SELECT post_id,state,last_error_class,unavailable_at
+                           FROM targets ORDER BY post_id"""
+                    )
+                }
+
+            self.assertEqual(
+                changed,
+                {
+                    "unavailable": {
+                        "private": 1,
+                        "suspended": 1,
+                    },
+                },
+            )
+            self.assertEqual(repeated, {"unavailable": {}})
+            self.assertEqual(rows["100"][0:2], ("unavailable", "private"))
+            self.assertIsNotNone(rows["100"][2])
+            self.assertEqual(rows["200"][0:2], ("unavailable", "suspended"))
+            self.assertEqual(
+                rows["300"][0:2],
+                ("manual_review", "transient"),
+            )
+            self.assertEqual(rows["400"][0:2], ("retryable", "transient"))
 
     def test_shared_exclusive_lock_rejects_a_second_worker(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -726,6 +801,72 @@ class WorkerAndDatasetTests(unittest.TestCase):
                     "SELECT state,last_error_class FROM targets WHERE post_id='200'"
                 ).fetchone()
             self.assertEqual(tuple(row), ("retryable", "authentication"))
+
+    def test_protected_parent_becomes_unavailable_after_one_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, db_path = make_archive(
+                root, [post("300", reply_id="200")]
+            )
+            context_x.seed_context(user_dir, db_path, dry_run=False, max_depth=10)
+            calls = []
+
+            def protected(**kwargs):
+                calls.append(kwargs["post_id"])
+                return context_x.FetchResult(
+                    1,
+                    None,
+                    "AuthRequired: Protected Tweet",
+                    False,
+                    [],
+                    None,
+                )
+
+            counts = context_x.run_worker(
+                **self.worker_args(root, user_dir, db_path, protected)
+            )
+            with context_x.ContextDB(db_path, create=False) as database:
+                row = database.connection.execute(
+                    """SELECT state,attempts,last_error_class,unavailable_at
+                       FROM targets WHERE post_id='200'"""
+                ).fetchone()
+
+            self.assertEqual(calls, ["200"])
+            self.assertEqual(counts["unavailable"], 1)
+            self.assertEqual(tuple(row[:3]), ("unavailable", 1, "private"))
+            self.assertIsNotNone(row["unavailable_at"])
+
+    def test_worker_reconciles_saved_terminal_failures_without_a_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, db_path = make_archive(
+                root, [post("300", reply_id="200")]
+            )
+            context_x.seed_context(user_dir, db_path, dry_run=False, max_depth=10)
+            with context_x.ContextDB(db_path, create=False) as database:
+                database.connection.execute(
+                    """UPDATE targets SET state='manual_review',attempts=3,
+                           last_error_class='transient',
+                           last_error_detail='AuthRequired: Protected Tweet'
+                       WHERE post_id='200'"""
+                )
+
+            def unexpected_request(**_kwargs):
+                self.fail("known terminal failure was requested again")
+
+            counts = context_x.run_worker(
+                **self.worker_args(root, user_dir, db_path, unexpected_request)
+            )
+            with context_x.ContextDB(db_path, create=False) as database:
+                row = database.connection.execute(
+                    """SELECT state,last_error_class,unavailable_at
+                       FROM targets WHERE post_id='200'"""
+                ).fetchone()
+
+            self.assertEqual(counts["attempted"], 0)
+            self.assertEqual(counts["reclassified_unavailable"], 1)
+            self.assertEqual(tuple(row[:2]), ("unavailable", "private"))
+            self.assertIsNotNone(row["unavailable_at"])
 
     def test_no_budget_worker_closes_an_ancestor_chain_one_post_at_a_time(self):
         with tempfile.TemporaryDirectory() as directory:

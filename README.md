@@ -218,6 +218,12 @@ are retried with bounded backoff and eventually require manual review. Use
 `retry POST_ID...` for an explicit reclassification retry. Rebuild the
 portable views with `export`.
 
+An individual lookup whose successful X response omits its Tweet result gets
+exactly one confirmation through the more stable TweetDetail endpoint. A focal
+post recovered there is archived normally; a second response without the focal
+post becomes an explicit deleted boundary. Other response-shape failures stay
+ambiguous and retain the normal bounded-retry behavior.
+
 Metadata closure is independent of media. Context media is processed
 automatically after metadata, verifies SHA-256 sidecars, and refuses to start
 below 5 GiB free. Failures remain explicit and retryable without unresolving

@@ -38,8 +38,16 @@ RATE_RESET_RE = re.compile(
 )
 TERMINAL_PATTERNS = {
     "deleted": ("Tweet unavailable ('Deleted')", "Tweet unavailable ('NotFound')"),
-    "private": ("Tweet unavailable ('Protected')", "Tweets are protected"),
-    "suspended": ("User has been suspended", "Account suspended"),
+    "private": (
+        "Tweet unavailable ('Protected')",
+        "Tweets are protected",
+        "AuthRequired: Protected Tweet",
+    ),
+    "suspended": (
+        "User has been suspended",
+        "Account suspended",
+        "Tweet unavailable ('Suspended')",
+    ),
     "withheld": ("Tweet unavailable ('Withheld')", "withheld in your country"),
 }
 AUTH_PATTERNS = (
@@ -58,6 +66,10 @@ TRANSIENT_PATTERNS = (
     "RemoteDisconnected",
     "Connection aborted",
     "Unable to retrieve",
+)
+AMBIGUOUS_RESPONSE_PATTERNS = (
+    "KeyError - 'result'",
+    'KeyError - "result"',
 )
 SENSITIVE_LOG_RE = re.compile(
     r"(?i)(authorization|proxy-authorization|cookie:|set-cookie:|auth_token|ct0)"
@@ -893,6 +905,50 @@ class ContextDB:
             self._set_meta("active_steps", "0")
         return state
 
+    def reconcile_known_failures(self) -> dict[str, dict[str, int]]:
+        """Repair classifications produced by older conservative pattern sets."""
+        terminal_changes: list[tuple[str, str, str]] = []
+        for row in self.connection.execute(
+            """SELECT post_id,state,last_error_class,last_error_detail FROM targets
+               WHERE state IN ('retryable','manual_review')
+                 AND last_error_detail IS NOT NULL"""
+        ):
+            error_class, terminal, global_stop = classify_log(
+                str(row["last_error_detail"])
+            )
+            if terminal and not global_stop:
+                terminal_changes.append(
+                    (str(row["post_id"]), str(row["state"]), error_class)
+                )
+        unavailable_counts: dict[str, int] = {}
+        if not terminal_changes:
+            return {"unavailable": unavailable_counts}
+        changed_at = iso_now()
+        with transaction(self.connection):
+            for post_id, previous_state, error_class in terminal_changes:
+                cursor = self.connection.execute(
+                    """UPDATE targets SET state='unavailable',
+                           next_attempt_at=0,lease_started_at=NULL,
+                           last_error_class=?,unavailable_at=COALESCE(
+                               unavailable_at,?
+                           ),updated_at=?
+                       WHERE post_id=? AND state=?""",
+                    (
+                        error_class,
+                        changed_at,
+                        changed_at,
+                        post_id,
+                        previous_state,
+                    ),
+                )
+                if cursor.rowcount:
+                    unavailable_counts[error_class] = (
+                        unavailable_counts.get(error_class, 0) + 1
+                    )
+            self._set_meta("active_post_id", None)
+            self._set_meta("active_steps", "0")
+        return {"unavailable": unavailable_counts}
+
     def media_succeeded(self, post_id: str) -> None:
         with transaction(self.connection):
             self.connection.execute(
@@ -1411,15 +1467,23 @@ def fetch_post(
     )
 
 
-def classify_failure(result: FetchResult) -> tuple[str, bool, bool]:
+def classify_log(log: str) -> tuple[str, bool, bool]:
     for error_class, patterns in TERMINAL_PATTERNS.items():
-        if any(pattern.lower() in result.log.lower() for pattern in patterns):
+        if any(pattern.lower() in log.lower() for pattern in patterns):
             return error_class, True, False
-    if any(pattern.lower() in result.log.lower() for pattern in AUTH_PATTERNS):
+    if any(pattern.lower() in log.lower() for pattern in AUTH_PATTERNS):
         return "authentication", False, True
-    if any(pattern.lower() in result.log.lower() for pattern in TRANSIENT_PATTERNS):
+    if any(
+        pattern.lower() in log.lower() for pattern in AMBIGUOUS_RESPONSE_PATTERNS
+    ):
+        return "ambiguous_response_shape", False, False
+    if any(pattern.lower() in log.lower() for pattern in TRANSIENT_PATTERNS):
         return "transient", False, False
     return "unknown", False, False
+
+
+def classify_failure(result: FetchResult) -> tuple[str, bool, bool]:
+    return classify_log(result.log)
 
 
 def reserve_request(
@@ -1514,12 +1578,16 @@ def run_worker(
         raise ContextError("context post limit must be positive")
     target_id, canonical_handle = target_identity(user_dir)
     counts = {"attempted": 0, "captured": 0, "unavailable": 0, "retryable": 0,
-              "manual_review": 0}
+              "manual_review": 0, "reclassified_unavailable": 0}
     with ContextDB(db_path) as context:
         context.bind_identity(target_id, canonical_handle)
         errors = context.integrity_errors()
         if errors:
             raise ContextError("; ".join(errors))
+        reconciled = context.reconcile_known_failures()
+        counts["reclassified_unavailable"] = sum(
+            reconciled["unavailable"].values()
+        )
         while max_posts is None or counts["attempted"] < max_posts:
             current = clock()
             row = context.claim(
