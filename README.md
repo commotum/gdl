@@ -115,6 +115,10 @@ highest-bitrate CDN URL.
 
 Two refreshed attempts at least 24 hours apart that return only HTTP `404` or
 `410` across the available variants classify an asset as source-unavailable.
+Other persistent failures, including repeated HTTP `500` and empty yt-dlp
+results, leave the automatic queue after three distinct archive-run attempts.
+This bounded budget favors an accurately qualified archive over retrying one
+broken asset forever.
 It leaves the automatic queue but retains its post identity, failure history,
 and evidence. An otherwise complete run reports
 `complete_with_unavailable_media`, exits successfully with a warning, and does
@@ -128,7 +132,8 @@ uv run scripts/archive-x --user USERNAME --retry-failed-only
 
 gallery-dl preserves an interrupted download as a `.part` file and resumes it
 with an HTTP Range request when the server supports resuming. Pending-media
-recovery uses up to 8 retries and a 300-second inactivity timeout by default;
+recovery uses up to 2 retries after the initial request and a 300-second
+inactivity timeout by default;
 these can be changed with `--media-retries` and `--media-timeout`. The normal
 request and endpoint delays still apply.
 

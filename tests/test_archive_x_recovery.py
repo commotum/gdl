@@ -511,6 +511,81 @@ class PendingMediaTests(unittest.TestCase):
                 1,
             )
 
+    def test_repeated_transient_media_exhausts_three_run_budget(self):
+        state = {}
+        transient = {
+            **failed_download(),
+            "http_statuses": [500],
+            "http_error_count": 3,
+        }
+        archive_x.merge_pending_media(
+            state,
+            [transient],
+            source_run_id="run-a",
+            observed_at="2026-07-20T00:00:00Z",
+        )
+        archive_x.merge_pending_media(
+            state,
+            [transient],
+            source_run_id="run-b",
+            observed_at="2026-07-21T00:00:00Z",
+        )
+        self.assertEqual(len(state["pending_media"]), 1)
+
+        archive_x.merge_pending_media(
+            state,
+            [transient],
+            source_run_id="run-c",
+            observed_at="2026-07-22T00:00:00Z",
+        )
+
+        self.assertEqual(state["pending_media"], [])
+        self.assertEqual(len(state["unavailable_media"]), 1)
+        self.assertEqual(
+            state["unavailable_media"][0]["unavailable_reason"],
+            "media_retry_budget_exhausted",
+        )
+
+    def test_existing_empty_file_failure_over_budget_is_migrated_before_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir = Path(directory) / "visakanv"
+            run_dir = user_dir / "runs" / "empty-run"
+            run_dir.mkdir(parents=True)
+            (run_dir / f"retry-media-{POST_ID}.log").write_text(
+                "[downloader.ytdl][error] The downloaded file is empty (9/9)\n"
+                + DOWNLOAD_ERROR,
+                encoding="utf-8",
+            )
+            state = {
+                "pending_media": [
+                    {
+                        **failed_download(),
+                        "attempts": 5,
+                        "failure_class": "transient",
+                        "first_failed_at": "2026-07-19T00:00:00Z",
+                        "last_failed_at": "2026-07-25T20:44:25Z",
+                        "last_source_run_id": "empty-run",
+                        "last_http_statuses": [],
+                        "next_retry_at": "2026-07-29T20:44:25Z",
+                        "status": "pending",
+                    }
+                ]
+            }
+
+            changed = archive_x.reclassify_pending_media_from_logs(
+                state, user_dir
+            )
+
+            self.assertEqual(changed, 1)
+            self.assertEqual(state["pending_media"], [])
+            self.assertEqual(
+                state["unavailable_media"][0]["unavailable_reason"],
+                "media_retry_budget_exhausted",
+            )
+            self.assertEqual(
+                archive_x.pending_media_due(state, user_dir), []
+            )
+
     def test_old_pending_record_is_reclassified_from_immutable_retry_log(self):
         with tempfile.TemporaryDirectory() as directory:
             user_dir = Path(directory) / "tszzl"
@@ -1085,7 +1160,7 @@ class RecoveryParserTests(unittest.TestCase):
         parser = archive_x.build_parser(REPO)
         defaults = parser.parse_args(["--user", "tszzl"])
         self.assertEqual(defaults.http_timeout, 60)
-        self.assertEqual(defaults.media_retries, 8)
+        self.assertEqual(defaults.media_retries, 2)
         self.assertEqual(defaults.media_timeout, 300)
         self.assertEqual(defaults.stalled_rate_limit_cycles, 3)
         self.assertFalse(defaults.retry_failed_only)

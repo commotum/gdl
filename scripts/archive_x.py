@@ -94,6 +94,7 @@ CHILD_TERMINATE_GRACE_SECONDS = 10
 MEDIA_UNAVAILABLE_HTTP_STATUSES = {404, 410}
 MEDIA_UNAVAILABLE_MIN_ATTEMPTS = 2
 MEDIA_UNAVAILABLE_MIN_AGE = timedelta(hours=24)
+MEDIA_RETRY_MAX_ATTEMPTS = 3
 MEDIA_RETRY_BASE_DELAY = timedelta(hours=6)
 MEDIA_RETRY_MAX_DELAY = timedelta(days=7)
 
@@ -919,9 +920,11 @@ proof, then resumed through bounded internal UTC windows. Its frontier means
 repeat-confirmed contiguous windows visible through X search; it is not proof
 that deleted, private, withheld, or unindexed posts were recovered. Legacy
 metadata may advance while its media remains in the shared pending-media queue.
-Transient media receives a durable retry time; repeated refreshed 404/410
-responses become explicit unavailable evidence. An otherwise complete archive
-reports `complete_with_unavailable_media` without retrying those assets forever.
+Transient media receives a durable retry time. Repeated refreshed 404/410
+responses, or three distinct failed archive-run attempts for another persistent
+media error, become explicit unavailable evidence. An otherwise complete
+archive reports `complete_with_unavailable_media` without retrying those assets
+forever.
 """
     path.write_text(text, encoding="utf-8")
     os.chmod(path, 0o600)
@@ -1792,16 +1795,22 @@ def merge_pending_media(
                 ),
             }
         )
-        if (
+        terminal_http_failure = (
             unavailable_candidate
             and attempts >= MEDIA_UNAVAILABLE_MIN_ATTEMPTS
             and old_enough(record)
-        ):
+        )
+        retry_budget_exhausted = attempts >= MEDIA_RETRY_MAX_ATTEMPTS
+        if terminal_http_failure or retry_budget_exhausted:
             record.update(
                 {
                     "status": "unavailable",
                     "unavailable_at": observed_at,
-                    "unavailable_reason": "repeated_http_404_or_410",
+                    "unavailable_reason": (
+                        "repeated_http_404_or_410"
+                        if terminal_http_failure
+                        else "media_retry_budget_exhausted"
+                    ),
                     "next_retry_at": None,
                 }
             )
@@ -2035,6 +2044,60 @@ def reclassify_pending_media_from_logs(
             source_run_id=source_run_id,
             observed_at=str(record.get("last_failed_at") or iso_utc(utc_now())),
         )
+
+    # Older state can already exceed today's bounded retry policy.  Migrate
+    # those concrete asset records before due-work selection so a normal run
+    # never spends another request merely to discover the budget was exhausted.
+    pending = list(
+        state.get("pending_media")
+        if isinstance(state.get("pending_media"), list)
+        else []
+    )
+    unavailable = list(
+        state.get("unavailable_media")
+        if isinstance(state.get("unavailable_media"), list)
+        else []
+    )
+    unavailable_keys = {
+        (
+            Path(str(record.get("filename") or "")).name,
+            id_string(record.get("post_id")),
+            record.get("media_number"),
+        )
+        for record in unavailable
+        if isinstance(record, dict)
+    }
+    remaining = []
+    for record in pending:
+        if not isinstance(record, dict):
+            continue
+        filename = Path(str(record.get("filename") or "")).name
+        post_id = id_string(record.get("post_id"))
+        media_number = record.get("media_number")
+        concrete_asset = bool(filename and post_id and media_number)
+        if (
+            not concrete_asset
+            or int(record.get("attempts") or 0) < MEDIA_RETRY_MAX_ATTEMPTS
+        ):
+            remaining.append(record)
+            continue
+        migrated = record.copy()
+        migrated.update(
+            {
+                "status": "unavailable",
+                "unavailable_at": (
+                    record.get("last_failed_at") or iso_utc(utc_now())
+                ),
+                "unavailable_reason": "media_retry_budget_exhausted",
+                "next_retry_at": None,
+            }
+        )
+        key = (filename, post_id, media_number)
+        if key not in unavailable_keys:
+            unavailable.append(migrated)
+            unavailable_keys.add(key)
+    state["pending_media"] = remaining
+    state["unavailable_media"] = unavailable
     prune_completed_pending_media(state, user_dir)
     after = len(
         state.get("unavailable_media")
@@ -3064,8 +3127,8 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
     parser.add_argument(
         "--media-retries",
         type=positive_int,
-        default=8,
-        help="retries for previously failed media assets (default: 8)",
+        default=2,
+        help="retries for previously failed media assets (default: 2)",
     )
     parser.add_argument(
         "--media-timeout",
