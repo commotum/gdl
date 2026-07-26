@@ -827,6 +827,49 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                 media=False,
             )
 
+    def test_metadata_failure_blocks_context_media_but_still_exports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            empty_archive(root)
+            calls = []
+
+            def scheduler(
+                args, repo_dir, archive_root, handles, *, media, progress=None
+            ):
+                calls.append(media)
+                if media:
+                    self.fail("context media ran after metadata failed")
+                return {
+                    handle: {"status": "failed", "error": "metadata fault"}
+                    for handle in handles
+                }
+
+            with mock.patch.object(
+                unified_x, "run_context_scheduler", side_effect=scheduler
+            ):
+                result = unified_x.run_unified_followups(
+                    unified_args(),
+                    REPO,
+                    root,
+                    "1.32.4",
+                    {"alice": {"run_id": "modern", "status": "success"}},
+                )
+
+            self.assertEqual(calls, [False])
+            self.assertEqual(
+                result["alice"]["context_metadata"]["status"], "failed"
+            )
+            self.assertEqual(
+                result["alice"]["context_media"],
+                {
+                    "status": "blocked",
+                    "reason": "context_metadata_failed",
+                },
+            )
+            self.assertEqual(
+                result["alice"]["context_export"]["status"], "complete"
+            )
+
     def test_seed_failure_does_not_starve_an_independent_user(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

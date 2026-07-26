@@ -628,17 +628,43 @@ def run_unified_followups(
             )
             emit()
 
-    for handle in context_handles:
+    media_handles = list(context_handles)
+    blocked_media: dict[str, dict[str, Any]] = {}
+    if not args.retry_failed_only:
+        media_handles = []
+        for handle in context_handles:
+            metadata_status = str(
+                combined[handle].get("context_metadata", {}).get("status", "")
+            )
+            if metadata_status in {
+                "failed", "interrupted", "stalled", "ambiguous", "blocked"
+            }:
+                blocked_media[handle] = {
+                    "status": "blocked",
+                    "reason": f"context_metadata_{metadata_status}",
+                }
+            else:
+                media_handles.append(handle)
+    for handle in media_handles:
         phase(handle, "context_media", "running", "fetching context media")
+    for handle in blocked_media:
+        phase(
+            handle,
+            "context_media",
+            "blocked",
+            "context media deferred after metadata failure",
+        )
     media = run_context_scheduler(
-        args, repo_dir, archive_root, context_handles, media=True,
+        args, repo_dir, archive_root, media_handles, media=True,
         progress=progress,
-    ) if context_handles else {}
+    ) if media_handles else {}
     for handle in context_handles:
-        combined[handle]["context_media"] = media[handle]
+        combined[handle]["context_media"] = (
+            blocked_media.get(handle) or media[handle]
+        )
         phase(
             handle, "context_media",
-            str(media[handle].get("status", "complete")),
+            str(combined[handle]["context_media"].get("status", "complete")),
             "context media checked",
         )
         phase(handle, "context_export", "running", "exporting context datasets")

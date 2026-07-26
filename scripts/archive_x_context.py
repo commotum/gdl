@@ -710,15 +710,11 @@ class ContextDB:
         ).fetchone()
         queued_conversation = id_string(row[0]) if row else None
         focal_conversation = id_string(focal.get("conversation_id"))
-        if (
+        conversation_mismatch = bool(
             queued_conversation
             and focal_conversation
             and queued_conversation != focal_conversation
-        ):
-            raise ContextError(
-                f"conversation mismatch for {focal_id}: "
-                f"{queued_conversation} and {focal_conversation}"
-            )
+        )
         conversation_id = focal_conversation or queued_conversation
 
         placeholders = ",".join("?" for _ in by_id)
@@ -732,11 +728,12 @@ class ContextDB:
         }
         actionable_states = {"pending", "retryable", "leased", "manual_review"}
         seeds = [focal_id]
-        seeds.extend(
-            post_id
-            for post_id in by_id
-            if post_id != focal_id and queued.get(post_id) in actionable_states
-        )
+        if not conversation_mismatch:
+            seeds.extend(
+                post_id
+                for post_id in by_id
+                if post_id != focal_id and queued.get(post_id) in actionable_states
+            )
 
         selected: list[str] = []
         selected_set: set[str] = set()
@@ -757,10 +754,23 @@ class ContextDB:
                     break
                 selected.append(current)
                 selected_set.add(current)
+                if conversation_mismatch:
+                    # Some old X records claim the reply itself as the
+                    # conversation root even though its reply_id points to an
+                    # older post.  The focal record remains useful, but this
+                    # response is not safe evidence for opportunistic
+                    # conversation harvesting.
+                    break
                 current = id_string(record.get("reply_id"))
 
         parents: dict[str, str | None] = {}
         with transaction(self.connection):
+            if conversation_mismatch and focal_conversation:
+                self.connection.execute(
+                    """UPDATE targets SET conversation_id=?,updated_at=?
+                       WHERE post_id=?""",
+                    (focal_conversation, iso_now(), focal_id),
+                )
             for post_id in selected:
                 parents[post_id] = self._capture_record(
                     post_id,
@@ -1465,6 +1475,16 @@ def build_context_config(
     )
     twitter = config["extractor"]["twitter"]
     twitter.pop("timeline", None)
+    if media:
+        # Context paths intentionally duplicate neither the primary archive's
+        # location nor its download ledger.  A metadata-only request must not
+        # mark a future context-media download as already archived.
+        twitter["archive"] = str(
+            user_dir / "_state" / "context-downloads.sqlite3"
+        )
+    else:
+        twitter.pop("archive", None)
+        twitter.pop("archive-table", None)
     twitter.update(
         {
             "tweet-endpoint": "detail" if conversation and not media else "rest",
@@ -1687,6 +1707,137 @@ def context_media_complete(user_dir: Path, post_id: str) -> bool:
             return False
         found = True
     return found
+
+
+def false_media_archive_skip_paths(
+    user_dir: Path, post_id: str, detail: str | None
+) -> list[str]:
+    """Return exact skipped context paths or nothing when evidence is mixed."""
+    if not detail:
+        return []
+    context_root = (user_dir / "media" / "context").resolve()
+    paths: list[str] = []
+    for raw_line in detail.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("command: "):
+            continue
+        if line == "[twitter][info] Initializing client transaction keys":
+            continue
+        if (
+            "[warning]" in line
+            and (
+                "Unsupported block type" in line
+                or "Unsupported entity type" in line
+            )
+        ):
+            continue
+        if not line.startswith("# "):
+            return []
+        path = Path(line[2:]).resolve()
+        if context_root not in path.parents or f"_{post_id}_" not in path.name:
+            return []
+        if path.exists() or Path(str(path) + ".json").exists():
+            return []
+        paths.append(str(path))
+    return paths
+
+
+def repair_false_media_archive_skips(
+    user_dir: Path, db_path: Path, *, apply: bool
+) -> dict[str, Any]:
+    """Requeue only media reviews proven to be download-archive false skips."""
+    with ContextDB(db_path, create=False) as context:
+        candidates = []
+        for row in context.connection.execute(
+            """SELECT post_id,media_state,media_attempts,media_next_attempt_at,
+                      last_error_class,last_error_detail,updated_at
+                 FROM targets
+                WHERE state='captured' AND media_state='manual_review'
+                  AND last_error_class='media_download'
+                ORDER BY post_id"""
+        ):
+            paths = false_media_archive_skip_paths(
+                user_dir, str(row["post_id"]), row["last_error_detail"]
+            )
+            if paths and not context_media_complete(
+                user_dir, str(row["post_id"])
+            ):
+                candidates.append({**dict(row), "skipped_paths": paths})
+
+        result: dict[str, Any] = {
+            "candidates": len(candidates),
+            "requeued": 0,
+            "writes": False,
+        }
+        if not apply or not candidates:
+            return result
+
+        canonical = json.dumps(
+            candidates, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        digest = hashlib.sha256(canonical.encode()).hexdigest()
+        backup = (
+            user_dir
+            / "_state"
+            / "backups"
+            / f"context-media-archive-skip-{digest[:12]}.json"
+        )
+        payload = {
+            "schema": "gdl-x-context-media-repair",
+            "schema_version": 1,
+            "created_at": iso_now(),
+            "database": str(db_path.relative_to(user_dir)),
+            "candidate_sha256": digest,
+            "rows": candidates,
+        }
+        if backup.exists():
+            previous = archive_x.load_json(backup, {})
+            if (
+                previous.get("candidate_sha256") != digest
+                or previous.get("rows") != candidates
+            ):
+                raise ContextError("context media repair backup changed")
+        else:
+            archive_x.atomic_write_json(backup, payload)
+            os.chmod(backup, 0o600)
+
+        repaired_at = iso_now()
+        with transaction(context.connection):
+            changed = 0
+            for row in candidates:
+                cursor = context.connection.execute(
+                    """UPDATE targets SET media_state='pending',
+                           media_attempts=0,media_next_attempt_at=0,
+                           last_error_class=NULL,last_error_detail=NULL,
+                           lease_started_at=NULL,updated_at=?
+                       WHERE post_id=? AND state='captured'
+                         AND media_state='manual_review'
+                         AND media_attempts=?
+                         AND last_error_class='media_download'
+                         AND last_error_detail=?""",
+                    (
+                        repaired_at,
+                        row["post_id"],
+                        row["media_attempts"],
+                        row["last_error_detail"],
+                    ),
+                )
+                changed += cursor.rowcount
+            if changed != len(candidates):
+                raise ContextError(
+                    "context media repair target changed during guarded update"
+                )
+        errors = context.integrity_errors()
+        if errors:
+            raise ContextError("; ".join(errors))
+        result.update(
+            {
+                "requeued": len(candidates),
+                "writes": True,
+                "backup": str(backup.relative_to(user_dir)),
+            }
+        )
+        return result
 
 
 def ensure_context_media_space(archive_root: Path) -> None:
@@ -2095,6 +2246,15 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
     commands.add_parser("status", help="print queue and coverage status")
     commands.add_parser("integrity", help="verify SQLite and graph invariants")
     commands.add_parser("export", help="atomically rebuild context datasets")
+    repair_media = commands.add_parser(
+        "repair-media-skips",
+        help="guardedly requeue false context-media archive skips",
+    )
+    repair_media.add_argument(
+        "--apply",
+        action="store_true",
+        help="write a recovery manifest and apply the exact repair",
+    )
     retry = commands.add_parser("retry", help="explicitly requeue failed targets")
     retry.add_argument("post_ids", nargs="*")
     retry.add_argument(
@@ -2120,7 +2280,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         handle = archive_x.normalize_handle(args.user)
-        dry = args.command == "seed" and args.dry_run
+        dry = (
+            args.command == "seed" and args.dry_run
+        ) or (
+            args.command == "repair-media-skips" and not args.apply
+        )
         archive_root = archive_x.resolve_output_root(args.output_root, plan_only=dry)
         user_dir, db_path = user_paths(archive_root, handle)
         if args.command == "seed":
@@ -2175,6 +2339,30 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"requeued: {reset_targets(db_path, args.post_ids, media=args.media)}"
             )
+            return 0
+        if args.command == "repair-media-skips":
+            if not args.apply:
+                print(
+                    json.dumps(
+                        repair_false_media_archive_skips(
+                            user_dir, db_path, apply=False
+                        ),
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 0
+            if not os.access(archive_root, os.W_OK | os.X_OK):
+                raise ContextError(f"archive root is not writable: {archive_root}")
+            with archive_x.exclusive_lock(
+                repo_dir / "state" / "locks" / "archive-x.lock"
+            ), archive_x.exclusive_lock(
+                archive_root / "_state" / "archive-x.lock"
+            ):
+                result = repair_false_media_archive_skips(
+                    user_dir, db_path, apply=True
+                )
+            print(json.dumps(result, indent=2, sort_keys=True))
             return 0
 
         args.cookies = args.cookies.expanduser().resolve()

@@ -240,7 +240,10 @@ ambiguous and retain the normal bounded-retry behavior.
 Metadata closure is independent of media. Context media is processed
 automatically after metadata, verifies SHA-256 sidecars, and refuses to start
 below 5 GiB free. Failures remain explicit and retryable without unresolving
-captured metadata.
+captured metadata. Metadata-only requests never write to a download ledger;
+context media uses its own `_state/context-downloads.sqlite3` ledger so a
+metadata observation cannot masquerade as a completed file download. If
+metadata fails, media is deferred instead of consuming the entire media queue.
 
 The standalone context CLI remains available for advanced read-only status,
 integrity, export, guarded retry, and deliberately bounded maintenance:
@@ -251,6 +254,7 @@ scripts/archive-x-context --user USERNAME integrity
 scripts/archive-x-context --user USERNAME export
 scripts/archive-x-context --user USERNAME run --max-posts 1  # bounded maintenance
 scripts/archive-x-context --user USERNAME media --max-posts 1
+scripts/archive-x-context --user USERNAME repair-media-skips  # read-only preview
 ```
 
 For a deliberately bounded unified production smoke, use the advanced

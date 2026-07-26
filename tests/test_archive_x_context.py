@@ -451,6 +451,8 @@ class ResolverConfigTests(unittest.TestCase):
         )
         twitter = config["extractor"]["twitter"]
         self.assertNotIn("timeline", twitter)
+        self.assertNotIn("archive", twitter)
+        self.assertNotIn("archive-table", twitter)
         self.assertEqual(twitter["tweet-endpoint"], "detail")
         self.assertTrue(twitter["conversations"])
         self.assertNotIn("post-filter", twitter)
@@ -480,6 +482,10 @@ class ResolverConfigTests(unittest.TestCase):
         self.assertEqual(twitter["tweet-endpoint"], "rest")
         self.assertFalse(twitter["conversations"])
         self.assertEqual(twitter["post-filter"], "tweet_id == 123")
+        self.assertEqual(
+            twitter["archive"],
+            "/archive/users/alice/_state/context-downloads.sqlite3",
+        )
 
     def test_fetch_rejects_non_focal_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -675,6 +681,37 @@ class SchedulerAndRecoveryTests(unittest.TestCase):
             self.assertNotIn("700", states)
             self.assertNotIn("999", states)
             self.assertEqual(media_state, "pending")
+
+    def test_conversation_id_mismatch_safely_captures_only_focal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with context_x.ContextDB(Path(directory) / "context.sqlite3") as database:
+                database.add_edge(
+                    "900", "500", conversation_id="900", depth=0,
+                    run_id="run", observed_at="now", max_depth=20,
+                )
+                database.add_edge(
+                    "800", "300", conversation_id="500", depth=0,
+                    run_id="run", observed_at="now", max_depth=20,
+                )
+                records = (
+                    post("500", author_id="2", conversation_id="500"),
+                    post("300", author_id="3", conversation_id="500"),
+                )
+
+                captured, continuation = database.capture_conversation_response(
+                    "500", records, target_user_id="1", max_depth=20
+                )
+                rows = {
+                    row["post_id"]: (row["state"], row["conversation_id"])
+                    for row in database.connection.execute(
+                        "SELECT post_id,state,conversation_id FROM targets"
+                    )
+                }
+
+            self.assertEqual(captured, ["500"])
+            self.assertIsNone(continuation)
+            self.assertEqual(rows["500"], ("captured", "500"))
+            self.assertEqual(rows["300"], ("pending", "500"))
 
     def test_conversation_capture_rolls_back_whole_response_on_edge_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -878,6 +915,82 @@ class PacingAndFailureTests(unittest.TestCase):
                 with self.assertRaises(context_x.archive_x.ArchiveError):
                     with context_x.archive_x.exclusive_lock(lock):
                         self.fail("second worker acquired the shared lock")
+
+    def test_false_media_archive_skip_repair_is_exact_and_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, db_path = make_archive(root)
+            with context_x.ContextDB(db_path) as database:
+                for post_id in ("100", "200"):
+                    database.upsert_target(
+                        post_id,
+                        conversation_id=post_id,
+                        depth=0,
+                        observed_at="now",
+                    )
+                    database.capture(
+                        post_id,
+                        post(post_id, author_id="2", count=1),
+                        source_kind="x:focal",
+                        target_user_id="1",
+                        max_depth=10,
+                    )
+                skipped = (
+                    "command: runner\n"
+                    "[twitter][info] Initializing client transaction keys\n"
+                    "[twitter.article][warning] Unsupported block type 'header-two'\n"
+                    f"# {user_dir}/media/context/2026/01/date_100_1_bob.jpg"
+                )
+                genuine = (
+                    "command: runner\n"
+                    "[downloader.http][error] 500 Internal Server Error"
+                )
+                database.connection.execute(
+                    """UPDATE targets SET media_state='manual_review',
+                           media_attempts=3,last_error_class='media_download',
+                           last_error_detail=?
+                       WHERE post_id='100'""",
+                    (skipped,),
+                )
+                database.connection.execute(
+                    """UPDATE targets SET media_state='manual_review',
+                           media_attempts=3,last_error_class='media_download',
+                           last_error_detail=?
+                       WHERE post_id='200'""",
+                    (genuine,),
+                )
+
+            preview = context_x.repair_false_media_archive_skips(
+                user_dir, db_path, apply=False
+            )
+            applied = context_x.repair_false_media_archive_skips(
+                user_dir, db_path, apply=True
+            )
+            with context_x.ContextDB(db_path, create=False) as database:
+                rows = {
+                    row["post_id"]: (
+                        row["media_state"],
+                        row["media_attempts"],
+                        row["last_error_class"],
+                    )
+                    for row in database.connection.execute(
+                        """SELECT post_id,media_state,media_attempts,
+                                  last_error_class
+                             FROM targets ORDER BY post_id"""
+                    )
+                }
+            backup = user_dir / applied["backup"]
+
+            self.assertEqual(preview, {
+                "candidates": 1, "requeued": 0, "writes": False
+            })
+            self.assertEqual(applied["requeued"], 1)
+            self.assertEqual(rows["100"], ("pending", 0, None))
+            self.assertEqual(rows["200"], ("manual_review", 3, "media_download"))
+            self.assertTrue(backup.is_file())
+            self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+            saved = json.loads(backup.read_text(encoding="utf-8"))
+            self.assertEqual(saved["rows"][0]["post_id"], "100")
 
 
 class WorkerAndDatasetTests(unittest.TestCase):
