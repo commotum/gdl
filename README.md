@@ -210,12 +210,20 @@ reply seeds its immediate parent, and the resolver follows that parent and its
 parent until a root, an explicit unavailable boundary, the depth guard, or a
 manual-review item. Parents authored by other accounts are retained with their
 true authorship. Siblings, descendants, quoted sources, and broad conversation
-expansion remain out of scope.
+pagination remain out of scope.
 
-The worker makes one focal-post request at a time, persists its next-safe
-request time, prefers finishing the current ancestor chain, periodically yields
-between chains/users, and has bounded attempts, leases, timeouts, and backoff.
-No `--max-posts` value is required for normal closure.
+For metadata, the worker reads at most the first bounded TweetDetail response.
+It retains the focal post, other targets that were already independently queued,
+and only the parent paths directly verified by that response. Unrelated
+siblings and descendants are discarded. If a successful response omits the
+focal post, the worker performs one paced exact lookup instead of treating
+absence as unavailability. Media requests remain focal-only.
+
+The worker persists its next-safe request time, prefers finishing the current
+ancestor chain, periodically yields between chains/users, and has bounded
+attempts, leases, timeouts, and backoff. Durable SQLite pacing is the sole
+startup delay for these short requests. No `--max-posts` value is required for
+normal closure.
 
 Stopping with Ctrl-C or SIGTERM leaves the current target retryable. Deleted,
 private, suspended, and withheld boundaries are recorded; ambiguous failures
@@ -223,8 +231,8 @@ are retried with bounded backoff and eventually require manual review. Use
 `retry POST_ID...` for an explicit reclassification retry. Rebuild the
 portable views with `export`.
 
-An individual lookup whose successful X response omits its Tweet result gets
-exactly one confirmation through the more stable TweetDetail endpoint. A focal
+An exact lookup whose successful X response omits its Tweet result gets exactly
+one bounded confirmation through the more stable TweetDetail endpoint. A focal
 post recovered there is archived normally; a second response without the focal
 post becomes an explicit deleted boundary. Other response-shape failures stay
 ambiguous and retain the normal bounded-retry behavior.

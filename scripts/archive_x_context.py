@@ -613,6 +613,24 @@ class ContextDB:
         target_user_id: str,
         max_depth: int,
     ) -> str | None:
+        with transaction(self.connection):
+            return self._capture_record(
+                post_id,
+                metadata,
+                source_kind=source_kind,
+                target_user_id=target_user_id,
+                max_depth=max_depth,
+            )
+
+    def _capture_record(
+        self,
+        post_id: str,
+        metadata: dict[str, Any],
+        *,
+        source_kind: str,
+        target_user_id: str,
+        max_depth: int,
+    ) -> str | None:
         actual = id_string(metadata.get("tweet_id"))
         if actual != post_id:
             raise ContextError(f"expected post {post_id}, received {actual or 'none'}")
@@ -623,51 +641,148 @@ class ContextDB:
         parent_id = id_string(metadata.get("reply_id"))
         conversation_id = id_string(metadata.get("conversation_id"))
         media_count = int(metadata.get("count") or 0)
-        enqueue_media = media_count > 0 and source_kind == "x:focal"
+        enqueue_media = media_count > 0 and source_kind.startswith("x:")
         row = self.connection.execute(
             "SELECT depth_min FROM targets WHERE post_id=?", (post_id,)
         ).fetchone()
         depth = int(row[0]) if row else 0
-        with transaction(self.connection):
-            self.upsert_target(
+        self.upsert_target(
+            post_id,
+            conversation_id=conversation_id,
+            depth=depth,
+            observed_at=captured_at,
+        )
+        self.connection.execute(
+            """INSERT INTO observations(
+                   post_id,captured_at,source_kind,raw_json,sha256
+               ) VALUES (?,?,?,?,?)
+               ON CONFLICT(post_id) DO UPDATE SET
+                   captured_at=excluded.captured_at,
+                   source_kind=excluded.source_kind,
+                   raw_json=excluded.raw_json,
+                   sha256=excluded.sha256,
+                   capture_count=observations.capture_count+1""",
+            (post_id, captured_at, source_kind, raw_json, digest),
+        )
+        self.connection.execute(
+            """UPDATE targets SET state='captured', lease_started_at=NULL,
+                   next_attempt_at=0, author_id=?, updated_at=?,
+                   last_error_class=NULL, last_error_detail=NULL,
+                   media_state=CASE
+                       WHEN ? > 0 AND media_state='none' THEN 'pending'
+                       ELSE media_state END
+               WHERE post_id=?""",
+            (author_id, captured_at, int(enqueue_media), post_id),
+        )
+        if parent_id:
+            self.add_edge(
                 post_id,
+                parent_id,
                 conversation_id=conversation_id,
-                depth=depth,
+                depth=depth + 1,
+                run_id=f"context:{source_kind}",
                 observed_at=captured_at,
+                max_depth=max_depth,
             )
-            self.connection.execute(
-                """INSERT INTO observations(
-                       post_id,captured_at,source_kind,raw_json,sha256
-                   ) VALUES (?,?,?,?,?)
-                   ON CONFLICT(post_id) DO UPDATE SET
-                       captured_at=excluded.captured_at,
-                       source_kind=excluded.source_kind,
-                       raw_json=excluded.raw_json,
-                       sha256=excluded.sha256,
-                       capture_count=observations.capture_count+1""",
-                (post_id, captured_at, source_kind, raw_json, digest),
+        return parent_id
+
+    def capture_conversation_response(
+        self,
+        focal_id: str,
+        records: tuple[dict[str, Any], ...],
+        *,
+        target_user_id: str,
+        max_depth: int,
+    ) -> tuple[list[str], str | None]:
+        """Atomically retain only queued targets and their verified ancestors."""
+        by_id: dict[str, dict[str, Any]] = {}
+        for record in records:
+            post_id = id_string(record.get("tweet_id"))
+            if not post_id or post_id in by_id:
+                raise ContextError("invalid or duplicate conversation response post")
+            by_id[post_id] = record
+        focal = by_id.get(focal_id)
+        if focal is None:
+            return [], None
+
+        row = self.connection.execute(
+            "SELECT conversation_id FROM targets WHERE post_id=?", (focal_id,)
+        ).fetchone()
+        queued_conversation = id_string(row[0]) if row else None
+        focal_conversation = id_string(focal.get("conversation_id"))
+        if (
+            queued_conversation
+            and focal_conversation
+            and queued_conversation != focal_conversation
+        ):
+            raise ContextError(
+                f"conversation mismatch for {focal_id}: "
+                f"{queued_conversation} and {focal_conversation}"
             )
-            self.connection.execute(
-                """UPDATE targets SET state='captured', lease_started_at=NULL,
-                       next_attempt_at=0, author_id=?, updated_at=?,
-                       last_error_class=NULL, last_error_detail=NULL,
-                       media_state=CASE
-                           WHEN ? > 0 AND media_state='none' THEN 'pending'
-                           ELSE media_state END
-                   WHERE post_id=?""",
-                (author_id, captured_at, int(enqueue_media), post_id),
+        conversation_id = focal_conversation or queued_conversation
+
+        placeholders = ",".join("?" for _ in by_id)
+        queued = {
+            str(target["post_id"]): str(target["state"])
+            for target in self.connection.execute(
+                f"""SELECT post_id,state FROM targets
+                    WHERE post_id IN ({placeholders})""",
+                tuple(by_id),
             )
-            if parent_id:
-                self.add_edge(
+        }
+        actionable_states = {"pending", "retryable", "leased", "manual_review"}
+        seeds = [focal_id]
+        seeds.extend(
+            post_id
+            for post_id in by_id
+            if post_id != focal_id and queued.get(post_id) in actionable_states
+        )
+
+        selected: list[str] = []
+        selected_set: set[str] = set()
+        for seed in seeds:
+            current = seed
+            while current and current not in selected_set:
+                record = by_id.get(current)
+                if record is None:
+                    break
+                record_conversation = id_string(record.get("conversation_id"))
+                if (
+                    conversation_id
+                    and record_conversation
+                    and record_conversation != conversation_id
+                ):
+                    break
+                if queued.get(current) == "captured":
+                    break
+                selected.append(current)
+                selected_set.add(current)
+                current = id_string(record.get("reply_id"))
+
+        parents: dict[str, str | None] = {}
+        with transaction(self.connection):
+            for post_id in selected:
+                parents[post_id] = self._capture_record(
                     post_id,
-                    parent_id,
-                    conversation_id=conversation_id,
-                    depth=depth + 1,
-                    run_id=f"context:{source_kind}",
-                    observed_at=captured_at,
+                    by_id[post_id],
+                    source_kind=(
+                        "x:focal" if post_id == focal_id else "x:conversation"
+                    ),
+                    target_user_id=target_user_id,
                     max_depth=max_depth,
                 )
-        return parent_id
+        continuation = None
+        for post_id in reversed(selected):
+            parent_id = parents.get(post_id)
+            if not parent_id or parent_id in selected_set:
+                continue
+            parent = self.connection.execute(
+                "SELECT state FROM targets WHERE post_id=?", (parent_id,)
+            ).fetchone()
+            if parent and parent["state"] in {"pending", "retryable"}:
+                continuation = parent_id
+                break
+        return selected, continuation
 
     def reclaim_stale(
         self, now: float, lease_seconds: float, *, media: bool = False
@@ -1326,6 +1441,7 @@ def build_context_config(
     cookie_file: Path,
     work_dir: Path,
     media: bool,
+    conversation: bool = True,
 ) -> tuple[dict[str, Any], Path]:
     raw_path = work_dir / "current.posts.jsonl.partial"
     config = archive_x.build_gallery_config(
@@ -1337,9 +1453,12 @@ def build_context_config(
         cookie_file=cookie_file,
         archive_run_id=f"context-{post_id}",
         archived_at=iso_now(),
-        request_delay="4-8",
+        # Context pacing is reserved durably in SQLite immediately before
+        # each request.  A second in-extractor delay only makes every short
+        # process slower without adding safety.
+        request_delay="0",
         download_delay="1-3",
-        extractor_delay="2-5",
+        extractor_delay="0",
         include_reposts=True,
         checksums=media,
         cursor=None,
@@ -1348,15 +1467,21 @@ def build_context_config(
     twitter.pop("timeline", None)
     twitter.update(
         {
-            "tweet-endpoint": "rest",
-            "conversations": False,
+            "tweet-endpoint": "detail" if conversation and not media else "rest",
+            "conversations": bool(conversation and not media),
             "expand": False,
             "showreplies": False,
             "quoted": False,
             "pinned": False,
-            "post-filter": f"tweet_id == {post_id}",
+            # A runner-side cursor guard turns TweetDetail into a single
+            # response rather than an unbounded conversation pagination.
+            "archive-conversation-pages": 1,
         }
     )
+    if conversation and not media:
+        twitter.pop("post-filter", None)
+    else:
+        twitter["post-filter"] = f"tweet_id == {post_id}"
     twitter["directory"] = [
         "users",
         handle,
@@ -1382,6 +1507,7 @@ class FetchResult:
     interrupted: bool
     failed_downloads: list[dict[str, Any]]
     rate_reset: float | None
+    records: tuple[dict[str, Any], ...] = ()
 
 
 def fetch_post(
@@ -1393,6 +1519,7 @@ def fetch_post(
     post_id: str,
     cookie_file: Path,
     media: bool,
+    conversation: bool = True,
 ) -> FetchResult:
     work_dir = user_dir / "_state" / "context-work"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1407,6 +1534,7 @@ def fetch_post(
         cookie_file=cookie_file,
         work_dir=work_dir,
         media=media,
+        conversation=conversation,
     )
     for path in (config_path, log_path, raw_path):
         try:
@@ -1433,7 +1561,7 @@ def fetch_post(
         "--retries",
         "1",
         "--post-range",
-        "1",
+        "1-200" if conversation and not media else "1",
     ]
     if not media:
         command.append("--no-download")
@@ -1452,11 +1580,24 @@ def fetch_post(
     rate_resets = [float(match.group(1)) for match in RATE_RESET_RE.finditer(log)]
     records = list(archive_x.iter_jsonl(raw_path))
     matching = [record for record in records if id_string(record.get("tweet_id")) == post_id]
-    if records and (len(records) != 1 or len(matching) != 1):
+    if not conversation and records and (
+        len(records) != 1 or len(matching) != 1
+    ):
         raise ContextError(
             f"focal-only invariant failed for {post_id}: "
             f"{len(records)} total, {len(matching)} matching"
         )
+    if conversation:
+        seen: set[str] = set()
+        for record in records:
+            record_id = id_string(record.get("tweet_id"))
+            if not record_id:
+                raise ContextError("conversation response contains a post without an ID")
+            if record_id in seen:
+                raise ContextError(
+                    f"conversation response contains duplicate post {record_id}"
+                )
+            seen.add(record_id)
     return FetchResult(
         status=status,
         metadata=matching[0] if matching else None,
@@ -1464,6 +1605,7 @@ def fetch_post(
         interrupted=interrupted,
         failed_downloads=failed_downloads,
         rate_reset=max(rate_resets) if rate_resets else None,
+        records=tuple(records),
     )
 
 
@@ -1580,8 +1722,16 @@ def run_worker(
     if max_posts is not None and max_posts < 1:
         raise ContextError("context post limit must be positive")
     target_id, canonical_handle = target_identity(user_dir)
-    counts = {"attempted": 0, "captured": 0, "unavailable": 0, "retryable": 0,
-              "manual_review": 0, "reclassified_unavailable": 0}
+    counts = {
+        "attempted": 0,
+        "requests": 0,
+        "captured": 0,
+        "conversation_captured": 0,
+        "unavailable": 0,
+        "retryable": 0,
+        "manual_review": 0,
+        "reclassified_unavailable": 0,
+    }
     with ContextDB(db_path) as context:
         context.bind_identity(target_id, canonical_handle)
         errors = context.integrity_errors()
@@ -1638,7 +1788,9 @@ def run_worker(
                     post_id=post_id,
                     cookie_file=cookie_file,
                     media=media,
+                    conversation=not media,
                 )
+                counts["requests"] += 1
             except KeyboardInterrupt:
                 context.fail(
                     post_id,
@@ -1662,6 +1814,54 @@ def run_worker(
                     media=media,
                 )
                 raise KeyboardInterrupt
+            if (
+                not media
+                and result.metadata is None
+                and (
+                    result.status == 0
+                    or classify_failure(result)[0]
+                    in {"ambiguous_response_shape", "unknown"}
+                )
+            ):
+                # A conversation response can legitimately contain nearby
+                # posts without its focal post.  Never infer unavailability
+                # from that shape; spend one paced exact lookup instead.
+                try:
+                    reserve_request(
+                        context, request_delay, announce=progress is None
+                    )
+                    result = fetcher(
+                        repo_dir=repo_dir,
+                        archive_root=archive_root,
+                        user_dir=user_dir,
+                        handle=canonical_handle or handle,
+                        post_id=post_id,
+                        cookie_file=cookie_file,
+                        media=False,
+                        conversation=False,
+                    )
+                    counts["requests"] += 1
+                except KeyboardInterrupt:
+                    context.fail(
+                        post_id,
+                        error_class="interrupted",
+                        detail="operator interrupt",
+                        now=clock(),
+                        max_attempts=max_attempts,
+                        retry_delay=0,
+                    )
+                    raise
+                persist_rate_reset(context, result.rate_reset)
+                if result.interrupted:
+                    context.fail(
+                        post_id,
+                        error_class="interrupted",
+                        detail=result.log,
+                        now=clock(),
+                        max_attempts=max_attempts,
+                        retry_delay=0,
+                    )
+                    raise KeyboardInterrupt
             if result.metadata is not None:
                 if media:
                     if (
@@ -1687,15 +1887,30 @@ def run_worker(
                         if progress is not None:
                             progress("captured", post_id, True)
                     continue
-                parent = context.capture(
-                    post_id,
-                    result.metadata,
-                    source_kind="x:focal",
-                    target_user_id=target_id,
-                    max_depth=max_depth,
-                )
-                context.continue_chain(parent, fairness_quantum)
-                counts["captured"] += 1
+                if len(result.records) > 1:
+                    captured, continuation = context.capture_conversation_response(
+                        post_id,
+                        result.records,
+                        target_user_id=target_id,
+                        max_depth=max_depth,
+                    )
+                    if not captured:
+                        raise ContextError(
+                            f"conversation response lost focal post {post_id}"
+                        )
+                    context.continue_chain(continuation, fairness_quantum)
+                    counts["captured"] += len(captured)
+                    counts["conversation_captured"] += max(0, len(captured) - 1)
+                else:
+                    parent = context.capture(
+                        post_id,
+                        result.metadata,
+                        source_kind="x:focal",
+                        target_user_id=target_id,
+                        max_depth=max_depth,
+                    )
+                    context.continue_chain(parent, fairness_quantum)
+                    counts["captured"] += 1
                 if progress is not None:
                     progress("captured", post_id, True)
                 continue

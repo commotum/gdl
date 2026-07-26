@@ -112,6 +112,58 @@ class ProgressSignalsTests(unittest.TestCase):
         self.assertEqual(young["qualifier"], "collecting samples")
         blocked, _ = progress.estimate_known_queue([], 10, blocked=True)
         self.assertEqual(blocked["qualifier"], "phase blocked")
+        blocked_with_rate, blocked_rate = progress.estimate_known_queue([
+            {"at": 0, "known_remaining": 1000, "resolved": 0},
+            {"at": 3600, "known_remaining": 900, "resolved": 200},
+        ], 900, blocked=True)
+        self.assertEqual(blocked_with_rate["qualifier"], "phase blocked")
+        self.assertEqual(blocked_rate["items_per_hour"], 200)
+
+    def test_nonactive_manual_review_does_not_hide_context_eta(self):
+        totals = progress.empty_totals()
+        totals.update({
+            "context_captured": 100,
+            "context_known_remaining": 1000,
+        })
+        later = dict(totals)
+        later.update({
+            "context_captured": 300,
+            "context_known_remaining": 900,
+        })
+        current = [0.0]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            progress,
+            "collect_user_totals",
+            side_effect=[totals, later],
+        ):
+            tracker = progress.ProgressTracker(
+                Path(directory) / "progress.json",
+                Path(directory),
+                "run",
+                ["alice"],
+                "2026-01-01T00:00:00Z",
+                clock=lambda: current[0],
+            )
+            tracker.event(
+                "alice",
+                phase="legacy",
+                phase_status="manual_review",
+                force=False,
+            )
+            tracker.event(
+                "alice",
+                phase="context_metadata",
+                phase_status="running",
+                force=False,
+            )
+            current[0] = 3600
+            tracker.refresh(force=True)
+            user = tracker.users["alice"]
+
+        self.assertEqual(user["action_required"], 1)
+        self.assertEqual(user["health"], "healthy")
+        self.assertEqual(user["rate"]["items_per_hour"], 200)
+        self.assertEqual(user["estimate"]["qualifier"], "known queue")
 
     def test_health_precedence(self):
         self.assertEqual(progress.derive_health(

@@ -357,26 +357,31 @@ def estimate_known_queue(
         "seconds": None, "label": None, "confidence": "none",
         "qualifier": "collecting samples", "known_remaining": known_remaining,
     }
-    if blocked:
-        estimate["qualifier"] = "phase blocked"
-        return estimate, None
     if len(samples) < 2:
+        if blocked:
+            estimate["qualifier"] = "phase blocked"
         return estimate, None
     first, last = samples[0], samples[-1]
     elapsed = float(last["at"]) - float(first["at"])
     resolved = int(last["resolved"]) - int(first["resolved"])
     burn = int(first["known_remaining"]) - int(last["known_remaining"])
     if elapsed < 600 or resolved < 20:
+        if blocked:
+            estimate["qualifier"] = "phase blocked"
         return estimate, None
     gross_rate = resolved / elapsed * 3600
+    rate = {
+        "items_per_hour": round(gross_rate, 1),
+        "window_seconds": int(elapsed),
+    }
+    if blocked:
+        estimate["qualifier"] = "phase blocked"
+        return estimate, rate
     if burn <= 0:
         estimate["qualifier"] = "still discovering"
-        return estimate, {
-            "items_per_hour": round(gross_rate, 1),
-            "window_seconds": int(elapsed),
-        }
-    rate = burn / elapsed
-    seconds = known_remaining / rate if rate else math.inf
+        return estimate, rate
+    net_rate = burn / elapsed
+    seconds = known_remaining / net_rate if net_rate else math.inf
     confidence = "medium" if elapsed >= 3600 else "low"
     if elapsed >= 4 * 3600:
         confidence = "high"
@@ -384,10 +389,7 @@ def estimate_known_queue(
         "seconds": int(seconds), "label": f"~{human_duration(seconds)}",
         "confidence": confidence, "qualifier": "known queue",
     })
-    return estimate, {
-        "items_per_hour": round(gross_rate, 1),
-        "window_seconds": int(elapsed),
-    }
+    return estimate, rate
 
 
 def _check_keys(value: dict[str, Any], allowed: set[str], where: str) -> None:
@@ -544,11 +546,6 @@ class ProgressTracker:
                     sample for sample in user["samples"]
                     if sample["at"] >= cutoff
                 ][-241:]
-                estimate, rate = estimate_known_queue(
-                    user["samples"], totals["context_known_remaining"],
-                    blocked=user["action_required"] > 0,
-                )
-                user["estimate"], user["rate"] = estimate, rate
                 user["action_required"] = (
                     totals["context_manual_review"]
                     + sum(
@@ -557,6 +554,14 @@ class ProgressTracker:
                     )
                 )
                 phase_status = user["phases"].get(user["phase"], "running")
+                estimate, rate = estimate_known_queue(
+                    user["samples"],
+                    totals["context_known_remaining"],
+                    blocked=phase_status in {
+                        "manual_review", "blocked", "failed"
+                    },
+                )
+                user["estimate"], user["rate"] = estimate, rate
                 user["health"] = derive_health(
                     status=self.status, phase_status=phase_status,
                     action_required=user["action_required"],

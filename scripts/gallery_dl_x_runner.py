@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import inspect
+import json
 import random
 import sys
 import textwrap
@@ -47,6 +48,10 @@ EMPTY_TWEET_RESULT_LOG = (
     "Archive empty TweetResult for %s; confirming once with TweetDetail"
 )
 RECOVERED_TWEET_RESULT_LOG = "Archive recovered %s through TweetDetail"
+BOUNDED_CONVERSATION_CONFIG = "archive-conversation-pages"
+BOUNDED_CONVERSATION_LOG = (
+    "Archive bounded TweetDetail at one response; skipped continuation cursor"
+)
 UPSTREAM_TWEET_RESULT_BY_REST_ID = TwitterAPI.tweet_result_by_rest_id
 
 
@@ -156,6 +161,28 @@ def rate_limit_safe_call(
     root: str | None = None,
 ) -> Any:
     """TwitterAPI._call from 1.32.4 with successful responses preserved."""
+    if (
+        endpoint.endswith("/TweetDetail")
+        and self.extractor.config(BOUNDED_CONVERSATION_CONFIG) == 1
+    ):
+        try:
+            variables = json.loads(params.get("variables") or "{}")
+        except (AttributeError, TypeError, ValueError):
+            variables = {}
+        if variables.get("cursor"):
+            # The context resolver deliberately harvests only the response
+            # that contains its focal post.  Returning a valid empty terminal
+            # page here prevents gallery-dl from spending another request on
+            # broad replies/siblings while allowing the first response to be
+            # fully processed.
+            self.log.info(BOUNDED_CONVERSATION_LOG)
+            return {
+                "data": {
+                    "threaded_conversation_with_injections_v2": {
+                        "instructions": []
+                    }
+                }
+            }
     url = (self.root if root is None else root) + endpoint
 
     while True:

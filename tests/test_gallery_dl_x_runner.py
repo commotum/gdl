@@ -114,6 +114,34 @@ class FallbackAPI:
 
 
 class DeferredRateLimitTests(unittest.TestCase):
+    def test_bounded_tweet_detail_stops_before_cursor_request(self):
+        api = FakeAPI([])
+        with mock.patch.object(
+            api.extractor,
+            "config",
+            side_effect=lambda key: (
+                1 if key == runner.BOUNDED_CONVERSATION_CONFIG else None
+            ),
+        ):
+            data = runner.rate_limit_safe_call(
+                api,
+                "/graphql/hash/TweetDetail",
+                {"variables": '{"focalTweetId":"100","cursor":"next-page"}'},
+            )
+
+        self.assertEqual(
+            data,
+            {
+                "data": {
+                    "threaded_conversation_with_injections_v2": {
+                        "instructions": []
+                    }
+                }
+            },
+        )
+        self.assertFalse(any(event[0] == "request" for event in api.events))
+        self.assertIn(("info", runner.BOUNDED_CONVERSATION_LOG), api.events)
+
     def test_successful_low_quota_page_is_returned_without_refetch(self):
         low = FakeResponse(200, {"page": "oldest"}, remaining="0")
         api = FakeAPI([low])

@@ -909,11 +909,13 @@ observations. Engagement metrics are point-in-time values, not historical
 totals. Raw per-run JSONL and logs live under `../runs/` and remain the source
 of truth.
 
-Reply context is automatically processed but remains ancestor-only. It excludes
-sibling replies, descendants, whole-conversation expansion, and quoted sources.
-Context state is durable in `../_state/context.sqlite3`; the unified command
-rebuilds these views, while `scripts/archive-x-context` remains available for
-advanced maintenance.
+Reply context is automatically processed but remains ancestor-only. A bounded
+first conversation response may settle several already-queued targets and their
+verified parent paths, but unrelated siblings, descendants, further
+conversation pagination, and quoted sources are excluded. Context state is
+durable in `../_state/context.sqlite3`; the unified command rebuilds these
+views, while `scripts/archive-x-context` remains available for advanced
+maintenance.
 
 Pre-Snowflake history is automatically initialized only after strict boundary
 proof, then resumed through bounded internal UTC windows. Its frontier means
@@ -2860,7 +2862,10 @@ def dry_run_summary(
         print("profile media endpoints after timeline: avatar, background")
     print(f"reposts: {'included and labeled' if not args.no_reposts else 'excluded'}")
     print("quoted-source media: excluded")
-    print("context scope: immediate reply ancestors only; no siblings/descendants/quotes")
+    print(
+        "context scope: one bounded response; queued ancestors only; "
+        "no unrelated siblings/descendants/quotes"
+    )
     if not args.no_reposts:
         print("repost attribution: best effort where X omits wrapper-author identity")
     print(f"request delay: {args.request_delay}s")

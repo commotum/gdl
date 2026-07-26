@@ -439,7 +439,7 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class ResolverConfigTests(unittest.TestCase):
-    def test_config_is_focal_ancestor_only_and_metadata_first(self):
+    def test_config_is_bounded_conversation_metadata_first(self):
         config, raw = context_x.build_context_config(
             handle="alice",
             post_id="123",
@@ -451,9 +451,13 @@ class ResolverConfigTests(unittest.TestCase):
         )
         twitter = config["extractor"]["twitter"]
         self.assertNotIn("timeline", twitter)
-        self.assertEqual(twitter["tweet-endpoint"], "rest")
-        self.assertEqual(twitter["post-filter"], "tweet_id == 123")
-        for key in ("conversations", "expand", "showreplies", "quoted", "pinned"):
+        self.assertEqual(twitter["tweet-endpoint"], "detail")
+        self.assertTrue(twitter["conversations"])
+        self.assertNotIn("post-filter", twitter)
+        self.assertEqual(twitter["archive-conversation-pages"], 1)
+        self.assertEqual(twitter["sleep-request"], "0")
+        self.assertEqual(twitter["sleep-extractor"], "0")
+        for key in ("expand", "showreplies", "quoted", "pinned"):
             self.assertFalse(twitter[key])
         self.assertEqual(
             twitter["directory"][3:6],
@@ -461,6 +465,21 @@ class ResolverConfigTests(unittest.TestCase):
         )
         self.assertEqual([p["event"] for p in twitter["postprocessors"]], ["post"])
         self.assertEqual(raw, Path("/work/current.posts.jsonl.partial"))
+
+    def test_media_config_remains_focal_only(self):
+        config, _raw = context_x.build_context_config(
+            handle="alice",
+            post_id="123",
+            archive_root=Path("/archive"),
+            user_dir=Path("/archive/users/alice"),
+            cookie_file=Path("/cookies/x.txt"),
+            work_dir=Path("/work"),
+            media=True,
+        )
+        twitter = config["extractor"]["twitter"]
+        self.assertEqual(twitter["tweet-endpoint"], "rest")
+        self.assertFalse(twitter["conversations"])
+        self.assertEqual(twitter["post-filter"], "tweet_id == 123")
 
     def test_fetch_rejects_non_focal_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -485,7 +504,38 @@ class ResolverConfigTests(unittest.TestCase):
                         post_id="123",
                         cookie_file=Path("/cookies"),
                         media=False,
+                        conversation=False,
                     )
+
+    def test_fetch_accepts_bounded_multi_post_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, _ = make_archive(root)
+
+            def fake_run(command, log_path, _label):
+                self.assertEqual(command[command.index("--post-range") + 1], "1-200")
+                work = user_dir / "_state" / "context-work"
+                (work / "current.posts.jsonl.partial").write_text(
+                    json.dumps(post("123", reply_id="100")) + "\n"
+                    + json.dumps(post("100")) + "\n",
+                    encoding="utf-8",
+                )
+                log_path.write_text("ok\n", encoding="utf-8")
+                return 0, None, 0, False, [], 0, False, 0
+
+            with mock.patch.object(context_x.archive_x, "run_gallery_dl", fake_run):
+                result = context_x.fetch_post(
+                    repo_dir=REPO,
+                    archive_root=root,
+                    user_dir=user_dir,
+                    handle="alice",
+                    post_id="123",
+                    cookie_file=Path("/cookies"),
+                    media=False,
+                )
+
+        self.assertEqual(result.metadata["tweet_id"], 123)
+        self.assertEqual(len(result.records), 2)
 
 
 class SchedulerAndRecoveryTests(unittest.TestCase):
@@ -576,6 +626,99 @@ class SchedulerAndRecoveryTests(unittest.TestCase):
                     "SELECT state,media_state FROM targets WHERE post_id='100'"
                 ).fetchone()
                 self.assertEqual(tuple(row), ("captured", "pending"))
+
+    def test_conversation_capture_keeps_only_queued_targets_and_ancestors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with context_x.ContextDB(Path(directory) / "context.sqlite3") as database:
+                database.add_edge(
+                    "900", "500", conversation_id="100", depth=0,
+                    run_id="run", observed_at="now", max_depth=20,
+                )
+                database.add_edge(
+                    "800", "300", conversation_id="100", depth=0,
+                    run_id="run", observed_at="now", max_depth=20,
+                )
+                records = (
+                    post("500", author_id="2", reply_id="400", conversation_id="100"),
+                    post(
+                        "400", author_id="2", reply_id="100",
+                        conversation_id="100", count=1,
+                    ),
+                    post("100", author_id="2", conversation_id="100"),
+                    post("300", author_id="3", reply_id="100", conversation_id="100"),
+                    # Unqueued sibling and descendant are deliberately ignored.
+                    post("600", author_id="4", reply_id="100", conversation_id="100"),
+                    post("700", author_id="5", reply_id="500", conversation_id="100"),
+                    post("999", author_id="6", conversation_id="999"),
+                )
+
+                captured, continuation = database.capture_conversation_response(
+                    "500", records, target_user_id="1", max_depth=20
+                )
+                states = {
+                    row["post_id"]: row["state"]
+                    for row in database.connection.execute(
+                        "SELECT post_id,state FROM targets"
+                    )
+                }
+                media_state = database.connection.execute(
+                    "SELECT media_state FROM targets WHERE post_id='400'"
+                ).fetchone()[0]
+
+            self.assertEqual(captured, ["500", "400", "100", "300"])
+            self.assertIsNone(continuation)
+            self.assertEqual(states["500"], "captured")
+            self.assertEqual(states["400"], "captured")
+            self.assertEqual(states["100"], "captured")
+            self.assertEqual(states["300"], "captured")
+            self.assertNotIn("600", states)
+            self.assertNotIn("700", states)
+            self.assertNotIn("999", states)
+            self.assertEqual(media_state, "pending")
+
+    def test_conversation_capture_rolls_back_whole_response_on_edge_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with context_x.ContextDB(Path(directory) / "context.sqlite3") as database:
+                database.add_edge(
+                    "900", "500", conversation_id="100", depth=0,
+                    run_id="run", observed_at="now", max_depth=20,
+                )
+                database.add_edge(
+                    "800", "300", conversation_id="100", depth=0,
+                    run_id="run", observed_at="now", max_depth=20,
+                )
+                database.add_edge(
+                    "300", "200", conversation_id="100", depth=0,
+                    run_id="run", observed_at="now", max_depth=20,
+                )
+                records = (
+                    post("500", author_id="2", conversation_id="100"),
+                    post(
+                        "200", author_id="2", conversation_id="100",
+                    ),
+                    # Conflicts with the durable 300 -> 200 edge.
+                    post(
+                        "300", author_id="3", reply_id="100",
+                        conversation_id="100",
+                    ),
+                    post("100", author_id="4", conversation_id="100"),
+                )
+
+                with self.assertRaisesRegex(
+                    context_x.ContextError, "conflicting parents"
+                ):
+                    database.capture_conversation_response(
+                        "500", records, target_user_id="1", max_depth=20
+                    )
+                observations = database.connection.execute(
+                    "SELECT COUNT(*) FROM observations"
+                ).fetchone()[0]
+                focal_state = database.connection.execute(
+                    "SELECT state FROM targets WHERE post_id='500'"
+                ).fetchone()[0]
+
+            self.assertEqual(observations, 0)
+            self.assertEqual(focal_state, "pending")
 
     def test_media_completion_requires_asset_sidecar_and_matching_sha256(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -835,6 +978,39 @@ class WorkerAndDatasetTests(unittest.TestCase):
             self.assertEqual(counts["unavailable"], 1)
             self.assertEqual(tuple(row[:3]), ("unavailable", 1, "private"))
             self.assertIsNotNone(row["unavailable_at"])
+
+    def test_missing_focal_uses_one_paced_exact_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, db_path = make_archive(
+                root, [post("300", reply_id="200", conversation_id="100")]
+            )
+            context_x.seed_context(user_dir, db_path, dry_run=False, max_depth=10)
+            calls = []
+
+            def fetcher(**kwargs):
+                calls.append(kwargs["conversation"])
+                if kwargs["conversation"]:
+                    nearby = post("999", author_id="2", conversation_id="100")
+                    return context_x.FetchResult(
+                        0, None, "ok", False, [], None, (nearby,)
+                    )
+                return context_x.FetchResult(
+                    0,
+                    post("200", author_id="2", conversation_id="100"),
+                    "ok",
+                    False,
+                    [],
+                    None,
+                )
+
+            counts = context_x.run_worker(
+                **self.worker_args(root, user_dir, db_path, fetcher)
+            )
+
+            self.assertEqual(calls, [True, False])
+            self.assertEqual(counts["requests"], 2)
+            self.assertEqual(counts["captured"], 1)
 
     def test_worker_reconciles_saved_terminal_failures_without_a_request(self):
         with tempfile.TemporaryDirectory() as directory:
