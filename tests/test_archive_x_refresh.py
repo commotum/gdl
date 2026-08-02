@@ -561,6 +561,21 @@ class RefreshFallbackTests(unittest.TestCase):
         self.assertEqual(len(self.refreshes()), 1)
         self.assertNotIn(b"SECRET_PATH", self.db_path.read_bytes())
 
+    def test_runner_local_failure_restores_refresh_claim_and_stops_phase(self):
+        self.add_missing()
+
+        def failed_runner(**_kwargs):
+            raise context_x.ContextLocalExecutionError("worker failed locally")
+
+        with self.assertRaises(context_x.ContextLocalExecutionError):
+            self.run_worker(fetcher=failed_runner)
+
+        refresh = self.refreshes()[0]
+        self.assertEqual(refresh["state"], "pending")
+        self.assertEqual(refresh["attempts"], 0)
+        self.assertIsNone(refresh["lease_token"])
+        self.assertIsNone(refresh["last_error_class"])
+
     def test_unknown_legacy_destination_fails_without_request(self):
         with context_x.ContextDB(self.db_path, create=False) as database:
             database.connection.execute(

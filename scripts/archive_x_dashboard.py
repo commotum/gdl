@@ -16,6 +16,17 @@ from typing import Any
 import archive_x_progress as progress
 
 
+PHASE_SEQUENCE = (
+    "modern",
+    "legacy",
+    "shared_media",
+    "context_seed",
+    "context_metadata",
+    "context_media",
+    "context_export",
+)
+
+
 def clip(text: str, width: int, unicode: bool) -> str:
     if len(text) <= width:
         return text
@@ -55,7 +66,23 @@ def render_user(
     totals, delta = user["totals"], user["delta"]
     started = progress.parse_time(started_at) or now
     active_phase = str(user["phase"])
-    phase = active_phase.replace("_", " ").upper()
+    phase_name = active_phase.replace("_", " ")
+    phase_display = phase_name.capitalize()
+    phase_index = (
+        PHASE_SEQUENCE.index(active_phase) + 1
+        if active_phase in PHASE_SEQUENCE
+        else None
+    )
+    phases_after = (
+        len(PHASE_SEQUENCE) - phase_index
+        if phase_index is not None
+        else len(PHASE_SEQUENCE)
+    )
+    remaining_text = (
+        "final phase"
+        if phases_after == 0
+        else f"{phases_after} phase{'s' if phases_after != 1 else ''} remain"
+    )
     rate = user.get("rate")
     if rate and rate.get("coverage_days_per_hour") is not None:
         rate_text = (
@@ -79,9 +106,24 @@ def render_user(
         estimate_text = f"{estimate['label']} {destination}{separator}"
         estimate_text += f"{estimate['confidence']} confidence"
     else:
-        estimate_text = (
-            f"not shown{separator}{estimate.get('qualifier', 'unknown denominator')}"
-        )
+        qualifier = estimate.get("qualifier", "unknown denominator")
+        if active_phase == "modern":
+            qualifier = "X exposes no reliable timeline total"
+        elif active_phase == "shared_media":
+            qualifier = "no stable media-request denominator"
+        elif active_phase == "context_seed":
+            qualifier = "discovering the reply queue"
+        elif active_phase == "context_export":
+            qualifier = "local publication checkpoint"
+        elif active_phase == "starting":
+            qualifier = "phase not started"
+        pending = qualifier in {
+            "collecting samples",
+            "discovering the reply queue",
+            "phase not started",
+        } or "sampled" in qualifier
+        estimate_text = f"{'pending' if pending else 'unavailable'}{separator}{qualifier}"
+    estimate_text += f"{separator}{remaining_text}"
     actions = int(user.get("action_required") or 0)
     health = user["health"]
     if actions:
@@ -99,14 +141,20 @@ def render_user(
     now_text = wait_label(user.get("wait_until"), now) or (
         f"progress {age(user.get('last_progress_at'), now)}"
     )
-    batch_text = (
-        f"{separator}{batch_position[0]}/{batch_position[1]}"
-        if batch_position is not None
-        else ""
+    account_text = (
+        f"Account {batch_position[0]}/{batch_position[1]}{separator}"
+        if batch_position is not None else ""
+    )
+    phase_text = (
+        f"Phase {phase_index}/{len(PHASE_SEQUENCE)}: {phase_display}"
+        if phase_index is not None else "Preparing"
+    )
+    header_tail = estimate.get("label") or (
+        f"{progress.human_duration(now - started)} elapsed"
     )
     lines = [
-        f"@{user['handle']}  {phase}{separator}{health}"
-        f"{separator}{progress.human_duration(now - started)}{batch_text}",
+        f"@{user['handle']}  {account_text}{phase_text}{separator}{health}"
+        f"{separator}{header_tail}",
         f"Timeline   {progress.human_number(totals['archive_posts'])} posts"
         f"{separator}{progress.human_number(totals['archive_media_files'])} media"
         f"{separator}{progress.human_bytes(totals['archive_media_bytes'])}",
@@ -118,7 +166,7 @@ def render_user(
         f"This run   +{progress.human_number(max(0, delta['context_parents_saved']))} parents"
         f"{separator}+{progress.human_number(max(0, delta['context_unavailable']))} boundaries"
         f"{separator}{rate_text}",
-        f"Estimate   {estimate_text}",
+        f"Phase ETA  {estimate_text}",
         f"Now        {user['activity']}{separator}{now_text}",
     ]
     legacy = user.get("legacy")
@@ -151,11 +199,22 @@ def render_user(
             f"{separator}+{progress.human_number(max(0, delta['context_media_manual_review']))} review"
             f"{separator}{rate_text}"
         )
+    elif active_phase == "context_metadata":
+        lines[3] = (
+            f"Queue      {progress.human_number(totals['context_known_remaining'])} remaining"
+            f"{separator}{progress.human_number(totals.get('context_retryable', 0))} retryable"
+            f"{separator}{progress.human_number(totals['conversations_closed'])} conversations closed"
+        )
+        lines[4] = (
+            f"This phase +{progress.human_number(max(0, delta['context_parents_saved']))} parents"
+            f"{separator}+{progress.human_number(max(0, delta['context_unavailable']))} boundaries"
+            f"{separator}{rate_text}"
+        )
     durable_generation = int(totals.get("archive_durable_generation") or 0)
     exported_generation = int(totals.get("archive_exported_generation") or 0)
     dirty_views = int(totals.get("archive_dirty_views") or 0)
-    if durable_generation != exported_generation or dirty_views:
-        lines[5] = (
+    if active_phase == "context_export":
+        lines[3] = (
             f"Export     durable {progress.human_number(durable_generation)}"
             f"{separator}published {progress.human_number(exported_generation)}"
             f"{separator}{progress.human_number(dirty_views)} views pending"
@@ -203,7 +262,12 @@ def render(
     users = []
     for source in snapshot["users"]:
         user = dict(source)
-        if stale and user.get("health") not in {"failed", "blocked"}:
+        if (
+            snapshot.get("status") == "interrupted"
+            and user.get("health") not in {"failed", "blocked"}
+        ):
+            user["health"] = "interrupted"
+        elif stale and user.get("health") not in {"failed", "blocked"}:
             user["health"] = "stale"
             user["activity"] = "no telemetry update"
         users.append(user)
@@ -215,7 +279,7 @@ def render(
         render_user(
             user, started_at=snapshot["started_at"], width=max(40, width),
             now=current, unicode=unicode,
-            batch_position=(index, len(users)) if active_only and len(users) > 1 else None,
+            batch_position=(index, len(users)) if active_only else None,
         )
         for index, user in indexed_users
     ]

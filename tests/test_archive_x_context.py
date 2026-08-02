@@ -513,6 +513,40 @@ class ResolverConfigTests(unittest.TestCase):
                         conversation=False,
                     )
 
+    def test_fetch_fails_locally_when_runner_makes_zero_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, _ = make_archive(root)
+
+            def fake_run(_command, log_path, _label, **_kwargs):
+                log_path.write_text(
+                    "command: runner --http-timeout 60\n",
+                    encoding="utf-8",
+                )
+                return 1, None, 0, False, [], 0, False, 0
+
+            with mock.patch.object(
+                context_x.archive_x, "run_gallery_dl", fake_run
+            ), mock.patch.object(
+                context_x.archive_x,
+                "request_telemetry_summary",
+                return_value=({"actual_requests": 0}, None),
+            ):
+                with self.assertRaisesRegex(
+                    context_x.ContextLocalExecutionError,
+                    "before making an external request",
+                ):
+                    context_x.fetch_post(
+                        repo_dir=REPO,
+                        archive_root=root,
+                        user_dir=user_dir,
+                        handle="alice",
+                        post_id="123",
+                        cookie_file=Path("/cookies"),
+                        media=False,
+                        conversation=False,
+                    )
+
     def test_fetch_accepts_bounded_multi_post_response(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -805,6 +839,15 @@ class PacingAndFailureTests(unittest.TestCase):
             with self.subTest(log=log):
                 self.assertEqual(context_x.classify_failure(self.result(log)), expected)
 
+    def test_saved_command_options_are_not_failure_evidence(self):
+        result = self.result(
+            "command: runner --http-timeout 60 --sleep-429 0\n"
+        )
+        self.assertEqual(
+            context_x.classify_failure(result),
+            ("unknown", False, False),
+        )
+
     def test_pacing_not_before_survives_reopen_and_rate_reset(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "context.sqlite3"
@@ -1039,7 +1082,29 @@ class WorkerAndDatasetTests(unittest.TestCase):
                     "SELECT state,lease_started_at,last_error_class "
                     "FROM targets WHERE post_id='200'"
                 ).fetchone()
-            self.assertEqual(tuple(row), ("retryable", None, "interrupted"))
+            self.assertEqual(tuple(row), ("pending", None, None))
+
+    def test_local_lookup_failure_restores_unspent_claim_and_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, db_path = make_archive(
+                root, [post("300", reply_id="200")]
+            )
+            context_x.seed_context(user_dir, db_path, dry_run=False, max_depth=10)
+
+            def local_failure(**_kwargs):
+                raise context_x.ContextLocalExecutionError("worker failed locally")
+
+            with self.assertRaises(context_x.ContextLocalExecutionError):
+                context_x.run_worker(
+                    **self.worker_args(root, user_dir, db_path, local_failure)
+                )
+            with context_x.ContextDB(db_path, create=False) as database:
+                row = database.connection.execute(
+                    "SELECT state,attempts,lease_token,last_error_class "
+                    "FROM targets WHERE post_id='200'"
+                ).fetchone()
+            self.assertEqual(tuple(row), ("pending", 0, None, None))
 
     def test_persistent_runner_reuses_actual_lane_without_logical_sleep(self):
         with tempfile.TemporaryDirectory() as directory:

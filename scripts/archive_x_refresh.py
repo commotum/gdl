@@ -263,14 +263,11 @@ def run_descriptor_refresh_worker(
                 counts[state] += 1
                 continue
             except archive_x.ArchiveError:
-                database.descriptor_refresh_failed(
-                    refresh_id=refresh_id,
-                    lease_token=lease_token,
-                    state="manual_review",
-                    error_class="refresh_execution_error",
+                database.release_descriptor_refresh_claim(
+                    refresh,
+                    lease_token,
                 )
-                counts["manual_review"] += 1
-                continue
+                raise
 
             if not actual_boundary_pacing:
                 context_x.persist_rate_reset(database, result.rate_reset)

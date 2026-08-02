@@ -1461,6 +1461,17 @@ def run_gallery_dl(
                     argv=command[2:],
                     output=controlled_output,
                 )
+                local_error = getattr(result, "error_class", None)
+                if local_error is not None:
+                    message = (
+                        "[archive-x][error] Controlled gallery runner failed "
+                        f"locally ({local_error}).\n"
+                    )
+                    controlled_output(message)
+                    raise ArchiveError(
+                        "controlled gallery runner failed locally "
+                        f"({local_error})"
+                    )
                 status = int(result.status)
             except KeyboardInterrupt:
                 interrupted = True

@@ -8,6 +8,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import re
 import select
 import signal
@@ -281,6 +282,7 @@ def worker_loop(
     input_stream: TextIO = sys.stdin,
     protocol_output: TextIO = sys.stdout,
     gallery_output: TextIO = sys.stderr,
+    gallery_input: TextIO | None = None,
     clock: Callable[[], float] = time.monotonic,
     session_pool_factory: Callable[[], AccountSessionPool] = AccountSessionPool,
 ) -> int:
@@ -296,112 +298,127 @@ def worker_loop(
             "max_age_ms": round(options.max_age_seconds * 1000),
         },
     )
-    with session_pool_factory():
-        for line in input_stream:
-            try:
-                command = _parse_command(line, options)
-            except ControlProtocolError as exc:
+    with contextlib.ExitStack() as resources:
+        if gallery_input is None:
+            gallery_input = resources.enter_context(
+                open(os.devnull, "r", encoding="utf-8")
+            )
+        with session_pool_factory():
+            for line in input_stream:
+                try:
+                    command = _parse_command(line, options)
+                except ControlProtocolError as exc:
+                    _write_message(
+                        protocol_output,
+                        {
+                            "type": "protocol_error",
+                            "protocol": PROTOCOL_VERSION,
+                            "error_class": _safe_error_name(exc),
+                        },
+                    )
+                    return 32
+                if command["type"] == "shutdown":
+                    _write_message(
+                        protocol_output,
+                        {"type": "stopped", "protocol": PROTOCOL_VERSION},
+                    )
+                    return 0
+
+                item_index = completed + 1
+                runner_starts = 1 if item_index == 1 else 0
                 _write_message(
                     protocol_output,
                     {
-                        "type": "protocol_error",
+                        "type": "begin",
                         "protocol": PROTOCOL_VERSION,
-                        "error_class": _safe_error_name(exc),
+                        "item_id": command["item_id"],
+                        "lease_token": command["lease_token"],
+                        "item_index": item_index,
+                        "runner_starts": runner_starts,
                     },
                 )
-                return 32
-            if command["type"] == "shutdown":
+                status = 1
+                error_class = None
+                forced_retire = None
+                state = GalleryItemState()
+                original_stdin = sys.stdin
+                try:
+                    # gallery-dl reconfigures stdin during every main() call.
+                    # The worker's real stdin is the already-read control
+                    # protocol and must never be handed to gallery-dl.
+                    sys.stdin = gallery_input
+                    with contextlib.redirect_stdout(
+                        gallery_output
+                    ), contextlib.redirect_stderr(gallery_output):
+                        status = int(
+                            execute(
+                                command["argv"], runner_starts=runner_starts
+                            )
+                            or 0
+                        )
+                except KeyboardInterrupt:
+                    status = 130
+                    error_class = "KeyboardInterrupt"
+                    forced_retire = "interrupted"
+                except SystemExit as exc:
+                    status = int(exc.code) if isinstance(exc.code, int) else 1
+                    error_class = "SystemExit"
+                    if status != 0:
+                        forced_retire = "worker_error"
+                except BaseException as exc:
+                    status = 1
+                    error_class = _safe_error_name(exc)
+                    forced_retire = "worker_error"
+                finally:
+                    sys.stdin = original_stdin
+                    try:
+                        gallery_output.flush()
+                    finally:
+                        state.reset()
+                # Start the barrier on a fresh line even if a renderer left a
+                # carriage-return progress update or unterminated fragment.
+                gallery_output.write(
+                    "\n"
+                    + OUTPUT_BARRIER_PREFIX
+                    + command["item_id"]
+                    + ":"
+                    + command["lease_token"]
+                    + "\n"
+                )
+                gallery_output.flush()
+
+                completed += 1
+                age_ms = max(0, round((clock() - started) * 1000))
+                if forced_retire is not None:
+                    retire_reason = forced_retire
+                elif completed >= options.max_items:
+                    retire_reason = "item_cap"
+                elif age_ms >= round(options.max_age_seconds * 1000):
+                    retire_reason = "age_cap"
+                else:
+                    retire_reason = None
                 _write_message(
                     protocol_output,
-                    {"type": "stopped", "protocol": PROTOCOL_VERSION},
+                    {
+                        "type": "result",
+                        "protocol": PROTOCOL_VERSION,
+                        "item_id": command["item_id"],
+                        "lease_token": command["lease_token"],
+                        "status": status,
+                        "item_index": item_index,
+                        "runner_starts": runner_starts,
+                        "session_age_ms": age_ms,
+                        "retire": retire_reason is not None,
+                        "retire_reason": retire_reason,
+                        "error_class": error_class,
+                    },
                 )
-                return 0
-
-            item_index = completed + 1
-            runner_starts = 1 if item_index == 1 else 0
-            _write_message(
-                protocol_output,
-                {
-                    "type": "begin",
-                    "protocol": PROTOCOL_VERSION,
-                    "item_id": command["item_id"],
-                    "lease_token": command["lease_token"],
-                    "item_index": item_index,
-                    "runner_starts": runner_starts,
-                },
-            )
-            status = 1
-            error_class = None
-            forced_retire = None
-            state = GalleryItemState()
-            try:
-                with contextlib.redirect_stdout(gallery_output), contextlib.redirect_stderr(
-                    gallery_output
-                ):
-                    status = int(
-                        execute(
-                            command["argv"], runner_starts=runner_starts
-                        )
-                        or 0
+                if retire_reason is not None:
+                    return (
+                        status
+                        if retire_reason in {"interrupted", "worker_error"}
+                        else 0
                     )
-            except KeyboardInterrupt:
-                status = 130
-                error_class = "KeyboardInterrupt"
-                forced_retire = "interrupted"
-            except SystemExit as exc:
-                status = int(exc.code) if isinstance(exc.code, int) else 1
-                error_class = "SystemExit"
-                if status != 0:
-                    forced_retire = "worker_error"
-            except BaseException as exc:
-                status = 1
-                error_class = _safe_error_name(exc)
-                forced_retire = "worker_error"
-            finally:
-                try:
-                    gallery_output.flush()
-                finally:
-                    state.reset()
-            # Start the barrier on a fresh line even if a renderer left a
-            # carriage-return progress update or unterminated fragment.
-            gallery_output.write(
-                "\n"
-                + OUTPUT_BARRIER_PREFIX
-                + command["item_id"]
-                + ":"
-                + command["lease_token"]
-                + "\n"
-            )
-            gallery_output.flush()
-
-            completed += 1
-            age_ms = max(0, round((clock() - started) * 1000))
-            if forced_retire is not None:
-                retire_reason = forced_retire
-            elif completed >= options.max_items:
-                retire_reason = "item_cap"
-            elif age_ms >= round(options.max_age_seconds * 1000):
-                retire_reason = "age_cap"
-            else:
-                retire_reason = None
-            _write_message(
-                protocol_output,
-                {
-                    "type": "result",
-                    "protocol": PROTOCOL_VERSION,
-                    "item_id": command["item_id"],
-                    "lease_token": command["lease_token"],
-                    "status": status,
-                    "item_index": item_index,
-                    "runner_starts": runner_starts,
-                    "session_age_ms": age_ms,
-                    "retire": retire_reason is not None,
-                    "retire_reason": retire_reason,
-                    "error_class": error_class,
-                },
-            )
-            if retire_reason is not None:
-                return status if retire_reason in {"interrupted", "worker_error"} else 0
     return 0
 
 
@@ -528,6 +545,11 @@ class RunnerControlClient:
             with self._callback_lock:
                 callback = self._output_callback
                 expected = self._expected_output_barrier
+            if expected is not None and not line.strip():
+                # worker_loop starts its private barrier on a fresh line.
+                # Do not surface that protocol separator as a blank archive
+                # event such as "[context:ID]".
+                continue
             if expected is not None and line.rstrip("\n") == expected:
                 self._output_barrier.set()
                 continue

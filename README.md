@@ -69,6 +69,10 @@ The default is deliberately restrained and fail-closed:
 - repeated context and legacy items reuse an account-scoped worker/session for
   at most 100 items or 15 minutes, then retire cleanly; workers remain
   sequential and never rotate cookies, identity, headers, or proxies;
+- the worker's control channel is isolated from gallery-dl's noninteractive
+  stdin; a local worker exception or a completed lookup with zero external
+  requests restores the unspent queue claim and stops the phase instead of
+  consuming retries or masquerading as a network timeout;
 - X rate-limit reset headers are respected, account-lock errors abort, and
   retries are bounded;
 - successful responses received at the end of an X quota window are processed
@@ -286,7 +290,9 @@ never reported as full completion.
 
 The ordinary command now maintains a private atomic progress snapshot with
 lifetime totals, this-run gains, active phase, health, known remaining context
-work, rolling throughput, and a confidence-labeled phase-local estimate:
+work, rolling throughput, and a confidence-labeled phase-local estimate. The
+live header identifies both units of progress, for example `Account 1/68 ·
+Phase 5/7: Context metadata · healthy · ~14h`:
 
 ```bash
 uv run scripts/archive-x --user USERNAME
@@ -309,13 +315,22 @@ scripts/archive-x-dashboard --archive-root /mnt/Bibliotheque/gdl/x-archive
 scripts/archive-x-dashboard --archive-root /mnt/Bibliotheque/gdl/x-archive --watch
 ```
 
-`known remaining` is the currently discovered actionable context queue, not a
-promise that discovery is finished. ETA is deliberately omitted while the
-queue grows, before enough completed-item or legacy-window evidence exists, or
-when work is blocked. The media phase has its own remaining count and ETA; it
-does not reuse a metadata estimate that has already reached zero. Deleted,
-protected, and suspended parents count as neutral unavailable boundaries;
-manual review and authentication/integrity failures remain actionable.
+The timeline and context rows are the stable account scorecard. Queue, this
+phase, phase ETA, and now are specific to the active phase; expected dirty
+portable-export state is shown only during the final export phase. `known
+remaining` is the currently discovered actionable context queue, not a promise
+that discovery is finished.
+
+The displayed ETA is for the current phase, not the whole account or input
+file. It appears after at least five minutes and 20 successful resolutions,
+once the known queue has begun shrinking. Before that the dashboard says what
+evidence is missing; after five minutes with zero successes it explicitly says
+`no successful resolutions yet` and shows the retryable count rather than
+remaining at `collecting samples`. Legacy estimates end at account creation,
+metadata estimates end at the known parent queue, and media estimates end at
+the media queue. Modern X pagination has no reliable total. Deleted, protected,
+and suspended parents count as neutral unavailable boundaries; manual review
+and authentication/integrity failures remain actionable.
 
 ### X archive contents
 

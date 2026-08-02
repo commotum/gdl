@@ -315,6 +315,34 @@ class ControlledRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(runner.calls[0]["lease_token"], "a" * 32)
         self.assertRegex(runner.calls[0]["item_id"], r"^[0-9a-f]{32}$")
 
+    def test_local_worker_exception_fails_closed_instead_of_becoming_status_one(self):
+        class Result:
+            status = 1
+            error_class = "UnsupportedOperation"
+
+        class Runner:
+            def run(self, **_kwargs):
+                return Result()
+
+            def signal_interrupt(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "controlled.log"
+            with self.assertRaisesRegex(
+                archive_x.ArchiveError,
+                "failed locally.*UnsupportedOperation",
+            ):
+                archive_x.run_gallery_dl(
+                    [sys.executable, "/runner.py", "--no-download"],
+                    log_path,
+                    "controlled",
+                    runner=Runner(),
+                )
+            saved = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("failed locally (UnsupportedOperation)", saved)
+
 
 class DatasetTests(unittest.TestCase):
     def test_normalizes_metrics_date_and_repost_authorship(self):

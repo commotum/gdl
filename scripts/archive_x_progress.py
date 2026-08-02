@@ -61,7 +61,8 @@ ALLOWED_TOTALS = {
     "archive_durable_generation", "archive_exported_generation",
     "archive_dirty_views",
     "context_captured", "context_parents_saved", "context_unavailable",
-    "context_manual_review", "context_known_remaining",
+    "context_manual_review", "context_known_remaining", "context_pending",
+    "context_leased", "context_retryable",
     "context_media_remaining", "context_media_actionable",
     "context_media_captured", "context_media_unavailable",
     "context_media_manual_review", "conversations_closed",
@@ -297,6 +298,9 @@ def _context_fast_metrics(connection: sqlite3.Connection) -> dict[str, int]:
         "context_parents_saved": parents,
         "context_unavailable": unavailable,
         "context_manual_review": states.get("manual_review", 0),
+        "context_pending": states.get("pending", 0),
+        "context_leased": states.get("leased", 0),
+        "context_retryable": states.get("retryable", 0),
         "context_known_remaining": sum(
             states.get(name, 0) for name in ("pending", "leased", "retryable")
         ),
@@ -892,6 +896,8 @@ def derive_health(
 ) -> str:
     if status == "failed" or phase_status == "failed":
         return "failed"
+    if status == "interrupted":
+        return "interrupted"
     if phase_status in {"manual_review", "blocked"}:
         return "blocked"
     if phase_status in {"retrying", "retryable"}:
@@ -925,7 +931,7 @@ def estimate_known_queue(
     # Five minutes plus 20 completed targets is enough for a deliberately
     # low-confidence first estimate. Confidence rises with observation time.
     required_resolved = min(20, max(2, known_remaining))
-    if elapsed < 300 or resolved < required_resolved:
+    if elapsed < 300:
         if blocked:
             estimate["qualifier"] = "phase blocked"
         return estimate, None
@@ -934,6 +940,18 @@ def estimate_known_queue(
         "items_per_hour": round(gross_rate, 1),
         "window_seconds": int(elapsed),
     }
+    if resolved <= 0:
+        estimate["qualifier"] = (
+            "phase blocked" if blocked else "no successful resolutions yet"
+        )
+        return estimate, rate
+    if resolved < required_resolved:
+        estimate["qualifier"] = (
+            "phase blocked"
+            if blocked
+            else f"{resolved}/{required_resolved} resolutions sampled"
+        )
+        return estimate, rate
     if blocked:
         estimate["qualifier"] = "phase blocked"
         return estimate, rate
@@ -1181,6 +1199,8 @@ class LiveProgressReader:
         samples[:] = [item for item in samples if item["at"] >= cutoff][-2881:]
 
         phase_status = str(source["phases"].get(phase, "running"))
+        if str(source.get("activity") or "").startswith("retryable "):
+            phase_status = "retrying"
         last_progress = source.get("last_progress_at")
         if (
             parse_time(context_activity) is not None

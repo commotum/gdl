@@ -296,6 +296,34 @@ class ControlClientTests(unittest.TestCase):
             client.close()
         self.assertGreaterEqual("".join(output).count("1.32.4"), 3)
 
+    def test_real_worker_keeps_gallery_dl_off_control_stdin(self):
+        """A real main() call used to fail before extraction in ~2 ms."""
+        client = control_x.RunnerControlClient(
+            [sys.executable, str(SCRIPTS / "gallery_dl_x_runner.py")],
+            control_x.WorkerOptions(self.scope, 2, 60),
+        )
+        output = []
+        arguments = ["--config-ignore", "--no-input", "--no-colors", "noop"]
+        try:
+            first = client.run(
+                item_id="a" * 32,
+                lease_token="b" * 32,
+                argv=arguments,
+                output=output.append,
+            )
+            second = client.run(
+                item_id="c" * 32,
+                lease_token="d" * 32,
+                argv=arguments,
+                output=output.append,
+            )
+        finally:
+            client.close()
+
+        self.assertEqual((first.status, first.error_class), (0, None))
+        self.assertEqual((second.status, second.error_class), (0, None))
+        self.assertEqual(output, [])
+
     def test_real_legacy_runner_supports_same_control_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -73,6 +73,8 @@ class ProgressSignalsTests(unittest.TestCase):
         self.assertEqual(result["context_captured"], 2)
         self.assertEqual(result["context_parents_saved"], 1)
         self.assertEqual(result["context_unavailable"], 3)
+        self.assertEqual(result["context_pending"], 1)
+        self.assertEqual(result["context_retryable"], 1)
         self.assertEqual(result["context_known_remaining"], 2)
         self.assertEqual(result["context_manual_review"], 1)
         self.assertEqual(result["context_media_actionable"], 2)
@@ -198,6 +200,15 @@ class ProgressSignalsTests(unittest.TestCase):
         self.assertEqual(preliminary["seconds"], 2700)
         self.assertEqual(preliminary["confidence"], "low")
         self.assertEqual(preliminary_rate["items_per_hour"], 240)
+        no_success, no_success_rate = progress.estimate_known_queue([
+            {"at": 0, "known_remaining": 100, "resolved": 10},
+            {"at": 600, "known_remaining": 100, "resolved": 10},
+        ], 100)
+        self.assertIsNone(no_success["seconds"])
+        self.assertEqual(
+            no_success["qualifier"], "no successful resolutions yet"
+        )
+        self.assertEqual(no_success_rate["items_per_hour"], 0)
         blocked, _ = progress.estimate_known_queue([], 10, blocked=True)
         self.assertEqual(blocked["qualifier"], "phase blocked")
         blocked_with_rate, blocked_rate = progress.estimate_known_queue([
@@ -522,7 +533,8 @@ class ProgressSignalsTests(unittest.TestCase):
         self.assertEqual(len(output.splitlines()), 7)
         self.assertTrue(all(len(line) <= 80 for line in output.splitlines()))
         self.assertNotIn("\033", output)
-        self.assertIn("117,936 known remaining", output)
+        self.assertIn("Phase 5/7: Context metadata", output)
+        self.assertIn("117,936 remaining", output)
 
         user["totals"].update(
             {
@@ -537,7 +549,64 @@ class ProgressSignalsTests(unittest.TestCase):
             "updated_at": "2026-01-01T01:00:00Z", "status": "running",
             "users": [user],
         }, width=80, now=1767229200, unicode=False)
-        self.assertIn("Export     durable 12 | published 9 | 2 views pending", dirty_output)
+        estimate_line = next(
+            line for line in dirty_output.splitlines()
+            if line.startswith("Phase ETA")
+        )
+        self.assertIn("~16d for known queue | low confidence", estimate_line)
+        self.assertNotIn("export", dirty_output.lower())
+
+        user["phase"] = "context_export"
+        user["phases"] = {"context_export": "running"}
+        export_output = dashboard.render({
+            "schema": progress.SCHEMA, "schema_version": 1,
+            "invocation_id": "run", "started_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T01:00:00Z", "status": "running",
+            "users": [user],
+        }, width=100, now=1767229200, unicode=False)
+        self.assertIn(
+            "Export     durable 12 | published 9 | 2 views pending",
+            export_output,
+        )
+        self.assertIn("Phase 7/7: Context export", export_output)
+
+    def test_metadata_card_explains_zero_success_instead_of_warming_forever(self):
+        totals = progress.empty_totals()
+        totals.update({
+            "archive_posts": 26479,
+            "context_known_remaining": 15522,
+            "context_retryable": 698,
+            "conversations_closed": 250,
+        })
+        estimate, rate = progress.estimate_known_queue([
+            {"at": 0, "known_remaining": 15522, "resolved": 1413},
+            {"at": 600, "known_remaining": 15522, "resolved": 1413},
+        ], 15522)
+        user = {
+            "handle": "daviddeutschoxf", "phase": "context_metadata",
+            "health": "retrying", "activity": "retryable 949336551007424512",
+            "last_progress_at": "1970-01-01T00:09:59Z", "wait_until": None,
+            "phases": {"context_metadata": "running"}, "totals": totals,
+            "baseline": progress.empty_totals(), "delta": progress.empty_totals(),
+            "samples": [], "rate": rate, "estimate": estimate,
+            "action_required": 0,
+        }
+        output = dashboard.render({
+            "schema": progress.SCHEMA, "schema_version": 1,
+            "invocation_id": "run", "started_at": "1970-01-01T00:00:00Z",
+            "updated_at": "1970-01-01T00:10:00Z", "status": "running",
+            "active_handle": "daviddeutschoxf", "users": [user],
+        }, width=100, now=600, unicode=False, active_only=True)
+
+        self.assertIn(
+            "Account 1/1 | Phase 5/7: Context metadata",
+            output.splitlines()[0],
+        )
+        self.assertIn("698 retryable", output)
+        self.assertIn(
+            "Phase ETA  unavailable | no successful resolutions yet | 2 phases remain",
+            output,
+        )
 
     def test_watch_renderer_shows_explicit_active_user_and_batch_position(self):
         def user(handle, phase, activity):
@@ -583,7 +652,8 @@ class ProgressSignalsTests(unittest.TestCase):
 
         self.assertEqual(len(output.splitlines()), 7)
         self.assertIn("@bob", output)
-        self.assertIn("| 2/3", output.splitlines()[0])
+        self.assertIn("Account 2/3", output.splitlines()[0])
+        self.assertIn("Phase 2/7: Legacy", output.splitlines()[0])
         self.assertNotIn("@alice", output)
         self.assertNotIn("@charlie", output)
 
@@ -638,7 +708,8 @@ class ProgressSignalsTests(unittest.TestCase):
         }, width=100, now=1767229200, unicode=False, active_only=True)
 
         self.assertIn("@daviddeutschoxf", output)
-        self.assertIn("| 1/2", output.splitlines()[0])
+        self.assertIn("Account 1/2", output.splitlines()[0])
+        self.assertIn("Phase 1/7: Modern", output.splitlines()[0])
         self.assertNotIn("@schmidhuberai", output)
 
     def test_tmux_adapter_is_optional_and_uses_argument_vectors(self):

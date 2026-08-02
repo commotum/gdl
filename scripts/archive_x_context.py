@@ -223,6 +223,10 @@ class ContextAuthenticationError(ContextError):
     """A credential/account failure that must stop all network workers."""
 
 
+class ContextLocalExecutionError(ContextError):
+    """A lookup failed locally before any external request was attempted."""
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -3734,6 +3738,36 @@ class ContextDB:
             claimed["attempts"] = int(row["attempts"]) + 1
             return claimed
 
+    def release_descriptor_refresh_claim(
+        self,
+        claimed: dict[str, Any],
+        lease_token: str,
+    ) -> None:
+        """Restore an unspent descriptor-refresh claim exactly."""
+        previous = str(claimed["state"])
+        if previous not in {"pending", "retryable"} or not lease_token:
+            raise ContextError("descriptor refresh claim origin is invalid")
+        with transaction(self.connection):
+            cursor = self.connection.execute(
+                """UPDATE descriptor_refresh_jobs SET state=?,lease_token=NULL,
+                       lease_started_at=NULL,next_attempt_at=?,
+                       attempts=MAX(0,attempts-1),last_error_class=?,
+                       last_error_detail=?,completed_at=?,updated_at=?
+                     WHERE refresh_id=? AND state='leased' AND lease_token=?""",
+                (
+                    previous,
+                    float(claimed["next_attempt_at"] or 0),
+                    claimed["last_error_class"],
+                    claimed["last_error_detail"],
+                    claimed["completed_at"],
+                    claimed["updated_at"],
+                    int(claimed["refresh_id"]),
+                    lease_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ContextError("descriptor refresh claim release is stale")
+
     def refresh_destination_scope(self, owner_id: str) -> str:
         rows = list(
             self.connection.execute(
@@ -4400,6 +4434,66 @@ class ContextDB:
                 self._set_meta("active_post_id", row["post_id"])
                 self._set_meta("active_steps", str(active_steps))
             return row
+
+    def release_claim(
+        self,
+        claimed: sqlite3.Row | dict[str, Any],
+        lease_token: str,
+        *,
+        media: bool = False,
+    ) -> None:
+        """Restore an unspent claim after a local execution failure."""
+        post_id = str(claimed["post_id"])
+        if not lease_token:
+            raise ContextError("context claim release token is invalid")
+        with transaction(self.connection):
+            if media:
+                previous = str(claimed["media_state"])
+                if previous not in {"pending", "retryable"}:
+                    raise ContextError("context media claim origin is invalid")
+                cursor = self.connection.execute(
+                    """UPDATE targets SET media_state=?,
+                           media_lease_started_at=NULL,media_lease_token=NULL,
+                           media_next_attempt_at=?,
+                           media_attempts=MAX(0,media_attempts-1),
+                           last_error_class=?,last_error_detail=?,updated_at=?
+                         WHERE post_id=? AND media_state='leased'
+                           AND media_lease_token=?""",
+                    (
+                        previous,
+                        float(claimed["media_next_attempt_at"] or 0),
+                        claimed["last_error_class"],
+                        claimed["last_error_detail"],
+                        claimed["updated_at"],
+                        post_id,
+                        lease_token,
+                    ),
+                )
+            else:
+                previous = str(claimed["state"])
+                if previous not in {"pending", "retryable"}:
+                    raise ContextError("context metadata claim origin is invalid")
+                cursor = self.connection.execute(
+                    """UPDATE targets SET state=?,lease_started_at=NULL,
+                           lease_token=NULL,next_attempt_at=?,
+                           attempts=MAX(0,attempts-1),last_error_class=?,
+                           last_error_detail=?,unavailable_at=?,updated_at=?
+                         WHERE post_id=? AND state='leased' AND lease_token=?""",
+                    (
+                        previous,
+                        float(claimed["next_attempt_at"] or 0),
+                        claimed["last_error_class"],
+                        claimed["last_error_detail"],
+                        claimed["unavailable_at"],
+                        claimed["updated_at"],
+                        post_id,
+                        lease_token,
+                    ),
+                )
+                self._set_meta("active_post_id", None)
+                self._set_meta("active_steps", "0")
+            if cursor.rowcount != 1:
+                raise ContextError("context claim release lease is stale")
 
     def work_availability(
         self, *, now: float, lease_seconds: float, media: bool = False
@@ -5285,6 +5379,18 @@ def fetch_post(
     request_summary, request_error = archive_x.request_telemetry_summary(
         request_path, request_operation
     )
+    if (
+        not interrupted
+        and isinstance(request_summary, dict)
+        and int(request_summary.get("actual_requests") or 0) == 0
+    ):
+        descriptor_x.finalize_artifact(
+            descriptor_partial,
+            complete=False,
+        )
+        raise ContextLocalExecutionError(
+            "context lookup exited before making an external request"
+        )
     descriptor_path = descriptor_x.finalize_artifact(
         descriptor_partial,
         complete=status == 0 and not interrupted,
@@ -5345,16 +5451,26 @@ def fetch_post(
 
 
 def classify_log(log: str) -> tuple[str, bool, bool]:
+    # The first line records the local argv for reproducibility.  Options such
+    # as '--http-timeout' are not failure evidence and must never influence
+    # network-error classification.
+    diagnostic = "\n".join(
+        line for line in log.splitlines()
+        if not line.startswith("command: ")
+    )
     for error_class, patterns in TERMINAL_PATTERNS.items():
-        if any(pattern.lower() in log.lower() for pattern in patterns):
+        if any(pattern.lower() in diagnostic.lower() for pattern in patterns):
             return error_class, True, False
-    if any(pattern.lower() in log.lower() for pattern in AUTH_PATTERNS):
+    if any(pattern.lower() in diagnostic.lower() for pattern in AUTH_PATTERNS):
         return "authentication", False, True
     if any(
-        pattern.lower() in log.lower() for pattern in AMBIGUOUS_RESPONSE_PATTERNS
+        pattern.lower() in diagnostic.lower()
+        for pattern in AMBIGUOUS_RESPONSE_PATTERNS
     ):
         return "ambiguous_response_shape", False, False
-    if any(pattern.lower() in log.lower() for pattern in TRANSIENT_PATTERNS):
+    if any(
+        pattern.lower() in diagnostic.lower() for pattern in TRANSIENT_PATTERNS
+    ):
         return "transient", False, False
     return "unknown", False, False
 
@@ -5703,26 +5819,25 @@ def run_worker(
                 add_request_telemetry(result)
                 descriptor_batches = list(result.descriptor_batches)
             except KeyboardInterrupt:
-                context.fail(
-                    post_id,
-                    error_class="interrupted",
-                    detail="operator interrupt",
-                    now=clock(),
-                    max_attempts=max_attempts,
-                    retry_delay=0,
+                context.release_claim(
+                    row,
+                    str(control_lease),
+                    media=media,
+                )
+                raise
+            except archive_x.ArchiveError:
+                context.release_claim(
+                    row,
+                    str(control_lease),
                     media=media,
                 )
                 raise
             if not actual_boundary_pacing:
                 persist_rate_reset(context, result.rate_reset)
             if result.interrupted:
-                context.fail(
-                    post_id,
-                    error_class="interrupted",
-                    detail=result.log,
-                    now=clock(),
-                    max_attempts=max_attempts,
-                    retry_delay=0,
+                context.release_claim(
+                    row,
+                    str(control_lease),
                     media=media,
                 )
                 raise KeyboardInterrupt
@@ -5758,25 +5873,23 @@ def run_worker(
                     add_request_telemetry(result)
                     descriptor_batches.extend(result.descriptor_batches)
                 except KeyboardInterrupt:
-                    context.fail(
-                        post_id,
-                        error_class="interrupted",
-                        detail="operator interrupt",
-                        now=clock(),
-                        max_attempts=max_attempts,
-                        retry_delay=0,
+                    context.release_claim(
+                        row,
+                        str(control_lease),
+                    )
+                    raise
+                except archive_x.ArchiveError:
+                    context.release_claim(
+                        row,
+                        str(control_lease),
                     )
                     raise
                 if not actual_boundary_pacing:
                     persist_rate_reset(context, result.rate_reset)
                 if result.interrupted:
-                    context.fail(
-                        post_id,
-                        error_class="interrupted",
-                        detail=result.log,
-                        now=clock(),
-                        max_attempts=max_attempts,
-                        retry_delay=0,
+                    context.release_claim(
+                        row,
+                        str(control_lease),
                     )
                     raise KeyboardInterrupt
             if result.metadata is not None:
