@@ -373,6 +373,116 @@ class AutomaticLegacyTransitionTests(unittest.TestCase):
             self.assertRegex(result["source_raw_sha256"], r"^[0-9a-f]{64}$")
             self.assertEqual(archive_x.sha256_file(state_path), before)
 
+    def test_one_clean_window_proves_an_exact_pre_snowflake_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, _state_path, _ = strict_transition_archive(Path(directory))
+            manifest_path = (
+                user_dir
+                / "runs"
+                / "20260720T023918Z-fixture"
+                / "manifest.json"
+            )
+            manifest = archive_x.load_json(manifest_path, {})
+            manifest["endpoints"][0]["stalled_rate_limit_cycles"] = 1
+            archive_x.atomic_write_json(manifest_path, manifest)
+
+            result = archive_x_legacy.classify_legacy_transition(user_dir)
+
+            self.assertEqual(result["decision"], "proven")
+            self.assertEqual(
+                result["reason"],
+                "exact_pre_snowflake_single_window_boundary",
+            )
+            self.assertEqual(result["confirmation_cycles"], 1)
+
+    def test_prior_matching_run_confirms_a_new_interrupted_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, _state_path, _ = strict_transition_archive(Path(directory))
+            prior_manifest_path = (
+                user_dir
+                / "runs"
+                / "20260720T023918Z-fixture"
+                / "manifest.json"
+            )
+            prior = archive_x.load_json(prior_manifest_path, {})
+            prior["endpoints"][0]["stalled_rate_limit_cycles"] = 1
+            archive_x.atomic_write_json(prior_manifest_path, prior)
+
+            latest_run_id = "20260721T023918Z-fixture"
+            latest_raw = (
+                user_dir
+                / "runs"
+                / latest_run_id
+                / "raw"
+                / "timeline.posts.incomplete.jsonl"
+            )
+            archive_x.atomic_write_jsonl(
+                latest_raw,
+                list(
+                    archive_x.iter_jsonl(
+                        user_dir / prior["endpoints"][0]["raw_path"]
+                    )
+                ),
+            )
+            latest = json.loads(json.dumps(prior))
+            latest.update(
+                run_id=latest_run_id,
+                started_at="2026-07-21T02:39:18Z",
+                completed_at="2026-07-22T01:04:43Z",
+                status="interrupted",
+                failure_stage=None,
+            )
+            latest["endpoints"][0].update(
+                status="interrupted",
+                interrupted=True,
+                stalled=False,
+                stalled_rate_limit_cycles=0,
+                raw_path=str(latest_raw.relative_to(user_dir)),
+            )
+            archive_x.atomic_write_json(
+                latest_raw.parents[1] / "manifest.json", latest
+            )
+
+            result = archive_x_legacy.classify_legacy_transition(user_dir)
+
+            self.assertEqual(result["decision"], "proven")
+            self.assertEqual(
+                result["reason"], "exact_pre_snowflake_historical_boundary"
+            )
+            self.assertEqual(result["source_run_id"], latest_run_id)
+            self.assertEqual(
+                result["confirmation_run_ids"],
+                ["20260720T023918Z-fixture"],
+            )
+
+    def test_transition_watchdog_is_short_only_for_verified_legacy_floor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, state_path, _ = strict_transition_archive(Path(directory))
+            state = archive_x.load_json(state_path, {})
+
+            legacy = archive_x_legacy.transition_watchdog_policy(
+                user_dir, state, ambiguous_cycles=3
+            )
+            self.assertEqual(legacy["cycles"], 1)
+            self.assertEqual(legacy["reason"], "verified_pre_snowflake_floor")
+
+            archive_x.atomic_write_jsonl(
+                user_dir / "dataset" / "posts.jsonl",
+                [
+                    {
+                        "post_id": "29116490825",
+                        "posted_at": "2010-11-05 00:00:00",
+                    }
+                ],
+            )
+            ambiguous = archive_x_legacy.transition_watchdog_policy(
+                user_dir, state, ambiguous_cycles=3
+            )
+            self.assertEqual(
+                ambiguous,
+                {"cycles": 3, "reason": "ambiguous_or_snowflake_boundary"},
+            )
+
     def test_weak_or_failed_boundaries_never_prove(self):
         mutations = {
             "generic stall": lambda manifest, raw: manifest.update(
@@ -397,8 +507,8 @@ class AutomaticLegacyTransitionTests(unittest.TestCase):
             "incremental cutoff": lambda manifest, raw: manifest.update(
                 date_after="2026-07-01T00:00:00Z"
             ),
-            "too few windows": lambda manifest, raw: manifest["endpoints"][0].update(
-                stalled_rate_limit_cycles=2
+            "no unchanged window": lambda manifest, raw: manifest["endpoints"][0].update(
+                stalled_rate_limit_cycles=0
             ),
             "identity mismatch": lambda manifest, raw: archive_x.atomic_write_jsonl(
                 raw,
@@ -472,6 +582,16 @@ class AutomaticLegacyTransitionTests(unittest.TestCase):
             self.assertFalse(repeated["modern_head_initialized"])
             self.assertEqual(repeated["state"], state)
 
+            with mock.patch.object(
+                archive_x_legacy,
+                "classify_legacy_transition",
+                side_effect=AssertionError("legacy detection repeated"),
+            ):
+                repeated = archive_x_legacy.automatic_initialize_legacy(
+                    user_dir, initialized_at="2026-07-22T14:00:00Z"
+                )
+            self.assertFalse(repeated["legacy_initialized"])
+
     def test_existing_modern_head_accepts_fractional_archive_timestamps(self):
         with tempfile.TemporaryDirectory() as directory:
             user_dir, state_path, _ = strict_transition_archive(Path(directory))
@@ -499,6 +619,34 @@ class AutomaticLegacyTransitionTests(unittest.TestCase):
                 repeated["state"]["modern_head"],
                 state["modern_head"],
             )
+
+    def test_initialized_transition_binds_confirmation_files_by_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_dir, _state_path, _ = strict_transition_archive(Path(directory))
+            initialized = archive_x_legacy.automatic_initialize_legacy(
+                user_dir,
+                initialized_at="2026-07-22T12:00:00Z",
+                expected_run_id="20260720T023918Z-fixture",
+            )
+            source = initialized["state"]["legacy_backfill"]["source"]
+            confirmation = source["transition_confirmations"][0]
+            manifest = archive_x.load_json(
+                user_dir
+                / "runs"
+                / confirmation["run_id"]
+                / "manifest.json",
+                {},
+            )
+            raw = user_dir / manifest["endpoints"][0]["raw_path"]
+            raw.write_text(raw.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                archive_x.ArchiveError,
+                "transition confirmation raw evidence changed",
+            ):
+                archive_x_legacy.automatic_initialize_legacy(
+                    user_dir, initialized_at="2026-07-22T13:00:00Z"
+                )
 
     def test_failed_state_write_leaves_prior_state_and_verified_backup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1051,6 +1199,7 @@ class LegacyOrchestrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             user_dir, state_path, original = initialized_fixture_archive(root)
+            progress_events = []
 
             def fake_walk(**kwargs):
                 return valid_walk(kwargs, count=1)
@@ -1061,7 +1210,8 @@ class LegacyOrchestrationTests(unittest.TestCase):
                 archive_x_legacy.archive_x, "sleep_random", return_value=0
             ):
                 result = archive_x_legacy.run_legacy_archive(
-                    legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                    legacy_run_args(root), REPO, root, "alice", "1.32.4",
+                    progress_callback=progress_events.append,
                 )
 
             state = archive_x.load_json(state_path, {})
@@ -1079,6 +1229,14 @@ class LegacyOrchestrationTests(unittest.TestCase):
             self.assertEqual(len(posts), 3)
             self.assertIn("29000000000", {item["post_id"] for item in posts})
             self.assertTrue(result["windows"][0]["state_committed"])
+            self.assertEqual(
+                [event["event"] for event in progress_events],
+                [
+                    "window_started", "walk_completed", "walk_completed",
+                    "window_committed",
+                ],
+            )
+            self.assertEqual(progress_events[-1]["dataset_posts"], 3)
 
     def test_mismatched_walks_enter_manual_review_without_advancing(self):
         with tempfile.TemporaryDirectory() as directory:

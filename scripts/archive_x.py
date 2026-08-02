@@ -1433,6 +1433,7 @@ def archive_endpoint(
     retries: int | None = None,
     http_timeout: int | None = None,
     include_reposts: bool | None = None,
+    stalled_rate_limit_cycles: int | None = None,
 ) -> dict[str, Any]:
     raw_partial = run_dir / "raw" / f"{endpoint}.posts.jsonl.partial"
     config_path = run_dir / f"{endpoint}.gallery-dl.json"
@@ -1476,6 +1477,11 @@ def archive_endpoint(
         url=url,
     )
     print(f"Archiving {handle}: {endpoint} ({url})")
+    effective_stalled_cycles = (
+        getattr(args, "stalled_rate_limit_cycles", 3)
+        if stalled_rate_limit_cycles is None
+        else stalled_rate_limit_cycles
+    )
     (
         status,
         resume_cursor,
@@ -1491,7 +1497,7 @@ def archive_endpoint(
         f"{handle}:{endpoint}",
         progress_path=raw_partial if endpoint == "timeline" else None,
         stalled_rate_limit_cycles=(
-            getattr(args, "stalled_rate_limit_cycles", 3)
+            effective_stalled_cycles
             if endpoint == "timeline"
             else 0
         ),
@@ -1549,6 +1555,9 @@ def archive_endpoint(
         "interrupted": interrupted,
         "stalled": stalled,
         "stalled_rate_limit_cycles": stalled_cycles,
+        "stalled_rate_limit_limit": (
+            effective_stalled_cycles if endpoint == "timeline" else 0
+        ),
         "synthetic_resume_cursor": synthetic_cursor,
         "metadata_complete": metadata_complete,
         "failed_downloads": failed_downloads,
@@ -2570,6 +2579,46 @@ def archive_user(
         user_dir, handle, info_raw, iso_utc(started)
     )
 
+    normal_transition_run = bool(
+        not args.retry_failed_only
+        and not timeline_post_limit
+        and args.since is None
+        and not args.full_rescan
+    )
+    resume_state = state.get("resume")
+    resume_cursor = (
+        str(resume_state.get("cursor") or "")
+        if isinstance(resume_state, dict)
+        else ""
+    )
+    if (
+        normal_transition_run
+        and not isinstance(state.get("legacy_backfill"), dict)
+        and resume_cursor.startswith("3_")
+    ):
+        legacy_module = importlib.import_module("archive_x_legacy")
+        classification = legacy_module.classify_legacy_transition(user_dir)
+        manifest["legacy_transition_preflight"] = classification
+        if classification.get("decision") == "proven":
+            prepared = legacy_module.automatic_initialize_legacy(
+                user_dir, initialized_at=legacy_module.second_utc(started)
+            )
+            state = prepared["state"]
+            modern_head_mode = True
+            cursor, chain_started_at, date_after = select_timeline_state(
+                args, state, started
+            )
+            manifest["resumed_from_cursor"] = cursor
+            manifest["date_after"] = iso_utc(date_after) if date_after else None
+            manifest["timeline_mode"] = "modern_head"
+            manifest["legacy_transition_preflight"]["status"] = "initialized"
+            print(
+                f"Initialized legacy handoff for @{handle} from "
+                f"{len(classification.get('confirmation_run_ids', ()))} "
+                "verified prior no-progress run(s)."
+            )
+        atomic_write_json(manifest_path, manifest)
+
     pending_before = prune_completed_pending_media(state, user_dir)
     due_before = pending_media_due(state, user_dir, now=started)
     retried_post_ids: list[str] = []
@@ -2671,6 +2720,15 @@ def archive_user(
         atomic_write_json(manifest_path, manifest)
         raise
 
+    legacy_module = importlib.import_module("archive_x_legacy")
+    transition_watchdog = legacy_module.transition_watchdog_policy(
+        user_dir,
+        state,
+        ambiguous_cycles=getattr(args, "stalled_rate_limit_cycles", 3),
+    )
+    manifest["timeline_stall_watchdog"] = transition_watchdog
+    atomic_write_json(manifest_path, manifest)
+
     timeline_result = archive_endpoint(
         args=args,
         repo_dir=repo_dir,
@@ -2683,6 +2741,7 @@ def archive_user(
         archived_at=iso_utc(started),
         date_after=date_after,
         cursor=cursor,
+        stalled_rate_limit_cycles=transition_watchdog["cycles"],
     )
     manifest["endpoints"].append(timeline_result)
     atomic_write_json(manifest_path, manifest)
@@ -2871,8 +2930,8 @@ def dry_run_summary(
     print(f"request delay: {args.request_delay}s")
     print(f"download delay: {args.download_delay}s")
     print(
-        "no-progress watchdog: stop after "
-        f"{args.stalled_rate_limit_cycles} unchanged rate-limit windows"
+        "no-progress watchdog: one unchanged window at a verified legacy-era "
+        f"floor; {args.stalled_rate_limit_cycles} for ambiguous boundaries"
     )
     print(f"between users: {args.user_delay}s")
     if args.post_limit:
@@ -2962,14 +3021,33 @@ def dry_run_summary(
                 f"account_floor={validated['floor_since']}"
             )
         else:
-            resume = state.get("resume")
-            if isinstance(resume, dict):
-                print("  modern: resume historical crawl (cursor redacted)")
-            elif state.get("last_successful_started_at"):
-                print("  modern: incremental update")
+            historical = (
+                legacy_module.classify_legacy_transition(user_dir)
+                if (
+                    not diagnostic_modern_only
+                    and not args.full_rescan
+                    and args.modern_max_posts is None
+                )
+                else {"decision": "not_applicable"}
+            )
+            if historical.get("decision") == "proven":
+                print("  modern: initialize legacy boundary, then update modern head")
+                print(
+                    "  legacy: initialize from "
+                    f"{len(historical.get('confirmation_run_ids', ()))} "
+                    "verified prior no-progress run(s), then backfill"
+                )
             else:
-                print("  modern: initial source-visible historical crawl")
-            print("  legacy: not initialized; strict transition evidence required")
+                resume = state.get("resume")
+                if isinstance(resume, dict):
+                    print("  modern: resume historical crawl (cursor redacted)")
+                elif state.get("last_successful_started_at"):
+                    print("  modern: incremental update")
+                else:
+                    print("  modern: initial source-visible historical crawl")
+                print(
+                    "  legacy: not initialized; strict transition evidence required"
+                )
             if args.modern_max_posts:
                 print("  legacy/context network: skipped; legacy is not initialized")
         print(
@@ -3083,8 +3161,9 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
         type=positive_int,
         default=3,
         help=(
-            "stop and checkpoint a timeline after this many consecutive "
-            "X rate-limit windows without new raw metadata (default: 3)"
+            "stop an ambiguous timeline after this many unchanged X "
+            "rate-limit windows; verified pre-Snowflake floors use one "
+            "window (default for ambiguous boundaries: 3)"
         ),
     )
     parser.add_argument(

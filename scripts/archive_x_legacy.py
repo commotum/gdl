@@ -14,7 +14,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import archive_x
@@ -179,6 +179,51 @@ def validate_source(source: Any, expected_user_id: str | None = None) -> None:
         )
     if not isinstance(source["reposts_included"], bool):
         raise archive_x.ArchiveError("legacy source repost policy is invalid")
+    confirmations = source.get("transition_confirmations", [])
+    if not isinstance(confirmations, list):
+        raise archive_x.ArchiveError(
+            "legacy source transition confirmations must be a list"
+        )
+    seen_runs: set[str] = set()
+    for confirmation in confirmations:
+        if not isinstance(confirmation, dict):
+            raise archive_x.ArchiveError(
+                "legacy source transition confirmation is invalid"
+            )
+        required_confirmation = {
+            "run_id",
+            "manifest_sha256",
+            "raw_sha256",
+            "cursor",
+            "stalled_rate_limit_cycles",
+        }
+        if not required_confirmation.issubset(confirmation):
+            raise archive_x.ArchiveError(
+                "legacy source transition confirmation is incomplete"
+            )
+        run_id = str(confirmation.get("run_id") or "")
+        if not run_id or Path(run_id).name != run_id or run_id in seen_runs:
+            raise archive_x.ArchiveError(
+                "legacy source transition confirmation run is invalid"
+            )
+        seen_runs.add(run_id)
+        require_sha256(
+            confirmation["manifest_sha256"],
+            "transition confirmation manifest hash",
+        )
+        require_sha256(
+            confirmation["raw_sha256"],
+            "transition confirmation raw hash",
+        )
+        if confirmation["cursor"] != source["cursor"]:
+            raise archive_x.ArchiveError(
+                "legacy source transition confirmation cursor changed"
+            )
+        cycles = confirmation["stalled_rate_limit_cycles"]
+        if not isinstance(cycles, int) or cycles < 1:
+            raise archive_x.ArchiveError(
+                "legacy source transition confirmation cycle count is invalid"
+            )
     if expected_user_id is not None and not expected_user_id.isdecimal():
         raise archive_x.ArchiveError("legacy expected numeric account ID is invalid")
 
@@ -289,6 +334,217 @@ def oldest_dataset_record(user_dir: Path) -> tuple[dict[str, Any], int]:
     return oldest, count
 
 
+def _matching_timeline(manifest: dict[str, Any], cursor: str) -> dict[str, Any] | None:
+    return next(
+        (
+            item
+            for item in manifest.get("endpoints", ())
+            if isinstance(item, dict)
+            and item.get("endpoint") == "timeline"
+            and item.get("resume_cursor") == cursor
+        ),
+        None,
+    )
+
+
+def _transition_run_evidence(
+    user_dir: Path,
+    manifest_path: Path,
+    *,
+    cursor: str,
+    oldest_post_id: str,
+    oldest_post_at: str,
+    requested_user_id: str,
+    require_unchanged_window: bool,
+) -> dict[str, Any] | None:
+    """Return immutable evidence for one clean run at an exact boundary."""
+    manifest = archive_x.load_json(manifest_path, None)
+    if not isinstance(manifest, dict):
+        return None
+    manifest_status = manifest.get("status")
+    if manifest_status not in {"stalled", "interrupted"}:
+        return None
+    if (
+        manifest.get("limited_run") is not False
+        or manifest.get("retry_failed_only") is not False
+        or manifest.get("date_after") not in {None, ""}
+    ):
+        return None
+    if (
+        manifest_status == "stalled"
+        and manifest.get("failure_stage") != "timeline_no_progress_watchdog"
+    ):
+        return None
+    timeline = _matching_timeline(manifest, cursor)
+    if not isinstance(timeline, dict):
+        return None
+    timeline_status = timeline.get("status")
+    if timeline_status not in {"stalled", "interrupted"}:
+        return None
+    coherent_stop = (
+        timeline_status == "stalled"
+        and timeline.get("stalled") is True
+        and timeline.get("interrupted") is False
+    ) or (
+        timeline_status == "interrupted"
+        and timeline.get("interrupted") is True
+        and timeline.get("stalled") in {None, False}
+    )
+    if not coherent_stop or manifest_status != timeline_status:
+        return None
+    if (
+        timeline.get("metadata_complete") is not False
+        or timeline.get("raw_has_record") is not True
+        or timeline.get("other_error_count") != 0
+        or not isinstance(timeline.get("exit_code"), int)
+        or timeline.get("exit_code") == 0
+    ):
+        return None
+    cycles = timeline.get("stalled_rate_limit_cycles")
+    if not isinstance(cycles, int) or cycles < 0:
+        return None
+    if require_unchanged_window and cycles < 1:
+        return None
+
+    log_path = manifest_path.parent / "timeline.log"
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log_text = ""
+    if (
+        "[twitter][warning] API errors" in log_text
+        or "[twitter][error]" in log_text
+        or "Unable to retrieve Tweets" in log_text
+    ):
+        return None
+
+    raw_relative = str(timeline.get("raw_path") or "")
+    raw_path = (user_dir / raw_relative).resolve()
+    runs_dir = (user_dir / "runs").resolve()
+    if (
+        not raw_relative
+        or not raw_path.is_file()
+        or runs_dir not in raw_path.parents
+        or raw_path.name.endswith(".tmp")
+        or archive_x.synthetic_search_cursor(raw_path) != cursor
+    ):
+        return None
+    boundary = next(
+        (
+            record
+            for record in archive_x.iter_jsonl(raw_path)
+            if archive_x.id_string(record.get("tweet_id")) == oldest_post_id
+        ),
+        None,
+    )
+    if not isinstance(boundary, dict):
+        return None
+    try:
+        boundary_at = archive_x.parse_datetime(str(boundary.get("date") or ""))
+        expected_at = parse_utc(oldest_post_at, "source oldest_post_at")
+    except (argparse.ArgumentTypeError, archive_x.ArchiveError):
+        return None
+    if second_utc(boundary_at) != second_utc(expected_at):
+        return None
+    boundary_user_id = archive_x.id_string((boundary.get("user") or {}).get("id"))
+    boundary_author_id = archive_x.id_string(
+        (boundary.get("author") or {}).get("id")
+    )
+    if requested_user_id not in {boundary_user_id, boundary_author_id}:
+        return None
+
+    run_id = str(manifest.get("run_id") or manifest_path.parent.name)
+    if not run_id or Path(run_id).name != run_id:
+        return None
+    return {
+        "run_id": run_id,
+        "manifest_sha256": archive_x.sha256_file(manifest_path),
+        "raw_sha256": archive_x.sha256_file(raw_path),
+        "cursor": cursor,
+        "stalled_rate_limit_cycles": cycles,
+        "completed_at": str(manifest.get("completed_at") or ""),
+    }
+
+
+def transition_confirmations(
+    user_dir: Path,
+    *,
+    cursor: str,
+    oldest_post_id: str,
+    oldest_post_at: str,
+    requested_user_id: str,
+) -> list[dict[str, Any]]:
+    """Collect clean, independent no-progress observations at one boundary."""
+    confirmations = []
+    for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
+        evidence = _transition_run_evidence(
+            user_dir,
+            manifest_path,
+            cursor=cursor,
+            oldest_post_id=oldest_post_id,
+            oldest_post_at=oldest_post_at,
+            requested_user_id=requested_user_id,
+            require_unchanged_window=True,
+        )
+        if evidence is not None:
+            confirmations.append(evidence)
+    confirmations.sort(key=lambda item: (item["completed_at"], item["run_id"]))
+    return confirmations
+
+
+def transition_watchdog_policy(
+    user_dir: Path,
+    state: dict[str, Any],
+    *,
+    ambiguous_cycles: int,
+) -> dict[str, Any]:
+    """Use one unchanged window only for an identity-bound legacy-era floor."""
+    if not isinstance(ambiguous_cycles, int) or ambiguous_cycles < 1:
+        raise archive_x.ArchiveError("transition watchdog cycle limit is invalid")
+    default = {
+        "cycles": ambiguous_cycles,
+        "reason": "ambiguous_or_snowflake_boundary",
+    }
+    if state.get("legacy_backfill") is not None:
+        return {"cycles": ambiguous_cycles, "reason": "legacy_already_initialized"}
+    requested_user_id = str(state.get("requested_user_id") or "")
+    resume = state.get("resume")
+    cursor = str(resume.get("cursor") or "") if isinstance(resume, dict) else ""
+    match = CURSOR_RE.fullmatch(cursor)
+    if not requested_user_id.isdecimal() or not match:
+        return default
+    try:
+        oldest, _count = oldest_dataset_record(user_dir)
+        oldest_at = archive_x.parse_datetime(str(oldest.get("posted_at") or ""))
+    except (archive_x.ArchiveError, argparse.ArgumentTypeError):
+        return default
+    if (
+        str(oldest.get("post_id") or "") != match.group(1)
+        or oldest_at >= SNOWFLAKE_EPOCH
+    ):
+        return default
+    profile_wrapper = archive_x.load_json(
+        user_dir / "dataset" / "profile.json", None
+    )
+    profile = (
+        profile_wrapper.get("profile")
+        if isinstance(profile_wrapper, dict)
+        else None
+    )
+    if (
+        not isinstance(profile, dict)
+        or str(profile.get("id") or "") != requested_user_id
+    ):
+        return default
+    return {
+        "cycles": 1,
+        "reason": "verified_pre_snowflake_floor",
+        "cursor": cursor,
+        "oldest_post_id": match.group(1),
+        "oldest_post_at": second_utc(oldest_at),
+    }
+
+
 def matching_source_manifest(user_dir: Path, cursor: str) -> Path:
     matches: list[tuple[str, Path]] = []
     for path in (user_dir / "runs").glob("*/manifest.json"):
@@ -380,6 +636,15 @@ def initialization_plan(user_dir: Path) -> dict[str, Any]:
         "dataset_post_count": dataset_count,
         "reposts_included": bool(manifest.get("reposts_included")),
     }
+    confirmations = transition_confirmations(
+        user_dir,
+        cursor=cursor,
+        oldest_post_id=oldest_id,
+        oldest_post_at=second_utc(oldest_at),
+        requested_user_id=user_id,
+    )
+    if confirmations:
+        evidence["transition_confirmations"] = confirmations
     proposed = {
         "requested_user_id": user_id,
         "initial_until": second_utc(initial_until),
@@ -459,6 +724,37 @@ def _legacy_source_manifest(
         raise archive_x.ArchiveError("legacy source manifest is invalid")
     if str(manifest.get("run_id") or resolved.parent.name) != run_id_value:
         raise archive_x.ArchiveError("legacy source manifest run ID changed")
+    for confirmation in source.get("transition_confirmations", ()):
+        confirmation_run = str(confirmation["run_id"])
+        confirmation_manifest = (
+            user_dir / "runs" / confirmation_run / "manifest.json"
+        ).resolve()
+        if (
+            not confirmation_manifest.is_file()
+            or runs_dir not in confirmation_manifest.parents
+            or archive_x.sha256_file(confirmation_manifest)
+            != confirmation["manifest_sha256"]
+        ):
+            raise archive_x.ArchiveError(
+                "legacy transition confirmation manifest changed"
+            )
+        confirmation_value = archive_x.load_json(confirmation_manifest, None)
+        if not isinstance(confirmation_value, dict):
+            raise archive_x.ArchiveError(
+                "legacy transition confirmation manifest is invalid"
+            )
+        timeline = _matching_timeline(confirmation_value, source["cursor"])
+        raw_relative = str(timeline.get("raw_path") or "") if timeline else ""
+        raw_path = (user_dir / raw_relative).resolve()
+        if (
+            not raw_relative
+            or not raw_path.is_file()
+            or runs_dir not in raw_path.parents
+            or archive_x.sha256_file(raw_path) != confirmation["raw_sha256"]
+        ):
+            raise archive_x.ArchiveError(
+                "legacy transition confirmation raw evidence changed"
+            )
     return resolved, manifest
 
 
@@ -498,85 +794,60 @@ def classify_legacy_transition(
     run_id_value = str(source["run_id"])
     if expected_run_id is not None and run_id_value != expected_run_id:
         return {"decision": "ambiguous", "reason": "source_run_mismatch"}
-    timeline = next(
-        (
-            item
-            for item in manifest.get("endpoints", ())
-            if isinstance(item, dict)
-            and item.get("endpoint") == "timeline"
-            and item.get("resume_cursor") == source["cursor"]
-        ),
-        None,
+    requested_user_id = str(state.get("requested_user_id") or "")
+    source_evidence = _transition_run_evidence(
+        user_dir,
+        manifest_path,
+        cursor=source["cursor"],
+        oldest_post_id=source["oldest_post_id"],
+        oldest_post_at=source["oldest_post_at"],
+        requested_user_id=requested_user_id,
+        require_unchanged_window=False,
     )
-    strict_manifest = (
+    if source_evidence is None:
+        return {"decision": "ambiguous", "reason": "not_exact_stopped_boundary"}
+    try:
+        boundary_at = parse_utc(source["oldest_post_at"], "source oldest_post_at")
+    except archive_x.ArchiveError:
+        return {"decision": "ambiguous", "reason": "boundary_timestamp_invalid"}
+    if boundary_at >= SNOWFLAKE_EPOCH:
+        return {"decision": "not_applicable", "reason": "snowflake_domain"}
+    timeline = _matching_timeline(manifest, source["cursor"])
+    assert isinstance(timeline, dict)
+    strict_watchdog = bool(
         manifest.get("status") == "stalled"
         and manifest.get("failure_stage") == "timeline_no_progress_watchdog"
-        and manifest.get("limited_run") is False
-        and manifest.get("retry_failed_only") is False
-        and manifest.get("date_after") in {None, ""}
-    )
-    strict_timeline = bool(
-        isinstance(timeline, dict)
         and timeline.get("status") == "stalled"
         and timeline.get("stalled") is True
         and timeline.get("interrupted") is False
-        and timeline.get("metadata_complete") is False
-        and timeline.get("raw_has_record") is True
-        and timeline.get("other_error_count") == 0
-        and isinstance(timeline.get("exit_code"), int)
-        and timeline.get("exit_code") != 0
         and isinstance(timeline.get("stalled_rate_limit_cycles"), int)
         and timeline.get("stalled_rate_limit_cycles") >= minimum_stalled_cycles
     )
-    if not strict_manifest or not strict_timeline:
-        return {"decision": "ambiguous", "reason": "not_exact_watchdog_boundary"}
-    raw_relative = str(timeline.get("raw_path") or "")
-    raw_path = (user_dir / raw_relative).resolve()
-    runs_dir = (user_dir / "runs").resolve()
-    if (
-        not raw_relative
-        or not raw_path.is_file()
-        or runs_dir not in raw_path.parents
-        or raw_path.name.endswith(".tmp")
-    ):
-        return {"decision": "ambiguous", "reason": "boundary_raw_missing"}
-    if archive_x.synthetic_search_cursor(raw_path) != source["cursor"]:
-        return {"decision": "ambiguous", "reason": "raw_cursor_mismatch"}
-    boundary = next(
-        (
-            record
-            for record in archive_x.iter_jsonl(raw_path)
-            if archive_x.id_string(record.get("tweet_id"))
-            == source["oldest_post_id"]
-        ),
-        None,
-    )
-    if not isinstance(boundary, dict):
-        return {"decision": "ambiguous", "reason": "boundary_record_missing"}
-    try:
-        boundary_at = archive_x.parse_datetime(str(boundary.get("date") or ""))
-        source_at = parse_utc(source["oldest_post_at"], "source oldest_post_at")
-    except (argparse.ArgumentTypeError, archive_x.ArchiveError):
-        return {"decision": "ambiguous", "reason": "boundary_timestamp_invalid"}
-    if second_utc(boundary_at) != second_utc(source_at):
-        return {"decision": "ambiguous", "reason": "boundary_timestamp_mismatch"}
-    if boundary_at >= SNOWFLAKE_EPOCH:
-        return {"decision": "not_applicable", "reason": "snowflake_domain"}
-    requested_user_id = str(state.get("requested_user_id") or "")
-    boundary_user_id = archive_x.id_string((boundary.get("user") or {}).get("id"))
-    boundary_author_id = archive_x.id_string(
-        (boundary.get("author") or {}).get("id")
-    )
-    if requested_user_id not in {boundary_user_id, boundary_author_id}:
-        return {"decision": "ambiguous", "reason": "boundary_identity_mismatch"}
+    confirmations = source.get("transition_confirmations", [])
+    if not confirmations:
+        return {
+            "decision": "ambiguous",
+            "reason": "no_clean_unchanged_window",
+        }
+    confirmation_runs = [item["run_id"] for item in confirmations]
+    if strict_watchdog:
+        reason = "exact_pre_snowflake_watchdog_boundary"
+    elif any(run_id != run_id_value for run_id in confirmation_runs):
+        reason = "exact_pre_snowflake_historical_boundary"
+    else:
+        reason = "exact_pre_snowflake_single_window_boundary"
     return {
         "decision": "proven",
-        "reason": "exact_pre_snowflake_watchdog_boundary",
+        "reason": reason,
         "source_run_id": run_id_value,
         "source_manifest_sha256": archive_x.sha256_file(manifest_path),
-        "source_raw_sha256": archive_x.sha256_file(raw_path),
+        "source_raw_sha256": source_evidence["raw_sha256"],
         "oldest_post_id": source["oldest_post_id"],
         "oldest_post_at": source["oldest_post_at"],
+        "confirmation_run_ids": confirmation_runs,
+        "confirmation_cycles": sum(
+            item["stalled_rate_limit_cycles"] for item in confirmations
+        ),
         "confirmation_token": plan["confirmation_token"],
     }
 
@@ -1416,7 +1687,17 @@ def run_legacy_archive(
     archive_root: Path,
     handle: str,
     version: str,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    def report(event: str, **details: Any) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback({"event": event, **details})
+        except Exception:
+            # Observability must never change an archival outcome.
+            pass
+
     options.validate()
     user_dir, state_path = state_paths(archive_root, handle)
     state = archive_x.load_json(state_path, None)
@@ -1514,6 +1795,12 @@ def run_legacy_archive(
         }
         manifest["windows"].append(window_result)
         archive_x.atomic_write_json(manifest_path, manifest)
+        report(
+            "window_started",
+            since=active["since"],
+            until=active["until"],
+            committed_windows=completed_count,
+        )
         confirmed_leaf_keys: set[tuple[str, str]] = set()
         canonical_by_id: dict[str, dict[str, Any]] = {}
         confirmed_walk_ids: list[str] = []
@@ -1564,6 +1851,13 @@ def run_legacy_archive(
                 )
                 window_result["walks"].append(public_walk_result(result))
                 archive_x.atomic_write_json(manifest_path, manifest)
+                report(
+                    "walk_completed",
+                    since=active["since"],
+                    until=active["until"],
+                    attempt=attempt,
+                    committed_windows=completed_count,
+                )
                 if result["interrupted"]:
                     manifest["status"] = "interrupted"
                     manifest["completed_at"] = second_utc(archive_x.utc_now())
@@ -1690,6 +1984,14 @@ def run_legacy_archive(
         window_result["status"] = "success"
         archive_x.atomic_write_json(manifest_path, manifest)
         completed_count += 1
+        report(
+            "window_committed",
+            since=active["since"],
+            until=active["until"],
+            committed_windows=completed_count,
+            new_posts=int(dataset_result.get("new_run_posts") or 0),
+            dataset_posts=int(dataset_result.get("dataset_posts") or 0),
+        )
         if (
             (
                 options.max_root_windows is None

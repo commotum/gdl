@@ -727,6 +727,47 @@ class UnifiedOrchestrationTests(unittest.TestCase):
         self.assertEqual(result["alice"]["status"], "limited")
         self.assertEqual(result["bob"]["status"], "limited")
 
+    def test_legacy_commit_is_forwarded_to_live_progress(self):
+        reporter = mock.Mock()
+
+        def fake_run(
+            options, repo_dir, archive_root, handle, version,
+            progress_callback=None,
+        ):
+            self.assertIsNotNone(progress_callback)
+            progress_callback({
+                "event": "window_committed",
+                "since": "2010-10-01T00:00:00Z",
+                "until": "2010-10-04T00:00:00Z",
+                "new_posts": 7,
+            })
+            return {
+                "run_id": "legacy-run", "status": "limited",
+                "windows": [{"state_committed": True}],
+            }
+
+        with mock.patch.object(
+            unified_x, "legacy_state_status", return_value="pending"
+        ), mock.patch.object(
+            unified_x.legacy_x, "verify_legacy_runner", return_value=None
+        ), mock.patch.object(
+            unified_x.legacy_x, "run_legacy_archive", side_effect=fake_run
+        ):
+            unified_x.run_legacy_scheduler(
+                unified_args(legacy_max_windows=1),
+                REPO,
+                Path("/archive"),
+                "1.32.4",
+                ["alice"],
+                progress=reporter,
+            )
+
+        reporter.event.assert_called_once()
+        self.assertEqual(reporter.event.call_args.args, ("alice",))
+        self.assertTrue(reporter.event.call_args.kwargs["progress"])
+        self.assertTrue(reporter.event.call_args.kwargs["force"])
+        self.assertIn("+7 posts", reporter.event.call_args.kwargs["activity"])
+
     def test_legacy_failure_isolated_to_one_user(self):
         args = unified_args(legacy_max_windows=1)
         calls = []
@@ -1004,6 +1045,73 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                 )
 
             self.assertFalse((user_dir / "runs").exists())
+
+    def test_archive_user_reuses_proven_history_before_timeline_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, state_path = transition_archive(root)
+            args = archive_x.build_parser(REPO).parse_args(
+                ["--user", "alice", "--output-root", str(root)]
+            )
+            timeline_calls = []
+
+            def endpoint(**kwargs):
+                name = kwargs["endpoint"]
+                raw = kwargs["run_dir"] / "raw" / f"{name}.posts.jsonl"
+                if name == "info":
+                    records = [
+                        {
+                            "id": 1,
+                            "name": "alice",
+                            "date": "2008-10-21 12:01:00",
+                        }
+                    ]
+                else:
+                    records = []
+                archive_x.atomic_write_jsonl(raw, records)
+                if name == "timeline":
+                    timeline_calls.append(
+                        {
+                            "cursor": kwargs["cursor"],
+                            "date_after": kwargs["date_after"],
+                            "cycles": kwargs["stalled_rate_limit_cycles"],
+                        }
+                    )
+                return {
+                    "endpoint": name,
+                    "status": "success",
+                    "exit_code": 0,
+                    "interrupted": False,
+                    "stalled": False,
+                    "stalled_rate_limit_cycles": 0,
+                    "resume_cursor": None,
+                    "metadata_complete": True,
+                    "failed_downloads": [],
+                    "other_error_count": 0,
+                    "raw_has_record": bool(records),
+                    "raw_path": str(raw.relative_to(user_dir)),
+                }
+
+            with mock.patch.object(
+                archive_x, "archive_endpoint", side_effect=endpoint
+            ), mock.patch.object(archive_x, "sleep_random", return_value=None):
+                result = archive_x.archive_user(
+                    args, REPO, root, "alice", "1.32.4"
+                )
+
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(len(timeline_calls), 1)
+            self.assertIsNone(timeline_calls[0]["cursor"])
+            self.assertIsNotNone(timeline_calls[0]["date_after"])
+            self.assertEqual(timeline_calls[0]["cycles"], 3)
+            state = archive_x.load_json(state_path, {})
+            self.assertIn("legacy_backfill", state)
+            self.assertIn("modern_head", state)
+            self.assertEqual(result["timeline_mode"], "modern_head")
+            self.assertEqual(
+                result["legacy_transition_preflight"]["status"],
+                "initialized",
+            )
 
     def test_main_holds_two_outer_locks_once_and_calls_unified_phases(self):
         with tempfile.TemporaryDirectory() as directory:

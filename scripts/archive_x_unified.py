@@ -97,6 +97,8 @@ def run_legacy_scheduler(
     archive_root: Path,
     version: str,
     handles: list[str],
+    *,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
     results = {
         handle: {
@@ -121,16 +123,49 @@ def run_legacy_scheduler(
         return results
     requested_limit = getattr(args, "legacy_max_windows", None)
     completed = {handle: 0 for handle in eligible}
+
+    def run_one(handle: str, max_windows: int | None) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if progress is not None:
+            def report(event: dict[str, Any]) -> None:
+                name = str(event.get("event") or "legacy_progress")
+                since = str(event.get("since") or "")[:10]
+                until = str(event.get("until") or "")[:10]
+                if name == "window_committed":
+                    activity = (
+                        f"committed legacy {since} to {until} "
+                        f"(+{int(event.get('new_posts') or 0)} posts)"
+                    )
+                elif name == "walk_completed":
+                    activity = (
+                        f"verified legacy pass {int(event.get('attempt') or 0)} "
+                        f"for {since} to {until}"
+                    )
+                else:
+                    activity = f"verifying legacy {since} to {until}"
+                progress.event(
+                    handle,
+                    phase="legacy",
+                    phase_status="running",
+                    activity=activity,
+                    progress=name == "window_committed",
+                    force=name == "window_committed",
+                )
+
+            kwargs["progress_callback"] = report
+        return legacy_x.run_legacy_archive(
+            legacy_options(args, max_windows),
+            repo_dir,
+            archive_root,
+            handle,
+            version,
+            **kwargs,
+        )
+
     if len(eligible) == 1:
         handle = eligible[0]
         try:
-            run = legacy_x.run_legacy_archive(
-                legacy_options(args, requested_limit),
-                repo_dir,
-                archive_root,
-                handle,
-                version,
-            )
+            run = run_one(handle, requested_limit)
         except archive_x.ArchiveError as exc:
             results[handle] = {
                 "status": "failed",
@@ -146,7 +181,7 @@ def run_legacy_scheduler(
 
     active = set(eligible)
     while active:
-        progress = False
+        made_progress = False
         for handle in eligible:
             if handle not in active:
                 continue
@@ -155,13 +190,7 @@ def run_legacy_scheduler(
                 active.remove(handle)
                 continue
             try:
-                run = legacy_x.run_legacy_archive(
-                    legacy_options(args, 1),
-                    repo_dir,
-                    archive_root,
-                    handle,
-                    version,
-                )
+                run = run_one(handle, 1)
             except archive_x.ArchiveError as exc:
                 results[handle]["status"] = "failed"
                 results[handle]["error"] = str(exc)
@@ -174,7 +203,7 @@ def run_legacy_scheduler(
                 1 for window in run.get("windows", ()) if window.get("state_committed")
             )
             completed[handle] += committed
-            progress = progress or bool(committed)
+            made_progress = made_progress or bool(committed)
             state_status = legacy_state_status(user_dir_for(archive_root, handle))
             if state_status in {"complete", "manual_review"}:
                 results[handle]["status"] = state_status
@@ -182,7 +211,7 @@ def run_legacy_scheduler(
             elif requested_limit is not None and completed[handle] >= requested_limit:
                 results[handle]["status"] = "limited"
                 active.remove(handle)
-        if active and not progress:
+        if active and not made_progress:
             raise archive_x.ArchiveError("legacy scheduler made no durable progress")
         if active:
             archive_x.sleep_random("30-60", "before next legacy round")
@@ -537,7 +566,10 @@ def run_unified_followups(
     if not args.retry_failed_only:
         for handle in eligible:
             phase(handle, "legacy", "running", "checking legacy coverage")
-        legacy = run_legacy_scheduler(args, repo_dir, archive_root, version, eligible)
+        legacy = run_legacy_scheduler(
+            args, repo_dir, archive_root, version, eligible,
+            progress=progress,
+        )
         for handle in eligible:
             combined[handle]["legacy"] = legacy[handle]
             phase(

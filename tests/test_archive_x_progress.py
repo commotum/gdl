@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -22,7 +23,8 @@ def make_context(path: Path) -> None:
         """
         CREATE TABLE targets(
           post_id TEXT PRIMARY KEY, state TEXT, media_state TEXT,
-          last_error_class TEXT);
+          last_error_class TEXT,
+          updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:10:00Z');
         CREATE TABLE observations(
           post_id TEXT PRIMARY KEY, source_kind TEXT);
         CREATE TABLE reply_edges(
@@ -39,7 +41,11 @@ def make_context(path: Path) -> None:
         ("7", "retryable", "retryable", "transient"),
         ("8", "manual_review", "manual_review", "unknown"),
     ]
-    connection.executemany("INSERT INTO targets VALUES (?,?,?,?)", targets)
+    connection.executemany(
+        "INSERT INTO targets(post_id,state,media_state,last_error_class) "
+        "VALUES (?,?,?,?)",
+        targets,
+    )
     connection.executemany(
         "INSERT INTO observations VALUES (?,?)",
         [("1", "x:focal"), ("2", "local:modern")],
@@ -69,10 +75,25 @@ class ProgressSignalsTests(unittest.TestCase):
         self.assertEqual(result["context_unavailable"], 3)
         self.assertEqual(result["context_known_remaining"], 2)
         self.assertEqual(result["context_manual_review"], 1)
+        self.assertEqual(result["context_media_actionable"], 2)
+        self.assertEqual(result["context_media_captured"], 1)
+        self.assertEqual(result["context_media_manual_review"], 1)
+        self.assertEqual(result["context_media_remaining"], 3)
         self.assertEqual(result["conversations_closed"], 2)
         self.assertEqual(result["boundaries_deleted"], 1)
         self.assertEqual(result["boundaries_private"], 1)
         self.assertEqual(result["boundaries_suspended"], 1)
+
+    def test_fast_context_metrics_skip_only_conversation_closure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.sqlite3"
+            make_context(path)
+            result = progress.collect_context_fast_metrics(path)
+
+        self.assertEqual(result["context_captured"], 2)
+        self.assertEqual(result["context_known_remaining"], 2)
+        self.assertNotIn("conversations_closed", result)
+        self.assertNotIn("conversations_total", result)
 
     def test_archive_metrics_use_manifest_not_terminal_or_file_scan(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -89,6 +110,38 @@ class ProgressSignalsTests(unittest.TestCase):
             "archive_media_files": 56,
             "archive_media_bytes": 7890,
         })
+
+    def test_archive_metrics_follow_committed_legacy_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user = Path(directory)
+            modern = user / "runs" / "modern" / "manifest.json"
+            modern.parent.mkdir(parents=True)
+            modern.write_text(json.dumps({
+                "post_dataset": {"dataset_posts": 100},
+                "media_dataset": {"media_files": 5, "media_bytes": 900},
+            }))
+            legacy = user / "runs" / "legacy" / "manifest.json"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(json.dumps({
+                "mode": "legacy_backfill",
+                "windows": [
+                    {
+                        "state_committed": True,
+                        "dataset": {"dataset_posts": 112},
+                    },
+                    {"status": "running"},
+                ],
+            }))
+            # A later-touched modern manifest may have the pre-legacy total;
+            # dataset counts are monotonic, so the committed maximum wins.
+            os.utime(legacy, (1, 1))
+            os.utime(modern, (2, 2))
+
+            result = progress.collect_archive_metrics(user)
+
+        self.assertEqual(result["archive_posts"], 112)
+        self.assertEqual(result["archive_media_files"], 5)
+        self.assertEqual(result["archive_media_bytes"], 900)
 
     def test_estimator_uses_net_wall_clock_burn_and_hides_false_precision(self):
         estimate, rate = progress.estimate_known_queue([
@@ -110,6 +163,13 @@ class ProgressSignalsTests(unittest.TestCase):
             {"at": 60, "known_remaining": 90, "resolved": 10},
         ], 90)
         self.assertEqual(young["qualifier"], "collecting samples")
+        preliminary, preliminary_rate = progress.estimate_known_queue([
+            {"at": 0, "known_remaining": 100, "resolved": 0},
+            {"at": 300, "known_remaining": 90, "resolved": 20},
+        ], 90)
+        self.assertEqual(preliminary["seconds"], 2700)
+        self.assertEqual(preliminary["confidence"], "low")
+        self.assertEqual(preliminary_rate["items_per_hour"], 240)
         blocked, _ = progress.estimate_known_queue([], 10, blocked=True)
         self.assertEqual(blocked["qualifier"], "phase blocked")
         blocked_with_rate, blocked_rate = progress.estimate_known_queue([
@@ -118,6 +178,164 @@ class ProgressSignalsTests(unittest.TestCase):
         ], 900, blocked=True)
         self.assertEqual(blocked_with_rate["qualifier"], "phase blocked")
         self.assertEqual(blocked_rate["items_per_hour"], 200)
+
+    def test_context_samples_start_after_queue_seeding(self):
+        samples = progress.phase_queue_samples([
+            {"at": 0, "known_remaining": 0, "resolved": 0},
+            {"at": 100, "known_remaining": 0, "resolved": 0},
+            {"at": 200, "known_remaining": 8742, "resolved": 728},
+            {"at": 500, "known_remaining": 8711, "resolved": 774},
+        ], "context_metadata")
+
+        self.assertEqual(
+            [sample["known_remaining"] for sample in samples],
+            [8742, 8711],
+        )
+        estimate, _rate = progress.estimate_known_queue(samples, 8711)
+        self.assertIsNotNone(estimate["seconds"])
+        self.assertEqual(estimate["confidence"], "low")
+
+    def test_live_media_phase_uses_media_queue_for_eta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = (
+                root / "users" / "alice" / "_state" / "context.sqlite3"
+            )
+            make_context(db_path)
+            totals = progress.empty_totals()
+            totals.update({"context_captured": 100})
+            snapshot = {
+                "schema": progress.SCHEMA, "schema_version": 1,
+                "invocation_id": "run",
+                "started_at": "1970-01-01T00:00:00Z",
+                "updated_at": "1970-01-01T00:10:00Z",
+                "status": "running",
+                "users": [{
+                    "handle": "alice", "phase": "context_media",
+                    "health": "healthy", "activity": "fetching 8",
+                    "last_progress_at": "1970-01-01T00:19:59Z",
+                    "wait_until": None,
+                    "phases": {"context_media": "running"},
+                    "totals": totals, "baseline": progress.empty_totals(),
+                    "delta": totals,
+                    # These are old-producer metadata samples: the zero marks
+                    # the handoff into context media.
+                    "samples": [
+                        {"at": 0, "known_remaining": 100, "resolved": 0},
+                        {"at": 600, "known_remaining": 0, "resolved": 100},
+                    ],
+                    "rate": None,
+                    "estimate": {
+                        "seconds": 0, "label": "~0s", "confidence": "low",
+                        "qualifier": "known queue", "known_remaining": 0,
+                    },
+                    "action_required": 0,
+                }],
+            }
+
+            result = progress.LiveProgressReader(root).enrich(
+                snapshot, now=1200
+            )
+
+        user = result["users"][0]
+        self.assertEqual(user["totals"]["context_media_actionable"], 2)
+        self.assertEqual(user["totals"]["context_media_captured"], 1)
+        self.assertEqual(user["totals"]["context_media_manual_review"], 1)
+        self.assertEqual(user["estimate"]["seconds"], 600)
+        self.assertEqual(user["rate"]["items_per_hour"], 12)
+        output = dashboard.render(result, width=120, now=1200, unicode=False)
+        self.assertIn("Media      1 saved", output)
+        self.assertIn("1 review", output)
+        self.assertIn("2 remaining", output)
+        self.assertIn("~10m to finish media pass", output)
+
+    def test_live_reader_derives_legacy_frontier_rate_and_eta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir = root / "users" / "alice"
+            state_path = user_dir / "_state" / "state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({
+                "legacy_backfill": {
+                    "status": "active",
+                    "initial_until": "2010-10-25T00:00:00Z",
+                    "next_until": "2010-10-19T00:00:00Z",
+                    "floor_since": "2010-10-07T00:00:00Z",
+                    "active_window": {
+                        "owner_run_id": "legacy-run",
+                        "since": "2010-10-16T00:00:00Z",
+                        "until": "2010-10-19T00:00:00Z",
+                    },
+                },
+            }))
+            # During context seeding the SQLite file can exist before all
+            # tables do. That must not suppress the valid timeline overlay.
+            sqlite3.connect(state_path.parent / "context.sqlite3").close()
+            manifest = user_dir / "runs" / "legacy-run" / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({
+                "mode": "legacy_backfill",
+                "started_at": "2026-01-01T00:30:00Z",
+                "windows": [
+                    {
+                        "since": "2010-10-22T00:00:00Z",
+                        "until": "2010-10-25T00:00:00Z",
+                        "state_committed": True,
+                        "canonical_post_count": 5,
+                        "dataset": {
+                            "new_run_posts": 5, "dataset_posts": 105,
+                        },
+                    },
+                    {
+                        "since": "2010-10-19T00:00:00Z",
+                        "until": "2010-10-22T00:00:00Z",
+                        "state_committed": True,
+                        "canonical_post_count": 7,
+                        "dataset": {
+                            "new_run_posts": 7, "dataset_posts": 112,
+                        },
+                    },
+                ],
+            }))
+            totals = progress.empty_totals()
+            totals["archive_posts"] = 100
+            snapshot = {
+                "schema": progress.SCHEMA, "schema_version": 1,
+                "invocation_id": "run",
+                "started_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "status": "running",
+                "users": [{
+                    "handle": "alice", "phase": "legacy",
+                    "health": "stale", "activity": "checking legacy coverage",
+                    "last_progress_at": "2026-01-01T00:00:00Z",
+                    "wait_until": None, "phases": {"legacy": "running"},
+                    "totals": totals, "baseline": dict(totals),
+                    "delta": progress.empty_totals(), "samples": [],
+                    "rate": None,
+                    "estimate": {
+                        "seconds": None, "label": None, "confidence": "none",
+                        "qualifier": "collecting samples", "known_remaining": 0,
+                    },
+                    "action_required": 0,
+                }],
+            }
+            now = progress.parse_time("2026-01-01T01:00:00Z")
+            result = progress.LiveProgressReader(root).enrich(
+                snapshot, now=now
+            )
+
+        user = result["users"][0]
+        self.assertEqual(user["totals"]["archive_posts"], 112)
+        self.assertEqual(user["delta"]["archive_posts"], 12)
+        self.assertEqual(user["legacy"]["committed_windows"], 2)
+        self.assertEqual(user["legacy"]["completed_seconds"], 6 * 86400)
+        self.assertEqual(user["rate"]["coverage_days_per_hour"], 12.0)
+        self.assertEqual(user["estimate"]["seconds"], 3600)
+        output = dashboard.render(result, width=100, now=now, unicode=False)
+        self.assertIn("6.0/18.0 days covered", output)
+        self.assertIn("~1h 0m to account creation", output)
+        self.assertIn("+12 posts", output)
 
     def test_nonactive_manual_review_does_not_hide_context_eta(self):
         totals = progress.empty_totals()
@@ -285,6 +503,12 @@ class ProgressSignalsTests(unittest.TestCase):
         )
         self.assertEqual(pane, "%42")
         self.assertEqual(calls[0][0][:3], ["tmux", "split-window", "-v"])
+        self.assertIn("-d", calls[0][0])
+        self.assertNotIn("-b", calls[0][0])
+        self.assertEqual(
+            calls[0][0][calls[0][0].index("-l") + 1],
+            str(progress.DASHBOARD_PANE_LINES),
+        )
         self.assertNotIsInstance(calls[0][0], str)
         self.assertIn("archive-x-dashboard:run-1", calls[1][0])
         self.assertIsNone(progress.start_tmux_dashboard(
@@ -292,6 +516,32 @@ class ProgressSignalsTests(unittest.TestCase):
             environ={"TMUX": "/tmp/socket", "ARCHIVE_X_DASHBOARD": "off"},
             isatty=True,
         ))
+
+    def test_tmux_adapter_accepts_nominal_80_by_24_terminal_inside_tmux(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            return mock.Mock(stdout="%42\n")
+
+        pane = progress.start_tmux_dashboard(
+            Path("/tmp/run.json"), "run-1", Path("/repo"),
+            environ={"TMUX": "/tmp/socket"}, isatty=True,
+            # tmux commonly consumes one row from a nominal 80x24 terminal.
+            terminal_size=__import__("os").terminal_size((80, 23)),
+            runner=runner,
+        )
+
+        self.assertEqual(pane, "%42")
+        self.assertEqual(len(calls), 2)
+        for size in ((71, 23), (80, 19)):
+            with self.subTest(size=size):
+                self.assertIsNone(progress.start_tmux_dashboard(
+                    Path("/tmp/run.json"), "run-1", Path("/repo"),
+                    environ={"TMUX": "/tmp/socket"}, isatty=True,
+                    terminal_size=__import__("os").terminal_size(size),
+                    runner=runner,
+                ))
 
     def test_reporting_failure_disables_itself_without_escaping(self):
         tracker = mock.Mock(path=Path("/tmp/snapshot"))
