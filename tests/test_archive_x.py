@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -179,6 +180,106 @@ class ConfigTests(unittest.TestCase):
         twitter = self.build(False)["extractor"]["twitter"]
         self.assertFalse(twitter["retweets"])
         self.assertNotIn("retweet_id", twitter["timeline"]["post-filter"])
+
+    def test_timeline_can_capture_private_descriptors_without_changing_downloads(self):
+        config = archive_x.build_gallery_config(
+            handle="tszzl",
+            endpoint="timeline",
+            archive_root=Path("/archive"),
+            user_dir=Path("/archive/users/tszzl"),
+            raw_partial=Path(
+                "/archive/users/tszzl/runs/run/raw/timeline.posts.jsonl.partial"
+            ),
+            cookie_file=Path("/cookies/x.txt"),
+            archive_run_id="run",
+            archived_at="2026-07-14T01:02:03Z",
+            request_delay="4-8",
+            download_delay="1-3",
+            extractor_delay="2-5",
+            include_reposts=True,
+            checksums=True,
+            cursor=None,
+            descriptor_artifact=Path(
+                "/archive/users/tszzl/runs/run/raw/"
+                "timeline.descriptors.jsonl.partial"
+            ),
+            descriptor_operation_id="run:timeline",
+            descriptor_source_kind="modern",
+            descriptor_source_operation="modern",
+        )
+        processors = config["extractor"]["twitter"]["postprocessors"]
+        self.assertEqual(processors[0]["name"], "archive_x_descriptor")
+        self.assertEqual(processors[0]["event"], "prepare")
+        self.assertEqual(processors[1]["name"], "hash")
+
+    def test_actual_request_scheduler_replaces_runner_retry_sleeps(self):
+        pacing = importlib.import_module("archive_x_pacing")
+        options = pacing.SchedulerOptions(
+            database=Path("/archive/state.sqlite3"),
+            scope_id="123",
+            delay_low=4.0,
+            delay_high=8.0,
+            lease_seconds=180.0,
+            backoff_429_seconds=300.0,
+        )
+        command = archive_x.gallery_command(
+            REPO,
+            Path("/archive/config.json"),
+            date_after=None,
+            post_limit=None,
+            retries=1,
+            http_timeout=60,
+            rate_limit="8M",
+            url="https://x.com/alice/timeline",
+            request_telemetry_path=Path("/archive/requests.json"),
+            request_operation="timeline",
+            download=False,
+            scheduler_options=options,
+        )
+
+        self.assertEqual(command[command.index("--sleep-retries") + 1], "0")
+        self.assertEqual(command[command.index("--sleep-429") + 1], "0")
+        for option in pacing.SCHEDULER_OPTIONS:
+            self.assertIn(option, command)
+
+
+class ControlledRunnerIntegrationTests(unittest.TestCase):
+    def test_parent_streams_and_parses_one_controlled_worker_result(self):
+        class Result:
+            status = 0
+
+        class Runner:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, **kwargs):
+                self.calls.append(kwargs)
+                kwargs["output"](
+                    "[twitter][info] Archive checkpoint cursor=3_100/\n"
+                )
+                kwargs["output"](
+                    "[twitter][info] Use '-o cursor=3_100/' to continue "
+                    "downloading from the current position\n"
+                )
+                return Result()
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "controlled.log"
+            runner = Runner()
+            observed = archive_x.run_gallery_dl(
+                [sys.executable, "/runner.py", "--no-download"],
+                log_path,
+                "controlled",
+                runner=runner,
+                control_lease_token="a" * 32,
+            )
+
+        self.assertEqual(observed[0], 0)
+        self.assertEqual(observed[1], "3_100/")
+        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(runner.calls[0]["argv"], ["--no-download"])
+        self.assertEqual(runner.calls[0]["lease_token"], "a" * 32)
+        self.assertRegex(runner.calls[0]["item_id"], r"^[0-9a-f]{32}$")
 
 
 class DatasetTests(unittest.TestCase):

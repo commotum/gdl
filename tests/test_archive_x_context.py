@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import os
 import sqlite3
@@ -14,13 +13,7 @@ SCRIPTS = REPO / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-SPEC = importlib.util.spec_from_file_location(
-    "archive_x_context", SCRIPTS / "archive_x_context.py"
-)
-context_x = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = context_x
-assert SPEC.loader is not None
-SPEC.loader.exec_module(context_x)
+import archive_x_context as context_x
 
 
 def post(
@@ -440,7 +433,7 @@ class DiscoveryTests(unittest.TestCase):
 
 class ResolverConfigTests(unittest.TestCase):
     def test_config_is_bounded_conversation_metadata_first(self):
-        config, raw = context_x.build_context_config(
+        config, raw, descriptor = context_x.build_context_config(
             handle="alice",
             post_id="123",
             archive_root=Path("/archive"),
@@ -465,11 +458,18 @@ class ResolverConfigTests(unittest.TestCase):
             twitter["directory"][3:6],
             ["context", "{date:%Y}", "{date:%m}"],
         )
-        self.assertEqual([p["event"] for p in twitter["postprocessors"]], ["post"])
-        self.assertEqual(raw, Path("/work/current.posts.jsonl.partial"))
+        self.assertEqual(
+            [p["event"] for p in twitter["postprocessors"]],
+            ["prepare", "post"],
+        )
+        self.assertEqual(raw, Path("/work/context-123.posts.jsonl.partial"))
+        self.assertEqual(
+            descriptor,
+            Path("/work/context-123.descriptors.jsonl.partial"),
+        )
 
     def test_media_config_remains_focal_only(self):
-        config, _raw = context_x.build_context_config(
+        config, _raw, _descriptor = context_x.build_context_config(
             handle="alice",
             post_id="123",
             archive_root=Path("/archive"),
@@ -494,7 +494,7 @@ class ResolverConfigTests(unittest.TestCase):
 
             def fake_run(_command, log_path, _label):
                 work = user_dir / "_state" / "context-work"
-                (work / "current.posts.jsonl.partial").write_text(
+                (work / f"{log_path.stem}.posts.jsonl.partial").write_text(
                     json.dumps(post("999")) + "\n", encoding="utf-8"
                 )
                 log_path.write_text("ok\n", encoding="utf-8")
@@ -520,8 +520,12 @@ class ResolverConfigTests(unittest.TestCase):
 
             def fake_run(command, log_path, _label):
                 self.assertEqual(command[command.index("--post-range") + 1], "1-200")
+                self.assertEqual(command[command.index("--sleep-retries") + 1], "0")
+                self.assertEqual(command[command.index("--sleep-429") + 1], "0")
+                for option in context_x.pacing_x.SCHEDULER_OPTIONS:
+                    self.assertIn(option, command)
                 work = user_dir / "_state" / "context-work"
-                (work / "current.posts.jsonl.partial").write_text(
+                (work / f"{log_path.stem}.posts.jsonl.partial").write_text(
                     json.dumps(post("123", reply_id="100")) + "\n"
                     + json.dumps(post("100")) + "\n",
                     encoding="utf-8",
@@ -787,6 +791,8 @@ class PacingAndFailureTests(unittest.TestCase):
             "Tweet unavailable ('Suspended')": ("suspended", True, False),
             "withheld in your country": ("withheld", True, False),
             "Could not authenticate you": ("authentication", False, True),
+            "Account temporarily locked": ("authentication", False, True),
+            "PacingAuthenticationError": ("authentication", False, True),
             "KeyError - 'result'": (
                 "ambiguous_response_shape",
                 False,
@@ -1034,6 +1040,43 @@ class WorkerAndDatasetTests(unittest.TestCase):
                     "FROM targets WHERE post_id='200'"
                 ).fetchone()
             self.assertEqual(tuple(row), ("retryable", None, "interrupted"))
+
+    def test_persistent_runner_reuses_actual_lane_without_logical_sleep(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, db_path = make_archive(
+                root, [post("300", reply_id="200")]
+            )
+            context_x.seed_context(user_dir, db_path, dry_run=False, max_depth=10)
+            runner = object()
+            calls = []
+
+            def fetched(**kwargs):
+                calls.append(kwargs)
+                return context_x.FetchResult(
+                    0,
+                    post("200", author_id="2", author="bob"),
+                    "ok",
+                    False,
+                    [],
+                    None,
+                )
+
+            with mock.patch.object(
+                context_x,
+                "reserve_request",
+                side_effect=AssertionError("stacked logical pacing ran"),
+            ):
+                counts = context_x.run_worker(
+                    **self.worker_args(root, user_dir, db_path, fetched),
+                    runner=runner,
+                )
+
+            self.assertEqual(counts["captured"], 1)
+            self.assertEqual(len(calls), 1)
+            self.assertIs(calls[0]["runner"], runner)
+            self.assertRegex(calls[0]["control_lease_token"], r"^[0-9a-f]{32}$")
+            self.assertEqual(calls[0]["request_delay"], "0")
 
     def test_authentication_evidence_stops_whole_worker(self):
         with tempfile.TemporaryDirectory() as directory:

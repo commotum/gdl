@@ -143,6 +143,34 @@ class ProgressSignalsTests(unittest.TestCase):
         self.assertEqual(result["archive_media_files"], 5)
         self.assertEqual(result["archive_media_bytes"], 900)
 
+    def test_export_generations_are_live_constant_size_dashboard_truth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE archive_generation(
+                  singleton INTEGER PRIMARY KEY,current_generation INTEGER);
+                INSERT INTO archive_generation VALUES (1,12);
+                CREATE TABLE current_pointers(
+                  pointer_name TEXT PRIMARY KEY,generation INTEGER);
+                INSERT INTO current_pointers VALUES ('portable_export',9);
+                CREATE TABLE export_views(
+                  view_name TEXT PRIMARY KEY,status TEXT,
+                  durable_generation INTEGER,exported_generation INTEGER);
+                INSERT INTO export_views VALUES ('posts','dirty',12,9);
+                INSERT INTO export_views VALUES ('media','current',9,9);
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            result = progress.collect_export_metrics(path)
+
+        self.assertEqual(result["archive_durable_generation"], 12)
+        self.assertEqual(result["archive_exported_generation"], 9)
+        self.assertEqual(result["archive_dirty_views"], 1)
+
     def test_estimator_uses_net_wall_clock_burn_and_hides_false_precision(self):
         estimate, rate = progress.estimate_known_queue([
             {"at": 0, "known_remaining": 1000, "resolved": 0},
@@ -486,6 +514,21 @@ class ProgressSignalsTests(unittest.TestCase):
         self.assertTrue(all(len(line) <= 80 for line in output.splitlines()))
         self.assertNotIn("\033", output)
         self.assertIn("117,936 known remaining", output)
+
+        user["totals"].update(
+            {
+                "archive_durable_generation": 12,
+                "archive_exported_generation": 9,
+                "archive_dirty_views": 2,
+            }
+        )
+        dirty_output = dashboard.render({
+            "schema": progress.SCHEMA, "schema_version": 1,
+            "invocation_id": "run", "started_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T01:00:00Z", "status": "running",
+            "users": [user],
+        }, width=80, now=1767229200, unicode=False)
+        self.assertIn("Export     durable 12 | published 9 | 2 views pending", dirty_output)
 
     def test_tmux_adapter_is_optional_and_uses_argument_vectors(self):
         calls = []

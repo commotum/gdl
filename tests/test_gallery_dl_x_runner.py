@@ -1,8 +1,12 @@
 import importlib.util
+import json
+import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import urllib3.connectionpool
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -114,6 +118,45 @@ class FallbackAPI:
 
 
 class DeferredRateLimitTests(unittest.TestCase):
+    def test_selected_low_quota_threshold_reaches_actual_gate(self):
+        class Gate:
+            def __init__(self):
+                self.completions = []
+
+            def reserve(self, _category, _endpoint):
+                return types.SimpleNamespace(
+                    waited_seconds=0, wait_source="none"
+                )
+
+            def complete(self, _reservation, **outcome):
+                self.completions.append(outcome)
+
+        gate = Gate()
+        low = FakeResponse(200, {"page": "oldest"}, remaining="2")
+        api = FakeAPI([low])
+        recorder = runner.request_telemetry.RequestRecorder(
+            Path("unused.json"), "timeline", request_gate=gate
+        )
+
+        def observed_request(_url, **_kwargs):
+            return recorder.observe(
+                transport="fixture",
+                url="https://x.com/i/api/graphql/hash/UserTweetsAndReplies",
+                method="GET",
+                send=lambda: api.extractor.responses.pop(0),
+                status_getter=lambda response: response.status_code,
+                headers_getter=lambda response: response.headers,
+            )
+
+        api.extractor.request = observed_request
+        with mock.patch.object(runner.random, "randrange", return_value=3):
+            runner.rate_limit_safe_call(api, "/timeline", {})
+        self.assertEqual(len(gate.completions), 1)
+        self.assertEqual(gate.completions[0]["rate_limit_threshold"], 3)
+        self.assertEqual(
+            gate.completions[0]["headers"]["x-rate-limit-remaining"], "2"
+        )
+
     def test_bounded_tweet_detail_stops_before_cursor_request(self):
         api = FakeAPI([])
         with mock.patch.object(
@@ -347,6 +390,8 @@ class CompatibilityTests(unittest.TestCase):
             ):
                 runner.require_supported_gallery_dl()
 
+
+class CompatibilityTestsContinued(unittest.TestCase):
     def test_installs_only_over_the_known_upstream_method(self):
         original = runner.TwitterAPI._call
         original_tweet_result = runner.TwitterAPI.tweet_result_by_rest_id
@@ -419,6 +464,216 @@ class CompatibilityTests(unittest.TestCase):
                 "TweetResultByRestId does not match",
             ):
                 runner.require_supported_gallery_dl()
+
+
+class RequestTelemetryIntegrationTests(unittest.TestCase):
+    def test_runner_wires_scheduler_to_each_hidden_actual_boundary(self):
+        class PoolResponse:
+            status = 200
+            headers = {"Content-Length": "0"}
+
+        class Gate:
+            def __init__(self):
+                self.reserved = []
+                self.completed = []
+                self.closed = False
+
+            def reserve(self, category, endpoint):
+                self.reserved.append((category, endpoint))
+                return types.SimpleNamespace(
+                    waited_seconds=0, wait_source="none"
+                )
+
+            def complete(self, reservation, **outcome):
+                self.completed.append((reservation, outcome))
+
+            def close(self):
+                self.closed = True
+
+        gate = Gate()
+
+        def fake_pool_request(
+            _pool, _connection, _method, _url, *_args, **_kwargs
+        ):
+            return PoolResponse()
+
+        def fake_gallery_main():
+            pool = types.SimpleNamespace(scheme="https", host="x.com")
+            for endpoint in ("TweetResultByRestId", "TweetDetail"):
+                urllib3.connectionpool.HTTPConnectionPool._make_request(
+                    pool, None, "GET", "/i/api/graphql/hash/" + endpoint
+                )
+            return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.json"
+            with mock.patch.object(
+                runner.pacing,
+                "DurableRequestScheduler",
+                return_value=gate,
+            ), mock.patch.object(
+                urllib3.connectionpool.HTTPConnectionPool,
+                "_make_request",
+                fake_pool_request,
+            ), mock.patch.object(
+                runner.gallery_dl, "main", side_effect=fake_gallery_main
+            ):
+                status = runner.run_gallery_args(
+                    [],
+                    path,
+                    "context_exact",
+                    scheduler_options=object(),
+                )
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            gate.reserved,
+            [("x_api", "tweet_result"), ("x_api", "tweet_detail")],
+        )
+        self.assertEqual(len(gate.completed), 2)
+        self.assertTrue(gate.closed)
+
+    def test_telemetry_shutdown_failure_does_not_change_gallery_status(self):
+        class BrokenCapture:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *_args):
+                raise OSError("private telemetry failure")
+
+        class Recorder:
+            def __init__(self, *_args):
+                pass
+
+            def capture(self):
+                return BrokenCapture()
+
+            def safe_write(self, _status):
+                return None
+
+        with mock.patch.object(
+            runner.request_telemetry, "RequestRecorder", Recorder
+        ), mock.patch.object(runner.gallery_dl, "main", return_value=4):
+            status = runner.run_gallery_args(
+                [], Path("unused.json"), "timeline"
+            )
+
+        self.assertEqual(status, 4)
+
+    def test_scheduler_capture_install_failure_is_fail_closed(self):
+        class BrokenCapture:
+            def __enter__(self):
+                raise OSError("private capture setup detail")
+
+        class Recorder:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def capture(self):
+                return BrokenCapture()
+
+        gate = mock.Mock()
+        with mock.patch.object(
+            runner.request_telemetry, "RequestRecorder", Recorder
+        ), mock.patch.object(
+            runner.pacing, "DurableRequestScheduler", return_value=gate
+        ), mock.patch.object(runner.gallery_dl, "main") as gallery_main:
+            with self.assertRaisesRegex(
+                runner.pacing.PacingError, "could not be installed"
+            ):
+                runner.run_gallery_args(
+                    [],
+                    Path("unused.json"),
+                    "timeline",
+                    scheduler_options=object(),
+                )
+
+        gallery_main.assert_not_called()
+        gate.close.assert_called_once_with()
+
+    def test_scheduler_capture_shutdown_failure_is_fail_closed(self):
+        class BrokenCapture:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *_args):
+                raise OSError("private capture shutdown detail")
+
+        class Recorder:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def capture(self):
+                return BrokenCapture()
+
+            def safe_write(self, _status):
+                return None
+
+        gate = mock.Mock()
+        with mock.patch.object(
+            runner.request_telemetry, "RequestRecorder", Recorder
+        ), mock.patch.object(
+            runner.pacing, "DurableRequestScheduler", return_value=gate
+        ), mock.patch.object(runner.gallery_dl, "main", return_value=0):
+            with self.assertRaisesRegex(
+                runner.pacing.PacingError, "could not be removed"
+            ):
+                runner.run_gallery_args(
+                    [],
+                    Path("unused.json"),
+                    "timeline",
+                    scheduler_options=object(),
+                )
+
+        gate.close.assert_called_once_with()
+
+    def test_one_logical_exact_fetch_records_hidden_detail_fallback(self):
+        class PoolResponse:
+            status = 200
+            headers = {"Content-Length": "2"}
+
+        def fake_pool_request(
+            _pool, _connection, _method, _url, *_args, **_kwargs
+        ):
+            return PoolResponse()
+
+        def fake_gallery_main():
+            pool = types.SimpleNamespace(scheme="https", host="x.com")
+            for endpoint in ("TweetResultByRestId", "TweetDetail"):
+                urllib3.connectionpool.HTTPConnectionPool._make_request(
+                    pool,
+                    None,
+                    "GET",
+                    "/i/api/graphql/hash/"
+                    + endpoint
+                    + "?variables=SECRET_POST_ID",
+                )
+            return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.json"
+            with mock.patch.object(
+                urllib3.connectionpool.HTTPConnectionPool,
+                "_make_request",
+                fake_pool_request,
+            ), mock.patch.object(
+                runner.gallery_dl,
+                "main",
+                side_effect=fake_gallery_main,
+            ):
+                status = runner.run_gallery_args([], path, "context_exact")
+
+            self.assertEqual(status, 0)
+            value = json.loads(path.read_text(encoding="utf-8"))
+            summary = value["summary"]
+            self.assertEqual(summary["actual_requests"], 2)
+            self.assertEqual(
+                summary["by_endpoint"],
+                {"tweet_detail": 1, "tweet_result": 1},
+            )
+            self.assertEqual(summary["peak_concurrency"], 1)
+            persisted = path.read_text(encoding="utf-8")
+            self.assertNotIn("SECRET_POST_ID", persisted)
+            self.assertNotIn("SECRET_AUTH", persisted)
 
 
 if __name__ == "__main__":

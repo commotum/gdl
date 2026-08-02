@@ -26,10 +26,20 @@ import json
 import random
 import sys
 import textwrap
+from pathlib import Path
 from typing import Any
 
 import gallery_dl
 from gallery_dl.extractor.twitter import TwitterAPI, TwitterTweetExtractor
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import archive_x_request_telemetry as request_telemetry
+import archive_x_descriptors as descriptor_capture
+import archive_x_pacing as pacing
+import archive_x_runner_control as runner_control
 
 
 SUPPORTED_VERSION = "1.32.4"
@@ -196,13 +206,15 @@ def rate_limit_safe_call(
             else:
                 self._authenticate_guest()
 
-        response = self.extractor.request(
-            url,
-            method=method,
-            params=params,
-            headers=self.headers,
-            fatal=None,
-        )
+        quota_threshold = random.randrange(1, 6)
+        with request_telemetry.rate_limit_threshold(quota_threshold):
+            response = self.extractor.request(
+                url,
+                method=method,
+                params=params,
+                headers=self.headers,
+                fatal=None,
+            )
 
         # Update 'x-csrf-token' header (#1170).
         if csrf_token := response.cookies.get("ct0"):
@@ -212,7 +224,7 @@ def rate_limit_safe_call(
         low_quota = (
             response.status_code < 400
             and remaining < 6
-            and remaining <= random.randrange(1, 6)
+            and remaining <= quota_threshold
         )
 
         try:
@@ -302,6 +314,7 @@ def empty_result_safe_tweet_result(
 def install_patch() -> None:
     """Install the version-checked patch once in this interpreter."""
     require_supported_gallery_dl()
+    descriptor_capture.install_postprocessor()
     current = TwitterAPI._call
     current_tweet_result = TwitterAPI.tweet_result_by_rest_id
     if (
@@ -326,13 +339,138 @@ def install_patch() -> None:
     TwitterAPI.tweet_result_by_rest_id = empty_result_safe_tweet_result
 
 
-def main() -> int:
+def run_gallery_args(
+    gallery_args: list[str],
+    telemetry_path: Path | None,
+    operation: str | None,
+    *,
+    scheduler_options: pacing.SchedulerOptions | None = None,
+    runner_starts: int = 1,
+) -> int:
+    scheduler = (
+        pacing.DurableRequestScheduler(scheduler_options, operation)
+        if scheduler_options is not None and operation is not None
+        else None
+    )
+    recorder_options: dict[str, Any] = {}
+    if scheduler is not None:
+        recorder_options["request_gate"] = scheduler
+    if runner_starts != 1:
+        recorder_options["runner_starts"] = runner_starts
+    recorder = (
+        request_telemetry.RequestRecorder(
+            telemetry_path, operation, **recorder_options
+        )
+        if telemetry_path is not None and operation is not None
+        else None
+    )
+    capture = None
+    if recorder is not None:
+        try:
+            capture = recorder.capture()
+            capture.__enter__()
+        except Exception as exc:
+            capture = None
+            if scheduler is not None:
+                scheduler.close()
+                raise pacing.PacingError(
+                    "actual request gate could not be installed"
+                ) from exc
+            print(
+                "gallery-dl X runner: request telemetry disabled after "
+                f"{exc.__class__.__name__}",
+                file=sys.stderr,
+            )
+
+    original_argv = sys.argv
+    status = 1
+    capture_shutdown_error: BaseException | None = None
     try:
+        sys.argv = [original_argv[0], *gallery_args]
+        result = gallery_dl.main()
+        status = int(result or 0)
+    finally:
+        sys.argv = original_argv
+        if capture is not None:
+            try:
+                capture.__exit__(*sys.exc_info())
+            except Exception as exc:
+                capture_shutdown_error = exc
+                if scheduler is None:
+                    print(
+                        "gallery-dl X runner: request telemetry shutdown failed "
+                        f"({exc.__class__.__name__})",
+                        file=sys.stderr,
+                    )
+        if recorder is not None:
+            error = recorder.safe_write(status)
+            if error:
+                print(
+                    "gallery-dl X runner: request telemetry write failed "
+                    f"({error})",
+                    file=sys.stderr,
+                )
+        if scheduler is not None:
+            scheduler.close()
+    if capture_shutdown_error is not None and scheduler is not None:
+        raise pacing.PacingError("actual request gate could not be removed") from (
+            capture_shutdown_error
+        )
+    return status
+
+
+def run_once(values: list[str], *, runner_starts: int = 1) -> int:
+    try:
+        telemetry_path, operation, remaining = (
+            request_telemetry.parse_runner_options(values)
+        )
+        scheduler_options, gallery_args = pacing.parse_runner_options(remaining)
+        if scheduler_options is not None and operation is None:
+            raise pacing.PacingError(
+                "request telemetry operation is required with scheduler options"
+            )
         install_patch()
-    except (importlib.metadata.PackageNotFoundError, ShimCompatibilityError) as exc:
+    except (
+        importlib.metadata.PackageNotFoundError,
+        pacing.PacingError,
+        request_telemetry.RequestTelemetryError,
+        ShimCompatibilityError,
+    ) as exc:
         print(f"gallery-dl X runner: {exc}", file=sys.stderr)
         return 32
-    return gallery_dl.main()
+    try:
+        return run_gallery_args(
+            gallery_args,
+            telemetry_path,
+            operation,
+            scheduler_options=scheduler_options,
+            runner_starts=runner_starts,
+        )
+    except pacing.PacingError as exc:
+        print(f"gallery-dl X runner: {exc}", file=sys.stderr)
+        return 32
+
+
+def main(argv: list[str] | None = None) -> int:
+    values = list(sys.argv[1:] if argv is None else argv)
+    try:
+        worker_options, remaining = runner_control.parse_worker_options(values)
+        if worker_options is not None and remaining:
+            raise runner_control.ControlProtocolError(
+                "control-worker startup does not accept gallery arguments"
+            )
+        if worker_options is not None:
+            install_patch()
+    except (
+        importlib.metadata.PackageNotFoundError,
+        runner_control.ControlProtocolError,
+        ShimCompatibilityError,
+    ) as exc:
+        print(f"gallery-dl X runner: {exc}", file=sys.stderr)
+        return 32
+    if worker_options is not None:
+        return runner_control.worker_loop(worker_options, run_once)
+    return run_once(remaining)
 
 
 if __name__ == "__main__":

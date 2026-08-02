@@ -266,6 +266,56 @@ at-least-equivalent evidence. Convenience or speed alone is not proof.
   and moved to maintained counters/current pointers if it measurably contends
   with the worker, but it is lower priority than request and commit-path work.
 
+### File verification, recovery, and log hot paths
+
+- Shared-media reconciliation calls `pending_media_is_complete()` separately
+  for queued records. Each expected ordinal can recursively search the entire
+  media tree, and unavailable matching is a linear scan of the unavailable
+  list. With many jobs this becomes repeated tree walking rather than indexed
+  lookup by `(post_id, media_ordinal)`.
+- Context-media completion recursively searches sidecars for one post and
+  re-hashes every matching asset, including large videos, whenever completion
+  is checked. Full-content verification is necessary at capture and explicit
+  audit boundaries, but repeating it during ordinary queue selection is not.
+- `run_gallery_dl()` already classifies failures while streaming child output,
+  then calls `analyze_gallery_log()` to read and classify the complete log a
+  second time. This is a bounded P2 candidate unless large-log measurements
+  show material overhead.
+- Startup recovery performs several independent full manifest-directory passes
+  for abandoned runs, download-only recovery, stalled-run recovery, legacy
+  recovery, and progress reconstruction. Immutable manifests remain required,
+  but a durable processed-run/current pointer can avoid reparsing old manifests
+  during ordinary startup.
+
+## Authoritative Stage 1 Decisions
+
+- Actual request counting is anchored at urllib3 `_make_request` and urllib
+  `AbstractHTTPHandler.do_open`, with session/connection starts counted
+  separately. Higher Requests/yt-dlp hooks are not accepted as the primary
+  ledger because they can hide or misattribute lower retries and redirects.
+- Media descriptors will be captured through a narrow private postprocessor on
+  gallery-dl's `prepare` event. `--no-download` preserves all required file
+  events while issuing zero CDN requests; exact accepted post IDs filter
+  provisional conversation/search rows before durable insertion.
+- Descriptor URL expiry is generation/outcome based. X media events do not
+  supply a trustworthy explicit expiry timestamp, so Stage 5 uses bounded
+  refresh after eligible stale/403 evidence rather than guessed expiry.
+- Bounded reuse will use an account-scoped control worker with an explicitly
+  shared session and per-item begin/result acknowledgements. Plain multi-URL
+  gallery-dl does not supply a safe durable item boundary and does not by itself
+  reuse extractor sessions.
+- The 100,000-target fixture measured roughly 109 ms per metadata claim, 25 ms
+  per media claim, and 123 ms per progress aggregate refresh with the current
+  scan/sort plans. Dashboard counters/current pointers therefore crossed the P2
+  threshold and are required in Stage 8.
+- A 5,000-manifest fixture took roughly 180 ms for one parse pass while startup
+  currently performs several independent passes. Processed-run/current-manifest
+  recovery indexes also crossed the P2 threshold for the large fixture and are
+  required in Stage 8.
+- The synthetic 5,000-post small-delta baseline performed about 15.0 MB of
+  historical read/write work for 924 bytes of new raw data (over 16,000x
+  amplification). Incremental indexed truth is therefore not optional.
+
 ## Prioritized Efficiency Backlog
 
 | Priority | Work | Why it belongs in Goal 5 | Safety condition |
@@ -279,10 +329,11 @@ at-least-equivalent evidence. Convenience or speed alone is not proof.
 | P1 | Reuse verified legacy identity/session | Avoids one profile call per walk | Numeric identity remains bound and every record is validated |
 | P1 | Bounded runner/session reuse | Reduces Python, transaction-key, TLS, and cookie churn | Per-item commits, max age/work cap, clean auth stop |
 | P1 | Incremental post/media indexes | Avoids full JSONL and sidecar rebuilds for tiny deltas | Raw snapshots stay authoritative and exports reproducible |
+| P1 | Indexed asset completion evidence | Avoids recursive media-tree search and repeated large-file hashes per queued job | Verify at capture; detect stat changes; retain explicit full audit |
 | P1 | Incremental context source ingestion | Avoids hashing/parsing old raw history every run | Mutation detection plus explicit full-integrity audit |
 | P1 | Indexed/materialized queue priority | Removes full target scan/sort per item | Preserve depth/fairness/shared-parent semantics |
 | P1 | Generation-aware context export | Avoids 400+ MiB unchanged rewrites | Never report stale export as current |
-| P2 | Current-manifest pointers and recovery indexes | Bounds startup/dashboard scans as run count grows | Manifests remain immutable audit evidence |
+| P2 | Current-manifest pointers and recovery indexes | Bounds repeated startup/dashboard manifest and log scans as run count grows | Manifests remain immutable audit evidence |
 | P2 | Further CDN variant/concurrency tuning | May save failed variant probes or idle time | Separate one-lane default, bandwidth cap, measured need |
 
 P0 and P1 items are part of the goal's required design and verification. A
@@ -444,6 +495,9 @@ Goal 5 is complete only when all of the following have direct evidence:
 
 ### 1-MEASURE
 
+Status: complete. Authoritative results and verification are recorded in
+`goal-5/1-MEASURE.md`.
+
 #### Big-Picture Objective
 
 Establish a trustworthy whole-pipeline request/process/I/O baseline and prove
@@ -490,6 +544,9 @@ mechanisms.
 
 ### 2-STATE
 
+Status: complete. Authoritative migration, query-plan, constraint, and
+benchmark results are recorded in `goal-5/2-STATE.md`.
+
 #### Big-Picture Objective
 
 Design and migrate the minimum coherent durable state needed for descriptors,
@@ -534,6 +591,9 @@ assets, pacing, source ingestion, incremental indexes, and export generations.
 
 ### 3-DESCRIPTORS
 
+Status: complete. Authoritative capture, selection, provenance, privacy, and
+replay results are recorded in `goal-5/3-DESCRIPTORS.md`.
+
 #### Big-Picture Objective
 
 Capture reusable media descriptors during work the archiver already performs,
@@ -572,6 +632,9 @@ and retain them only for records that become authoritative archive scope.
 
 ### 4-DIRECT-MEDIA
 
+Status: complete. Authoritative direct-transfer, recovery, compatibility, and
+verification results are recorded in `goal-5/4-DIRECT-MEDIA.md`.
+
 #### Big-Picture Objective
 
 Download and verify media directly from persisted descriptors without an X
@@ -608,6 +671,9 @@ tweet/profile extractor on the normal or ordinary retry path.
 
 ### 5-FALLBACKS
 
+Status: complete. Authoritative refresh-policy, recovery, compatibility, and
+verification results are recorded in `goal-5/5-FALLBACKS.md`.
+
 #### Big-Picture Objective
 
 Provide a bounded exact-post descriptor refresh for exceptional cases without
@@ -643,6 +709,11 @@ letting compatibility or failure paths erase the request savings.
 - Compatibility jobs migrate lazily; verified complete files never refresh.
 
 ### 6-PACING
+
+Status: complete. Authoritative actual-boundary pacing, bounded-worker,
+fault-recovery, and verification results are recorded in
+`goal-5/6-PACING.md`. Stage 9 owns the unified-command cutover and removal of
+the now-proven redundant logical sleeps.
 
 #### Big-Picture Objective
 
@@ -685,6 +756,10 @@ without increasing X request density.
 
 ### 7-LEGACY
 
+Status: complete. Authoritative adaptive-window, durable-evidence,
+profile-binding, indexed-commit, coalesced-export, recovery, and verification
+results are recorded in `goal-5/7-LEGACY.md`.
+
 #### Big-Picture Objective
 
 Reduce sparse legacy backfill calls and repeated evidence work while retaining
@@ -725,6 +800,10 @@ the source-visible completeness standard.
 - No per-window full portable-dataset rewrite remains.
 
 ### 8-LOCAL
+
+Status: complete. Authoritative incremental-ingestion, one-time migration,
+maintained-counter, generation-export, recovery, fault, and scale results are
+recorded in `goal-5/8-LOCAL.md`.
 
 #### Big-Picture Objective
 
@@ -774,6 +853,10 @@ work proportional to new/actionable data rather than total archive size.
 
 ### 9-INTEGRATE
 
+Status: complete. The identity/local/direct-media/export cutover and the Stage
+6 durable actual-request lane/bounded reusable worker are wired into unified
+orchestration. Details and proof are recorded in `goal-5/9-INTEGRATE.md`.
+
 #### Big-Picture Objective
 
 Make all optimized paths automatic under the one command, with coherent
@@ -815,6 +898,11 @@ ordering, progress, migration, and failure semantics.
 - Multi-user tests preserve isolation/fairness and global auth stop.
 
 ### 10-PROVE
+
+Status: complete. Full natural discovery, the explicit no-cheating/scale and
+failure ladders, pinned-runner fingerprints, compilation/shell/whitespace
+checks, documentation, and deliberate integration/privacy review are green.
+No live request or production archive mutation was used.
 
 #### Big-Picture Objective
 

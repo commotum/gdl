@@ -41,16 +41,32 @@ ancestor-only reply-context queue (including recoverable context media). No
 legacy window count, context post count, seed flag, or follow-up command is
 required for normal operation.
 
+The first run after this storage upgrade performs one identity-guarded local
+migration: it indexes prior manifests and raw sources, reconciles existing
+media/sidecars, and publishes the initial portable generation. This can take
+noticeably longer on a large archive but makes no extra X requests and does not
+redownload verified files. Once its reconciliation pointers are committed,
+unchanged runs use the SQLite registry and exact stat evidence instead of
+re-globbing, reparsing, or rehashing the full archive.
+
 The input file accepts one bare handle, `@handle`, or `x.com`/`twitter.com`
 profile URL per line. Blank lines and lines beginning with `#` are ignored,
 and duplicate handles are removed. The file is parsed by the wrapper rather
 than passed to gallery-dl, so entries cannot act as gallery-dl command-line
 directives.
 
-The default is deliberately slow and fail-closed:
+The default is deliberately restrained and fail-closed:
 
 - one archive process at a time, protected by an exclusive lock;
-- 4–8 seconds between X extraction requests and 1–3 seconds before assets;
+- every actual X API/bootstrap attempt—not merely every script phase—passes
+  through one durable per-account lane with a 4–8 second floor, at most one X
+  request in flight, and no accumulated burst credit after an idle period;
+- the lane persists spacing, quota-reset, HTTP 429, and authentication-stop
+  state across phases, worker replacement, Ctrl-C, and restart; direct media
+  CDN transfers do not consume or weaken that X lane;
+- repeated context and legacy items reuse an account-scoped worker/session for
+  at most 100 items or 15 minutes, then retire cleanly; workers remain
+  sequential and never rotate cookies, identity, headers, or proxies;
 - X rate-limit reset headers are respected, account-lock errors abort, and
   retries are bounded;
 - successful responses received at the end of an X quota window are processed
@@ -105,24 +121,23 @@ instead of silently filling the local disk.
 
 ### Recovering incomplete media
 
-A download-only media error does not force another historical timeline
-backfill. When timeline enumeration otherwise completed, the archiver advances
-the timeline state, records the incomplete asset as pending, and marks the run
-`partial`. Transient failures receive a durable `next_retry_at` and are skipped
-until due rather than retried by every invocation. Video recovery delegates
-variant selection to yt-dlp instead of repeating only gallery-dl's original
-highest-bitrate CDN URL.
+Modern, legacy, context, and profile extraction save private media descriptors
+from responses the archiver already needed. A shared worker then downloads the
+selected asset directly from the allowlisted X media CDN; it does not re-query
+the post just to rediscover the same URL. Existing files are accepted only with
+confined path, sidecar, size/stat, and digest evidence. Interrupted transfers
+retain private partial state and use an HTTP Range request when the server and
+validator permit a safe resume.
 
-Two refreshed attempts at least 24 hours apart that return only HTTP `404` or
-`410` across the available variants classify an asset as source-unavailable.
-Other persistent failures, including repeated HTTP `500` and empty yt-dlp
-results, leave the automatic queue after three distinct archive-run attempts.
-This bounded budget favors an accurately qualified archive over retrying one
-broken asset forever.
-It leaves the automatic queue but retains its post identity, failure history,
-and evidence. An otherwise complete run reports
-`complete_with_unavailable_media`, exits successfully with a warning, and does
-not pretend the missing bytes were recovered.
+Transient CDN failures receive durable eligibility/backoff and a bounded
+attempt budget. A rejected or expired descriptor (`403`, `404`, or `410`)
+enters one bounded exact-post descriptor-refresh generation; all missing
+ordinals for that post share the result instead of spending one X lookup per
+asset. Deleted, protected, suspended, withheld, or confirmed media-absent
+sources become explicit unavailable outcomes. Repeated transient or malformed
+results stop at `manual_review` instead of looping forever. An otherwise
+complete archive reports `complete_with_unavailable_media` without pretending
+that missing bytes were recovered.
 
 To retry only recorded incomplete media without crawling the timeline, run:
 
@@ -130,17 +145,15 @@ To retry only recorded incomplete media without crawling the timeline, run:
 uv run scripts/archive-x --user USERNAME --retry-failed-only
 ```
 
-gallery-dl preserves an interrupted download as a `.part` file and resumes it
-with an HTTP Range request when the server supports resuming. Pending-media
-recovery uses up to 2 retries after the initial request and a 300-second
-inactivity timeout by default;
-these can be changed with `--media-retries` and `--media-timeout`. The normal
-request and endpoint delays still apply.
+The direct media worker uses at most 2 automatic attempts per asset and a
+300-second read-inactivity timeout by default; adjust these with
+`--media-retries` and `--media-timeout`. `--rate-limit` controls CDN bandwidth.
+The X scheduler remains authoritative only for the exceptional descriptor
+refresh, so CDN work cannot compress X request spacing.
 
-If an asset remains incomplete, the recovery run stays `partial` and exits
-nonzero; rerunning the same command continues from the retained `.part` file.
-After a recovery-only run succeeds, run the normal archive command when a
-current timeline and profile-media refresh is also wanted:
+If actionable media remains, the recovery result stays resumable. After a
+recovery-only run, use the normal command when a current timeline and context
+update is also wanted:
 
 ```bash
 uv run scripts/archive-x --user USERNAME
@@ -164,8 +177,9 @@ or generic failures never trigger the handoff.
 
 Once initialized, the same normal command resumes bounded internal UTC windows
 until the source-visible account-creation floor or an explicit manual-review
-stop. Operators do not calculate or supply a window count. New roots target
-three UTC days and split recursively when dense; an interrupted active window
+stop. Operators do not calculate or supply a window count. The policy begins
+at three UTC days, adapts future roots between one and ninety days from proven
+page density, and splits recursively when dense; an interrupted active window
 always retains its original exact bounds.
 
 Each UTC interval is queried with exact epoch-second bounds, never by decoding
@@ -188,9 +202,10 @@ scripts/archive-x-legacy --user USERNAME retry \
   --window-id LEGACY_WINDOW_ID --reason 'operator review reason'
 ```
 
-Legacy metadata completion is independent of media completion. Media-bearing
-posts enter the existing pending-media queue and are retried through the normal
-individual-post recovery path.
+Legacy metadata completion is independent of media completion. Confirmed walks
+commit their returned descriptors with the canonical window, after which the
+shared direct-CDN worker handles the bytes. Only missing or rejected descriptor
+evidence enters the bounded exact-post refresh path.
 
 The standalone legacy CLI is an advanced maintenance interface. Its
 network-free `status`/`plan`, exact guarded `retry`, and optional bounded `run`
@@ -219,11 +234,12 @@ siblings and descendants are discarded. If a successful response omits the
 focal post, the worker performs one paced exact lookup instead of treating
 absence as unavailability. Media requests remain focal-only.
 
-The worker persists its next-safe request time, prefers finishing the current
-ancestor chain, periodically yields between chains/users, and has bounded
-attempts, leases, timeouts, and backoff. Durable SQLite pacing is the sole
-startup delay for these short requests. No `--max-posts` value is required for
-normal closure.
+The worker prefers finishing the current ancestor chain, periodically yields
+between chains/users, and has bounded attempts, leases, timeouts, and backoff.
+Every hidden bootstrap, TweetResult, fallback TweetDetail, redirect, and retry
+uses the same durable actual-request lane as modern and legacy work. One
+account-scoped gallery-dl process/session is reused within its bounded lifetime.
+No `--max-posts` value is required for normal closure.
 
 Stopping with Ctrl-C or SIGTERM leaves the current target retryable. Deleted,
 private, suspended, and withheld boundaries are recorded; ambiguous failures
@@ -237,13 +253,15 @@ post recovered there is archived normally; a second response without the focal
 post becomes an explicit deleted boundary. Other response-shape failures stay
 ambiguous and retain the normal bounded-retry behavior.
 
-Metadata closure is independent of media. Context media is processed
-automatically after metadata, verifies SHA-256 sidecars, and refuses to start
-below 5 GiB free. Failures remain explicit and retryable without unresolving
-captured metadata. Metadata-only requests never write to a download ledger;
-context media uses its own `_state/context-downloads.sqlite3` ledger so a
-metadata observation cannot masquerade as a completed file download. If
-metadata fails, media is deferred instead of consuming the entire media queue.
+Metadata closure is independent of media, but it is no longer a second X pass.
+The first context response commits metadata and reusable descriptors together;
+the direct-CDN worker drains those descriptors automatically, verifies SHA-256
+sidecars, and refuses to start below 5 GiB free. Failures remain explicit and
+retryable without unresolving captured metadata. Metadata-only requests never
+write to a download ledger; completed bytes use
+`_state/context-downloads.sqlite3`, so observing metadata cannot masquerade as
+a completed file. Descriptors committed before a later metadata failure can
+still be drained safely.
 
 The standalone context CLI remains available for advanced read-only status,
 integrity, export, guarded retry, and deliberately bounded maintenance:
@@ -272,11 +290,13 @@ work, rolling throughput, and a confidence-labeled phase-local estimate:
 uv run scripts/archive-x --user USERNAME
 ```
 
-When launched interactively inside tmux at 80x24 or larger, it automatically
-opens a small pane titled `archive-x-dashboard:RUN_ID`. The original pane keeps
-the complete event stream. The dashboard pane owns no archive state and exits
-when the invocation reaches a final status; failure of that pane cannot stop
-the worker. Set `ARCHIVE_X_DASHBOARD=off` to suppress automatic pane creation.
+When launched interactively inside tmux at 72x20 or larger, it automatically
+opens an eight-line pane at the bottom titled `archive-x-dashboard:RUN_ID`.
+The original pane keeps the complete event stream. The bottom pane refreshes
+from live maintained SQLite counters every few seconds, owns no archive state,
+and exits when the invocation reaches a final status; failure of that pane
+cannot stop the worker. Set `ARCHIVE_X_DASHBOARD=off` to suppress automatic
+pane creation.
 
 Outside tmux the worker emits a compact heartbeat at the slower telemetry
 cadence. A snapshot can also be inspected once, or watched, without contacting
@@ -289,10 +309,11 @@ scripts/archive-x-dashboard --archive-root /mnt/Bibliotheque/gdl/x-archive --wat
 
 `known remaining` is the currently discovered actionable context queue, not a
 promise that discovery is finished. ETA is deliberately omitted while the
-queue grows, before enough wall-clock evidence exists, or when work is blocked.
-Deleted, protected, and suspended parents count as neutral unavailable
-boundaries; manual review and authentication/integrity failures remain
-actionable.
+queue grows, before enough completed-item or legacy-window evidence exists, or
+when work is blocked. The media phase has its own remaining count and ETA; it
+does not reuse a metadata estimate that has already reached zero. Deleted,
+protected, and suspended parents count as neutral unavailable boundaries;
+manual review and authentication/integrity failures remain actionable.
 
 ### X archive contents
 
@@ -300,7 +321,7 @@ Each account is self-contained under `users/HANDLE/`:
 
 ```text
 users/HANDLE/
-├── _state/                  # timeline state plus separate context.sqlite3
+├── _state/                  # timeline state plus coherent context.sqlite3
 ├── media/YYYY/MM/           # original images/videos plus JSON sidecars
 ├── media/profile/           # avatar and header history
 ├── runs/RUN_ID/             # immutable raw JSONL, configs, logs, manifest
@@ -326,8 +347,13 @@ does not reliably provide a structured ID for the quoted target. Records also
 store
 `first_captured_at` and `last_captured_at`, because engagement counts describe
 the crawl time rather than a permanent historical total. Raw run snapshots
-remain the source of truth, while `dataset/*.jsonl` are atomically rebuilt
-portable views intended for later indexing or LLM dataset preparation.
+remain immutable provenance. Indexed SQLite truth advances transactionally as
+small deltas; `dataset/*.jsonl` are reproducible portable views published as
+atomic generations. The initial generation, a forced checkpoint, 1,000
+generations of accumulated change, or 24 hours of dirty age triggers
+publication. Until then the dashboard and final summary explicitly show
+durable versus published generations rather than rewriting large JSONL files
+after every small phase.
 
 New media assets receive SHA-256 hashes before their sidecar metadata is
 written. Cookie values are never placed in manifests or logs, and the process

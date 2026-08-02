@@ -1,4 +1,5 @@
 import importlib
+import hashlib
 import io
 import json
 import sys
@@ -17,7 +18,42 @@ if str(SCRIPTS) not in sys.path:
 
 archive_x = importlib.import_module("archive_x")
 context_x = importlib.import_module("archive_x_context")
+descriptor_x = importlib.import_module("archive_x_descriptors")
+local_x = importlib.import_module("archive_x_local")
 unified_x = importlib.import_module("archive_x_unified")
+
+
+class _MediaResponse:
+    def __init__(self, body: bytes):
+        self.status_code = 200
+        self.headers = {
+            "Content-Length": str(len(body)),
+            "Content-Type": "image/jpeg",
+        }
+        self.body = body
+
+    def iter_content(self, chunk_size):
+        del chunk_size
+        yield self.body
+
+    def close(self):
+        pass
+
+
+class _MediaSession:
+    def __init__(self, body: bytes):
+        self.response = _MediaResponse(body)
+        self.calls = []
+        self.trust_env = True
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if len(self.calls) > 1:
+            raise AssertionError("descriptor asset was downloaded twice")
+        return self.response
+
+    def close(self):
+        pass
 
 
 def unified_args(**overrides):
@@ -177,6 +213,141 @@ def transition_archive(root: Path):
 
 
 class UnifiedOrchestrationTests(unittest.TestCase):
+    def test_first_identity_probe_bridges_into_lane_without_stacked_sleep(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir = empty_archive(root)
+            db_path = user_dir / "_state" / "context.sqlite3"
+            with context_x.ContextDB(db_path) as database:
+                database.bind_identity("1", "alice")
+                database.connection.execute(
+                    "UPDATE pacing SET next_request_at=0 WHERE singleton=1"
+                )
+            options = archive_x.x_scheduler_options(user_dir, "1", "0")
+
+            with mock.patch.object(
+                archive_x.random, "uniform", return_value=4.0
+            ), mock.patch.object(
+                archive_x,
+                "sleep_random",
+                side_effect=AssertionError("outer identity sleep ran"),
+            ):
+                archive_x.bridge_identity_probe_boundary(
+                    options, probe_completed_at=10.0
+                )
+            with context_x.ContextDB(db_path, create=False) as database:
+                first = database.connection.execute(
+                    "SELECT next_request_at FROM pacing WHERE singleton=1"
+                ).fetchone()[0]
+                database.connection.execute(
+                    "UPDATE pacing SET next_request_at=20 WHERE singleton=1"
+                )
+            with mock.patch.object(
+                archive_x.random, "uniform", return_value=4.0
+            ):
+                archive_x.bridge_identity_probe_boundary(
+                    options, probe_completed_at=10.0
+                )
+            with context_x.ContextDB(db_path, create=False) as database:
+                second = database.connection.execute(
+                    "SELECT next_request_at FROM pacing WHERE singleton=1"
+                ).fetchone()[0]
+
+            self.assertEqual(first, 14.0)
+            self.assertEqual(second, 20.0)
+
+    def test_existing_identity_probe_uses_bound_durable_request_lane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir = empty_archive(root)
+            db_path = user_dir / "_state" / "context.sqlite3"
+            with context_x.ContextDB(db_path) as database:
+                database.bind_identity("1", "alice")
+            args = archive_x.build_parser(REPO).parse_args(
+                ["--user", "alice", "--output-root", str(root)]
+            )
+            observed = []
+
+            def endpoint(**kwargs):
+                observed.append(kwargs)
+                return {
+                    "endpoint": "info",
+                    "status": "failed",
+                    "exit_code": 1,
+                    "interrupted": False,
+                    "raw_path": "runs/unused/raw/info.posts.incomplete.jsonl",
+                }
+
+            with mock.patch.object(
+                archive_x, "archive_endpoint", side_effect=endpoint
+            ):
+                result = archive_x.archive_user(
+                    args, REPO, root, "alice", "1.32.4"
+                )
+
+            self.assertEqual(result["failure_stage"], "identity_probe")
+            self.assertEqual(len(observed), 1)
+            scheduler = observed[0]["scheduler_options"]
+            self.assertEqual(scheduler.scope_id, "1")
+            self.assertEqual(scheduler.database, db_path)
+            self.assertFalse(observed[0]["download_media"])
+
+    def test_context_scheduler_reuses_one_lazy_account_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir = empty_archive(root)
+            db_path = user_dir / "_state" / "context.sqlite3"
+            with context_x.ContextDB(db_path) as database:
+                database.bind_identity("1", "alice")
+            runner = object()
+            factories = []
+            workers = []
+
+            @contextmanager
+            def client(repo_dir, account_id, *, legacy=False):
+                factories.append((repo_dir, account_id, legacy))
+                yield runner
+
+            def worker(
+                args,
+                repo_dir,
+                archive_root,
+                handle,
+                *,
+                media,
+                max_posts,
+                runner=None,
+            ):
+                workers.append(runner)
+                return {
+                    "status": "complete",
+                    "counts": {"attempted": 2},
+                    "availability": {
+                        "total": 0,
+                        "ready": 0,
+                        "manual_review": 0,
+                        "next_eligible_at": None,
+                    },
+                }
+
+            with mock.patch.object(
+                archive_x, "x_runner_control_client", side_effect=client
+            ), mock.patch.object(
+                unified_x, "run_context_worker", side_effect=worker
+            ):
+                result = unified_x.run_context_scheduler(
+                    unified_args(),
+                    REPO,
+                    root,
+                    ["alice"],
+                    media=False,
+                    persistent_runner=True,
+                )
+
+            self.assertEqual(result["alice"]["status"], "complete")
+            self.assertEqual(factories, [(REPO, "1", False)])
+            self.assertEqual(workers, [runner])
+
     def test_unavailable_media_is_a_successful_warning_status(self):
         self.assertEqual(
             unified_x.overall_status(
@@ -338,17 +509,12 @@ class UnifiedOrchestrationTests(unittest.TestCase):
             context_x.seed_context(user_dir, db_path, dry_run=False, max_depth=1000)
             calls = []
 
-            def worker(args, repo_dir, archive_root, handle, *, media, max_posts):
-                calls.append(media)
+            def worker(args, repo_dir, archive_root, handle, **_kwargs):
+                calls.append(handle)
                 return {
                     "status": "complete",
-                    "counts": {"attempted": 0},
-                    "availability": {
-                        "total": 0,
-                        "ready": 0,
-                        "manual_review": 0,
-                        "next_eligible_at": None,
-                    },
+                    "pending_before": 0,
+                    "pending_after": 0,
                 }
 
             with mock.patch.object(
@@ -356,7 +522,7 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                 "seed_context",
                 side_effect=AssertionError("retry-only seed"),
             ), mock.patch.object(
-                unified_x, "run_context_worker", side_effect=worker
+                unified_x, "run_media_pipeline", side_effect=worker
             ):
                 result = unified_x.run_unified_followups(
                     unified_args(retry_failed_only=True),
@@ -375,10 +541,146 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                     },
                 )
 
-            self.assertEqual(calls, [True])
+            self.assertEqual(calls, ["alice"])
             self.assertNotIn("context_seed", result["alice"])
             self.assertNotIn("context_metadata", result["alice"])
             self.assertEqual(result["alice"]["context_media"]["status"], "complete")
+
+    def test_descriptor_media_pipeline_uses_one_cdn_call_and_zero_x_calls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir = empty_archive(root)
+            db_path = user_dir / "_state" / "context.sqlite3"
+            body = b"descriptor-media"
+            url = "https://pbs.twimg.com/media/parent-1.jpg?name=orig"
+            filename = "2026-01-01T00-00-00_100_1_other.jpg"
+            relative = f"users/alice/media/context/2026/01/{filename}"
+            descriptor = {
+                "schema": descriptor_x.SCHEMA,
+                "schema_version": descriptor_x.SCHEMA_VERSION,
+                "operation_id": "context:100",
+                "run_id": "context",
+                "source_kind": "context",
+                "source_operation": "context",
+                "owner_kind": "post",
+                "owner_id": "100",
+                "post_id": "100",
+                "media_ordinal": 1,
+                "media_type": "photo",
+                "extension": "jpg",
+                "private_url": url,
+                "url_sha256": hashlib.sha256(url.encode()).hexdigest(),
+                "url_host": "pbs.twimg.com",
+                "filename": filename,
+                "relative_directory": str(Path(relative).parent),
+                "relative_path": relative,
+                "width": 1200,
+                "height": 800,
+                "duration_seconds": None,
+                "bitrate": None,
+                "alt_text": None,
+                "variant": {"type": "photo", "width": 1200, "height": 800},
+                "posted_at": "2026-01-01T00:00:00Z",
+                "original_posted_at": None,
+                "author_id": "2",
+                "author_handle": "other",
+                "conversation_id": "100",
+                "reply_id": None,
+                "retweet_id": None,
+                "captured_at": "2026-01-02T00:00:00Z",
+            }
+            descriptor["descriptor_sha256"] = hashlib.sha256(
+                descriptor_x.canonical_json(
+                    descriptor_x.descriptor_payload(descriptor)
+                ).encode()
+            ).hexdigest()
+            descriptor = descriptor_x.normalize_record(descriptor)
+            batch = descriptor_x.DescriptorBatch(
+                operation_id="context:100",
+                run_id="context",
+                source_kind="context",
+                source_operation="context",
+                rows=(descriptor,),
+                source_sha256=hashlib.sha256(b"descriptor fixture").hexdigest(),
+                ephemeral=True,
+            )
+            metadata = {
+                "tweet_id": 100,
+                "conversation_id": 100,
+                "reply_id": 0,
+                "retweet_id": 0,
+                "count": 1,
+                "date": "2026-01-01 00:00:00",
+                "archived_at": "2026-01-02T00:00:00Z",
+                "author": {"id": 2, "name": "other"},
+                "user": {"id": 1, "name": "alice"},
+            }
+            with context_x.ContextDB(db_path) as database:
+                database.bind_identity("1", "alice")
+                database.upsert_target(
+                    "100",
+                    conversation_id="100",
+                    depth=0,
+                    observed_at="2026-01-01T00:00:00Z",
+                )
+                database.capture(
+                    "100",
+                    metadata,
+                    source_kind="x:focal",
+                    target_user_id="1",
+                    max_depth=10,
+                    descriptor_batches=(batch,),
+                )
+
+            session = _MediaSession(body)
+            with mock.patch.object(
+                unified_x.media_x.requests, "Session", return_value=session
+            ), mock.patch.object(
+                context_x,
+                "reserve_request",
+                side_effect=AssertionError("descriptor hit entered the X lane"),
+            ):
+                first = unified_x.run_media_pipeline(
+                    unified_args(), REPO, root, "alice"
+                )
+                second = unified_x.run_media_pipeline(
+                    unified_args(), REPO, root, "alice"
+                )
+
+            self.assertEqual(first["status"], "complete")
+            self.assertEqual(first["direct_attempted"], 1)
+            self.assertEqual(first["downloaded"], 1)
+            self.assertEqual(first["refresh_attempted"], 0)
+            self.assertEqual(first["x_api_requests"], 0)
+            self.assertEqual(first["x_support_requests"], 0)
+            self.assertEqual(len(session.calls), 1)
+            self.assertEqual(second["direct_attempted"], 0)
+            self.assertEqual(second["refresh_attempted"], 0)
+            self.assertEqual(second["x_api_requests"], 0)
+
+    def test_final_summary_distinguishes_durable_and_published_generations(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            archive_x.print_invocation_summary(
+                [
+                    {
+                        "requested_handle": "alice",
+                        "status": "success",
+                        "phases": {
+                            "context_export": {
+                                "status": "deferred",
+                                "durable_generation": 12,
+                                "exported_generation": 9,
+                            }
+                        },
+                    }
+                ]
+            )
+        self.assertIn(
+            "context_export: deferred (durable generation 12; "
+            "published generation 9)",
+            output.getvalue(),
+        )
 
     def test_retry_only_identity_failure_never_launches_context_media(self):
         with mock.patch.object(
@@ -430,7 +732,8 @@ class UnifiedOrchestrationTests(unittest.TestCase):
             text = output.getvalue()
             self.assertIn("phase 1: modern", text)
             self.assertIn("phase 2: guarded automatic legacy", text)
-            self.assertIn("phase 3: seed and drain ancestor-only", text)
+            self.assertIn("phase 3: seed reply ancestors", text)
+            self.assertIn("no extra X endpoint", text)
             self.assertIn("context: bootstrap from committed sources", text)
             self.assertIn("archive filesystem in this process: read-write", text)
 
@@ -508,7 +811,7 @@ class UnifiedOrchestrationTests(unittest.TestCase):
             self.assertIn("advanced context metadata bound: 2", text)
             self.assertIn("advanced context media bound: 3", text)
             self.assertIn("1 metadata pending", text)
-            self.assertIn("integrity=ok", text)
+            self.assertIn("integrity=not checked", text)
 
     def test_dry_run_reports_completed_legacy_without_exposing_cursor(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -868,15 +1171,23 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                 media=False,
             )
 
-    def test_metadata_failure_blocks_context_media_but_still_exports(self):
+    def test_metadata_failure_still_drains_committed_media_and_exports(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             empty_archive(root)
             calls = []
 
             def scheduler(
-                args, repo_dir, archive_root, handles, *, media, progress=None
+                args,
+                repo_dir,
+                archive_root,
+                handles,
+                *,
+                media,
+                progress=None,
+                persistent_runner=False,
             ):
+                self.assertTrue(persistent_runner)
                 calls.append(media)
                 if media:
                     self.fail("context media ran after metadata failed")
@@ -887,7 +1198,11 @@ class UnifiedOrchestrationTests(unittest.TestCase):
 
             with mock.patch.object(
                 unified_x, "run_context_scheduler", side_effect=scheduler
-            ):
+            ), mock.patch.object(
+                unified_x,
+                "run_media_pipeline",
+                return_value={"status": "complete", "pending_after": 0},
+            ) as media_worker:
                 result = unified_x.run_unified_followups(
                     unified_args(),
                     REPO,
@@ -900,13 +1215,8 @@ class UnifiedOrchestrationTests(unittest.TestCase):
             self.assertEqual(
                 result["alice"]["context_metadata"]["status"], "failed"
             )
-            self.assertEqual(
-                result["alice"]["context_media"],
-                {
-                    "status": "blocked",
-                    "reason": "context_metadata_failed",
-                },
-            )
+            self.assertEqual(result["alice"]["context_media"]["status"], "complete")
+            self.assertEqual(media_worker.call_count, 2)
             self.assertEqual(
                 result["alice"]["context_export"]["status"], "complete"
             )
@@ -1024,27 +1334,111 @@ class UnifiedOrchestrationTests(unittest.TestCase):
             self.assertEqual(status["availability"]["manual_review"], 1)
             self.assertEqual(status["availability"]["ready"], 1)
 
-    def test_legacy_preparation_failure_creates_no_modern_run_directory(self):
+    def test_legacy_preparation_runs_after_identity_and_before_timeline(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             user_dir = root / "users" / "alice"
             archive_x.atomic_write_json(
                 user_dir / "_state" / "state.json",
-                {"legacy_backfill": {"status": "pending"}},
+                {
+                    "requested_user_id": "1",
+                    "requested_handle": "alice",
+                    "canonical_handle": "alice",
+                    "legacy_backfill": {"status": "pending"},
+                },
             )
-            legacy_module = mock.Mock()
-            legacy_module.automatic_initialize_legacy.side_effect = (
-                archive_x.ArchiveError("migration fault")
+            args = archive_x.build_parser(REPO).parse_args(
+                ["--user", "alice", "--output-root", str(root)]
             )
+            endpoints = []
+
+            def endpoint(**kwargs):
+                name = kwargs["endpoint"]
+                endpoints.append(name)
+                raw = kwargs["run_dir"] / "raw" / f"{name}.posts.jsonl"
+                archive_x.atomic_write_jsonl(
+                    raw, [{"id": 1, "name": "alice"}]
+                )
+                return {
+                    "endpoint": name,
+                    "status": "success",
+                    "exit_code": 0,
+                    "interrupted": False,
+                    "raw_path": str(raw.relative_to(user_dir)),
+                }
 
             with mock.patch.object(
-                archive_x.importlib, "import_module", return_value=legacy_module
-            ), self.assertRaises(archive_x.ArchiveError):
-                archive_x.archive_user(
-                    unified_args(), REPO, root, "alice", "1.32.4"
+                archive_x, "archive_endpoint", side_effect=endpoint
+            ), mock.patch(
+                "archive_x_legacy.automatic_initialize_legacy",
+                side_effect=archive_x.ArchiveError("migration fault"),
+            ) as initialize:
+                result = archive_x.archive_user(
+                    args, REPO, root, "alice", "1.32.4"
                 )
 
-            self.assertFalse((user_dir / "runs").exists())
+            self.assertEqual(endpoints, ["info"])
+            self.assertEqual(initialize.call_count, 1)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_stage"], "post_identity_recovery")
+
+    def test_identity_mismatch_cannot_mutate_prior_recovery_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir = root / "users" / "alice"
+            state_path = user_dir / "_state" / "state.json"
+            archive_x.atomic_write_json(
+                state_path,
+                {
+                    "requested_user_id": "1",
+                    "requested_handle": "alice",
+                    "canonical_handle": "alice",
+                    "pending_media": [{"post_id": "100", "attempts": 2}],
+                },
+            )
+            prior_manifest = user_dir / "runs" / "prior" / "manifest.json"
+            archive_x.atomic_write_json(
+                prior_manifest,
+                {
+                    "run_id": "prior",
+                    "status": "running",
+                    "started_at": "2026-01-01T00:00:00Z",
+                },
+            )
+            state_before = state_path.read_bytes()
+            manifest_before = prior_manifest.read_bytes()
+            args = archive_x.build_parser(REPO).parse_args(
+                ["--user", "alice", "--output-root", str(root)]
+            )
+
+            def endpoint(**kwargs):
+                raw = kwargs["run_dir"] / "raw" / "info.posts.jsonl"
+                archive_x.atomic_write_jsonl(
+                    raw, [{"id": 2, "name": "alice"}]
+                )
+                return {
+                    "endpoint": "info",
+                    "status": "success",
+                    "exit_code": 0,
+                    "interrupted": False,
+                    "raw_path": str(raw.relative_to(user_dir)),
+                }
+
+            with mock.patch.object(
+                archive_x, "archive_endpoint", side_effect=endpoint
+            ), mock.patch.object(
+                archive_x,
+                "finalize_abandoned_manifests",
+                side_effect=AssertionError("recovery ran before identity"),
+            ):
+                result = archive_x.archive_user(
+                    args, REPO, root, "alice", "1.32.4"
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_stage"], "identity_guard")
+            self.assertEqual(state_path.read_bytes(), state_before)
+            self.assertEqual(prior_manifest.read_bytes(), manifest_before)
 
     def test_archive_user_reuses_proven_history_before_timeline_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1054,9 +1448,18 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                 ["--user", "alice", "--output-root", str(root)]
             )
             timeline_calls = []
+            endpoint_names = []
+            current_timeline_created = [False]
+            original_iter_jsonl = archive_x.iter_jsonl
+
+            def no_timeline_second_parse(path):
+                if current_timeline_created[0] and "timeline.posts" in Path(path).name:
+                    raise AssertionError("timeline source parsed twice")
+                return original_iter_jsonl(path)
 
             def endpoint(**kwargs):
                 name = kwargs["endpoint"]
+                endpoint_names.append(name)
                 raw = kwargs["run_dir"] / "raw" / f"{name}.posts.jsonl"
                 if name == "info":
                     records = [
@@ -1070,6 +1473,7 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                     records = []
                 archive_x.atomic_write_jsonl(raw, records)
                 if name == "timeline":
+                    current_timeline_created[0] = True
                     timeline_calls.append(
                         {
                             "cursor": kwargs["cursor"],
@@ -1094,12 +1498,32 @@ class UnifiedOrchestrationTests(unittest.TestCase):
 
             with mock.patch.object(
                 archive_x, "archive_endpoint", side_effect=endpoint
-            ), mock.patch.object(archive_x, "sleep_random", return_value=None):
+            ), mock.patch.object(
+                archive_x, "sleep_random", return_value=None
+            ), mock.patch.object(
+                archive_x,
+                "update_post_dataset",
+                side_effect=AssertionError("full post rewrite"),
+            ), mock.patch.object(
+                archive_x,
+                "update_media_dataset",
+                side_effect=AssertionError("recursive media scan"),
+            ), mock.patch.object(
+                archive_x, "iter_jsonl", side_effect=no_timeline_second_parse
+            ):
                 result = archive_x.archive_user(
                     args, REPO, root, "alice", "1.32.4"
                 )
 
             self.assertEqual(result["status"], "success")
+            self.assertNotIn(result["run_id"], result["finalized_abandoned_runs"])
+            self.assertEqual(endpoint_names, ["info", "timeline"])
+            self.assertEqual(
+                result["profile_media"]["separate_x_extractors"], 0
+            )
+            self.assertEqual(
+                result["media_dataset"]["recursive_sidecar_scan"], False
+            )
             self.assertEqual(len(timeline_calls), 1)
             self.assertIsNone(timeline_calls[0]["cursor"])
             self.assertIsNotNone(timeline_calls[0]["date_after"])
@@ -1111,6 +1535,12 @@ class UnifiedOrchestrationTests(unittest.TestCase):
             self.assertEqual(
                 result["legacy_transition_preflight"]["status"],
                 "initialized",
+            )
+            self.assertEqual(
+                local_x.indexed_recovery_manifest_candidates(
+                    user_dir, user_dir / "_state" / "context.sqlite3"
+                ),
+                [],
             )
 
     def test_main_holds_two_outer_locks_once_and_calls_unified_phases(self):

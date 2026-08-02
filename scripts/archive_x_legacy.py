@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -18,6 +19,9 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 import archive_x
+import archive_x_context as context_x
+import archive_x_descriptors as descriptor_x
+import archive_x_pacing as pacing_x
 
 
 LEGACY_SCHEMA_VERSION = 1
@@ -29,9 +33,97 @@ CURSOR_RE = re.compile(r"3_(\d+)/\Z")
 LEGACY_TERMINAL_REASONS = {"no_cursor", "distinct_empty_tail"}
 DEFAULT_ROOT_WINDOW_DAYS = 3
 DEFAULT_EMPTY_TAIL_PAGES = 2
+MIN_ROOT_WINDOW_SECONDS = 24 * 60 * 60
+MAX_ROOT_WINDOW_SECONDS = 90 * 24 * 60 * 60
+MAX_RETAINED_OBSERVATIONS_PER_LEAF = 8
+MAX_PENDING_PORTABLE_EXPORTS = 10_000
+LEGACY_POLICY_SCHEMA_VERSION = 1
 # Twitter's documented Snowflake epoch. Returned metadata before this instant
 # is evidence about the ID domain only; it is never used to paginate legacy IDs.
 SNOWFLAKE_EPOCH = datetime(2010, 11, 4, 1, 42, 54, 657000, tzinfo=timezone.utc)
+
+
+def _relative_evidence_path(value: Any, field: str) -> str:
+    text = str(value or "")
+    path = Path(text)
+    if not text or path.is_absolute() or ".." in path.parts:
+        raise archive_x.ArchiveError(f"legacy {field} path is invalid")
+    return text
+
+
+def _positive_counter(value: Any, field: str, *, allow_zero: bool = True) -> int:
+    minimum = 0 if allow_zero else 1
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise archive_x.ArchiveError(f"legacy {field} counter is invalid")
+    return value
+
+
+def validate_window_policy(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema_version") != (
+        LEGACY_POLICY_SCHEMA_VERSION
+    ):
+        raise archive_x.ArchiveError("legacy adaptive window policy is invalid")
+    required = {
+        "schema_version",
+        "next_window_seconds",
+        "minimum_seconds",
+        "maximum_seconds",
+        "last_decision",
+    }
+    if not required <= set(value):
+        raise archive_x.ArchiveError("legacy adaptive window policy is incomplete")
+    minimum = _positive_counter(
+        value["minimum_seconds"], "adaptive minimum", allow_zero=False
+    )
+    maximum = _positive_counter(
+        value["maximum_seconds"], "adaptive maximum", allow_zero=False
+    )
+    next_seconds = _positive_counter(
+        value["next_window_seconds"], "adaptive next window", allow_zero=False
+    )
+    if (
+        minimum != MIN_ROOT_WINDOW_SECONDS
+        or maximum != MAX_ROOT_WINDOW_SECONDS
+        or not minimum <= next_seconds <= maximum
+    ):
+        raise archive_x.ArchiveError("legacy adaptive window bounds changed")
+    if value["last_decision"] not in {
+        "initial",
+        "sparse_grow",
+        "dense_shrink",
+        "steady",
+        "floor_clip",
+    }:
+        raise archive_x.ArchiveError("legacy adaptive decision is invalid")
+    for field in (
+        "last_search_requests",
+        "last_api_requests",
+        "last_post_count",
+        "last_leaf_count",
+    ):
+        if field in value:
+            _positive_counter(value[field], field)
+    last_window_id = value.get("last_window_id")
+    if last_window_id is not None and (
+        not isinstance(last_window_id, str)
+        or not last_window_id
+        or len(last_window_id) > 80
+    ):
+        raise archive_x.ArchiveError("legacy adaptive last window is invalid")
+    return value
+
+
+def new_window_policy(seconds: int) -> dict[str, Any]:
+    bounded = max(
+        MIN_ROOT_WINDOW_SECONDS, min(MAX_ROOT_WINDOW_SECONDS, int(seconds))
+    )
+    return {
+        "schema_version": LEGACY_POLICY_SCHEMA_VERSION,
+        "next_window_seconds": bounded,
+        "minimum_seconds": MIN_ROOT_WINDOW_SECONDS,
+        "maximum_seconds": MAX_ROOT_WINDOW_SECONDS,
+        "last_decision": "initial",
+    }
 
 
 @dataclass(frozen=True)
@@ -228,6 +320,121 @@ def validate_source(source: Any, expected_user_id: str | None = None) -> None:
         raise archive_x.ArchiveError("legacy expected numeric account ID is invalid")
 
 
+def validate_retained_observation(
+    value: Any, *, leaf_since: str, leaf_until: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise archive_x.ArchiveError("legacy retained observation is invalid")
+    required = {
+        "observation_id",
+        "archive_run_id",
+        "walk_id",
+        "since",
+        "until",
+        "query_sha256",
+        "compatibility_sha256",
+        "raw_path",
+        "raw_sha256",
+        "telemetry_path",
+        "telemetry_sha256",
+        "request_limit",
+        "empty_tail_pages",
+        "search_requests",
+        "api_requests",
+        "accepted_count",
+    }
+    if not required <= set(value):
+        raise archive_x.ArchiveError("legacy retained observation is incomplete")
+    for field in (
+        "observation_id",
+        "query_sha256",
+        "compatibility_sha256",
+        "raw_sha256",
+        "telemetry_sha256",
+    ):
+        require_sha256(value[field], f"retained {field}")
+    if value["since"] != leaf_since or value["until"] != leaf_until:
+        raise archive_x.ArchiveError("legacy retained observation bounds changed")
+    for field in ("archive_run_id", "walk_id"):
+        text = str(value.get(field) or "")
+        if not text or len(text) > 200 or "\x00" in text:
+            raise archive_x.ArchiveError(
+                f"legacy retained observation {field} is invalid"
+            )
+    _relative_evidence_path(value["raw_path"], "retained raw")
+    _relative_evidence_path(value["telemetry_path"], "retained telemetry")
+    request_limit = _positive_counter(
+        value["request_limit"], "retained request limit", allow_zero=False
+    )
+    empty_tail = _positive_counter(
+        value["empty_tail_pages"], "retained empty tail", allow_zero=False
+    )
+    if empty_tail >= request_limit:
+        raise archive_x.ArchiveError("legacy retained request proof is invalid")
+    for field in ("search_requests", "api_requests", "accepted_count"):
+        _positive_counter(value[field], f"retained {field}")
+    if value["api_requests"] < value["search_requests"]:
+        raise archive_x.ArchiveError("legacy retained API counters are inconsistent")
+    descriptor_path = value.get("descriptor_artifact_path")
+    descriptor_hash = value.get("descriptor_artifact_sha256")
+    if (descriptor_path is None) != (descriptor_hash is None):
+        raise archive_x.ArchiveError(
+            "legacy retained descriptor evidence is incomplete"
+        )
+    if descriptor_path is not None:
+        _relative_evidence_path(descriptor_path, "retained descriptor")
+        require_sha256(descriptor_hash, "retained descriptor hash")
+    return value
+
+
+def validate_pending_exports(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_PENDING_PORTABLE_EXPORTS:
+        raise archive_x.ArchiveError("legacy pending portable exports are invalid")
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or not {
+            "window_id",
+            "since",
+            "until",
+            "canonical_raw_path",
+            "canonical_raw_sha256",
+            "indexed_generation",
+        } <= set(item):
+            raise archive_x.ArchiveError(
+                "legacy pending portable export is incomplete"
+            )
+        window = str(item.get("window_id") or "")
+        if not window or window in seen:
+            raise archive_x.ArchiveError(
+                "legacy pending portable export identity is invalid"
+            )
+        seen.add(window)
+        since = parse_utc(item["since"], "pending export since")
+        until = parse_utc(item["until"], "pending export until")
+        if not since < until:
+            raise archive_x.ArchiveError(
+                "legacy pending portable export bounds are invalid"
+            )
+        if window_id(item["since"], item["until"]) != window:
+            raise archive_x.ArchiveError(
+                "legacy pending portable export bounds changed"
+            )
+        _relative_evidence_path(
+            item["canonical_raw_path"], "pending canonical raw"
+        )
+        require_sha256(
+            item["canonical_raw_sha256"], "pending canonical raw hash"
+        )
+        _positive_counter(
+            item["indexed_generation"],
+            "pending indexed generation",
+            allow_zero=False,
+        )
+    return value
+
+
 def validate_active_window(active: Any, floor: datetime, initial: datetime) -> None:
     if not isinstance(active, dict):
         raise archive_x.ArchiveError("legacy active_window must be an object")
@@ -244,15 +451,41 @@ def validate_active_window(active: Any, floor: datetime, initial: datetime) -> N
     if not isinstance(leaves, list) or not leaves:
         raise archive_x.ArchiveError("legacy active_window leaves are missing")
     expected = since
+    observation_ids: set[str] = set()
+    observation_paths: set[str] = set()
     for leaf in leaves:
-        if not isinstance(leaf, dict) or set(leaf) != {"since", "until", "status"}:
+        if not isinstance(leaf, dict) or not {"since", "until", "status"} <= set(leaf):
             raise archive_x.ArchiveError("legacy active leaf is malformed")
+        if set(leaf) - {"since", "until", "status", "observations"}:
+            raise archive_x.ArchiveError("legacy active leaf fields are invalid")
         leaf_since = parse_utc(leaf["since"], "active leaf since")
         leaf_until = parse_utc(leaf["until"], "active leaf until")
         if leaf_since != expected or not leaf_since < leaf_until:
             raise archive_x.ArchiveError("legacy active leaves are not contiguous")
         if leaf["status"] not in {"pending", "confirmed"}:
             raise archive_x.ArchiveError("legacy active leaf status is invalid")
+        observations = leaf.get("observations", [])
+        if (
+            not isinstance(observations, list)
+            or len(observations) > MAX_RETAINED_OBSERVATIONS_PER_LEAF
+        ):
+            raise archive_x.ArchiveError(
+                "legacy active leaf observation count is invalid"
+            )
+        for observation in observations:
+            validate_retained_observation(
+                observation,
+                leaf_since=leaf["since"],
+                leaf_until=leaf["until"],
+            )
+            observation_id = observation["observation_id"]
+            raw_path = observation["raw_path"]
+            if observation_id in observation_ids or raw_path in observation_paths:
+                raise archive_x.ArchiveError(
+                    "legacy retained observation is duplicated"
+                )
+            observation_ids.add(observation_id)
+            observation_paths.add(raw_path)
         expected = leaf_until
     if expected != until:
         raise archive_x.ArchiveError("legacy active leaves do not cover the window")
@@ -312,6 +545,10 @@ def validate_legacy_state(
         raise archive_x.ArchiveError("legacy manual-review evidence is missing")
     if status != "manual_review" and manual is not None:
         raise archive_x.ArchiveError("legacy manual_review must otherwise be null")
+    policy = legacy.get("window_policy")
+    if policy is not None:
+        validate_window_policy(policy)
+    validate_pending_exports(legacy.get("pending_portable_exports"))
     return legacy
 
 
@@ -1033,6 +1270,8 @@ def build_legacy_gallery_config(
     request_delay: str,
     include_reposts: bool,
     empty_tail_pages: int,
+    descriptor_artifact: Path | None = None,
+    descriptor_operation_id: str | None = None,
 ) -> dict[str, Any]:
     if empty_tail_pages < 1:
         raise archive_x.ArchiveError(
@@ -1053,6 +1292,14 @@ def build_legacy_gallery_config(
         include_reposts=include_reposts,
         checksums=False,
         cursor=None,
+        descriptor_artifact=descriptor_artifact,
+        descriptor_operation_id=descriptor_operation_id,
+        descriptor_source_kind=(
+            "legacy" if descriptor_artifact is not None else None
+        ),
+        descriptor_source_operation=(
+            "legacy" if descriptor_artifact is not None else None
+        ),
     )
     twitter = config["extractor"]["twitter"]
     # Enumeration must not depend on the media-download archive. Both walks
@@ -1072,7 +1319,10 @@ def build_legacy_gallery_config(
             "expand": False,
             "showreplies": False,
             "cards": False,
-            "videos": False,
+            # --no-download still emits prepare events. Keep video extraction
+            # enabled so confirmed walks retain the already returned CDN
+            # descriptor without transferring bytes.
+            "videos": True,
             "previews": False,
             "articles": False,
         }
@@ -1084,12 +1334,15 @@ def legacy_gallery_command(
     repo_dir: Path,
     config_path: Path,
     telemetry_path: Path,
+    request_telemetry_path: Path,
     *,
     request_limit: int,
     empty_tail_pages: int,
     retries: int,
     http_timeout: int,
+    requested_user_id: str,
     url: str,
+    scheduler_options: pacing_x.SchedulerOptions | None = None,
 ) -> list[str]:
     if request_limit < 1:
         raise archive_x.ArchiveError("legacy request limit must be positive")
@@ -1097,7 +1350,9 @@ def legacy_gallery_command(
         raise archive_x.ArchiveError(
             "legacy empty-tail page count must be below the request limit"
         )
-    return [
+    if not requested_user_id.isdecimal() or int(requested_user_id) < 1:
+        raise archive_x.ArchiveError("legacy bound user ID is invalid")
+    command = [
         sys.executable,
         str(repo_dir / "scripts" / "gallery_dl_x_legacy_runner.py"),
         "--archive-x-legacy-telemetry",
@@ -1106,6 +1361,16 @@ def legacy_gallery_command(
         str(request_limit),
         "--archive-x-legacy-empty-tail-pages",
         str(empty_tail_pages),
+        "--archive-x-legacy-bound-user-id",
+        requested_user_id,
+        "--archive-x-request-telemetry",
+        str(request_telemetry_path),
+        "--archive-x-operation",
+        "legacy_walk",
+    ]
+    if scheduler_options is not None:
+        command.extend(pacing_x.options_as_runner_args(scheduler_options))
+    command.extend([
         "--config-ignore",
         "-c",
         str(repo_dir / "gallery-dl.conf"),
@@ -1117,13 +1382,14 @@ def legacy_gallery_command(
         "--http-timeout",
         str(http_timeout),
         "--sleep-retries",
-        "30-60",
+        "0" if scheduler_options is not None else "30-60",
         "--sleep-429",
-        "300",
+        "0" if scheduler_options is not None else "300",
         "--retries",
         str(retries),
         url,
-    ]
+    ])
+    return command
 
 
 def verify_legacy_runner(repo_dir: Path, version: str) -> None:
@@ -1227,6 +1493,7 @@ def validate_walk_telemetry(
     empty_tail_pages: int,
     exit_code: int,
     expected_user_id: str,
+    require_bound_identity: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(telemetry, dict) or telemetry.get("schema_version") != 1:
         raise archive_x.ArchiveError("legacy walk telemetry schema is invalid")
@@ -1244,6 +1511,24 @@ def validate_walk_telemetry(
     if telemetry.get("profile_user_ids") != [expected_user_id]:
         raise archive_x.ArchiveError(
             "legacy walk profile identity does not match the archive"
+        )
+    identity_source = telemetry.get("identity_source", "profile_api")
+    profile_requests = telemetry.get(
+        "profile_requests", 1 if identity_source == "profile_api" else 0
+    )
+    if identity_source not in {"profile_api", "bound_numeric_id"} or not isinstance(
+        profile_requests, int
+    ):
+        raise archive_x.ArchiveError("legacy walk identity evidence is invalid")
+    if (
+        identity_source == "bound_numeric_id" and profile_requests != 0
+    ) or (
+        identity_source == "profile_api" and profile_requests < 1
+    ):
+        raise archive_x.ArchiveError("legacy walk profile request evidence changed")
+    if require_bound_identity and identity_source != "bound_numeric_id":
+        raise archive_x.ArchiveError(
+            "legacy walk repeated profile resolution instead of bound identity"
         )
     pages = telemetry.get("pages")
     if not isinstance(pages, list) or len(pages) != search_requests:
@@ -1286,14 +1571,24 @@ def run_legacy_walk(
     retries: int,
     http_timeout: int,
     stalled_rate_limit_cycles: int,
+    runner: Any | None = None,
 ) -> dict[str, Any]:
     endpoint = f"{window_id_value}-{walk_id}"
     raw_partial = run_dir / "raw" / f"{endpoint}.posts.jsonl.partial"
+    descriptor_partial = (
+        run_dir / "raw" / f"{endpoint}.descriptors.jsonl.partial"
+    )
     telemetry_path = run_dir / f"{endpoint}.telemetry.json"
+    request_telemetry_path = run_dir / f"{endpoint}.requests.json"
     config_path = run_dir / f"{endpoint}.gallery-dl.json"
     log_path = run_dir / f"{endpoint}.log"
     query, url = legacy_query(
         handle, since, until, include_reposts=include_reposts
+    )
+    descriptor_operation_id = f"{archive_run_id}:{endpoint}"
+    descriptor_x.prepare_artifact(descriptor_partial)
+    scheduler_options = archive_x.x_scheduler_options(
+        user_dir, requested_user_id, request_delay
     )
     config = build_legacy_gallery_config(
         handle=handle,
@@ -1304,20 +1599,25 @@ def run_legacy_walk(
         cookie_file=cookie_file,
         archive_run_id=archive_run_id,
         archived_at=second_utc(archive_x.utc_now()),
-        request_delay=request_delay,
+        request_delay="0",
         include_reposts=include_reposts,
         empty_tail_pages=empty_tail_pages,
+        descriptor_artifact=descriptor_partial,
+        descriptor_operation_id=descriptor_operation_id,
     )
     archive_x.atomic_write_json(config_path, config)
     command = legacy_gallery_command(
         repo_dir,
         config_path,
         telemetry_path,
+        request_telemetry_path,
         request_limit=request_limit,
         empty_tail_pages=empty_tail_pages,
         retries=retries,
         http_timeout=http_timeout,
+        requested_user_id=requested_user_id,
         url=url,
+        scheduler_options=scheduler_options,
     )
     (
         status,
@@ -1334,8 +1634,12 @@ def run_legacy_walk(
         f"{handle}:{endpoint}",
         progress_path=raw_partial,
         stalled_rate_limit_cycles=stalled_rate_limit_cycles,
+        runner=runner,
     )
     telemetry = archive_x.load_json(telemetry_path, None)
+    request_summary, request_error = archive_x.request_telemetry_summary(
+        request_telemetry_path, "legacy_walk"
+    )
     valid = False
     validation_error = None
     records = None
@@ -1357,6 +1661,7 @@ def run_legacy_walk(
             empty_tail_pages=empty_tail_pages,
             exit_code=status,
             expected_user_id=requested_user_id,
+            require_bound_identity=True,
         )
         records = validate_walk_records(
             raw_partial,
@@ -1370,7 +1675,11 @@ def run_legacy_walk(
     except archive_x.ArchiveError as exc:
         validation_error = str(exc)
     raw_path = archive_x.finalize_raw_file(raw_partial, valid)
+    descriptor_path = descriptor_x.finalize_artifact(
+        descriptor_partial, complete=valid
+    )
     return {
+        "archive_run_id": archive_run_id,
         "walk_id": walk_id,
         "endpoint": endpoint,
         "since": since,
@@ -1386,15 +1695,59 @@ def run_legacy_walk(
         "terminal_reason": (
             telemetry.get("terminal_reason") if isinstance(telemetry, dict) else None
         ),
+        "request_limit": (
+            telemetry.get("request_limit") if isinstance(telemetry, dict) else None
+        ),
+        "empty_tail_pages": (
+            telemetry.get("empty_tail_pages")
+            if isinstance(telemetry, dict)
+            else None
+        ),
+        "search_requests": (
+            telemetry.get("search_requests") if isinstance(telemetry, dict) else None
+        ),
+        "api_requests": (
+            telemetry.get("api_requests") if isinstance(telemetry, dict) else None
+        ),
+        "profile_requests": (
+            telemetry.get("profile_requests")
+            if isinstance(telemetry, dict)
+            else None
+        ),
+        "identity_source": (
+            telemetry.get("identity_source") if isinstance(telemetry, dict) else None
+        ),
         "records": records,
         "raw_path": str(raw_path.relative_to(user_dir)),
         "raw_sha256": archive_x.sha256_file(raw_path),
+        "descriptor_artifact_path": str(
+            descriptor_path.relative_to(user_dir)
+        ),
+        "descriptor_artifact_sha256": descriptor_x.sha256_file(
+            descriptor_path
+        ),
+        "descriptor_artifact_bytes": descriptor_path.stat().st_size,
+        "descriptor_operation_id": descriptor_operation_id,
+        "descriptor_source_kind": "legacy",
+        "descriptor_source_operation": "legacy",
         "telemetry_path": str(telemetry_path.relative_to(user_dir))
         if telemetry_path.exists()
         else None,
         "telemetry_sha256": archive_x.sha256_file(telemetry_path)
         if telemetry_path.exists()
         else None,
+        "request_telemetry_path": (
+            str(request_telemetry_path.relative_to(user_dir))
+            if request_telemetry_path.exists()
+            else None
+        ),
+        "request_telemetry_sha256": (
+            archive_x.sha256_file(request_telemetry_path)
+            if request_telemetry_path.exists()
+            else None
+        ),
+        "request_telemetry": request_summary,
+        "request_telemetry_error": request_error,
         "config_path": str(config_path.relative_to(user_dir)),
         "config_sha256": archive_x.sha256_file(config_path),
         "log_path": str(log_path.relative_to(user_dir)),
@@ -1449,6 +1802,255 @@ def enqueue_legacy_media_posts(
     )
 
 
+def commit_indexed_legacy_window(
+    user_dir: Path,
+    *,
+    canonical_path: Path,
+    canonical_hash: str,
+    canonical_records: list[dict[str, Any]],
+    handle: str,
+    requested_user_id: str,
+    run_id: str,
+    window_id_value: str,
+    since: str,
+    until: str,
+    observation_ids: list[str],
+    observed_at: str,
+) -> dict[str, int | bool]:
+    relative = str(canonical_path.relative_to(user_dir))
+    if archive_x.sha256_file(canonical_path) != require_sha256(
+        canonical_hash, "indexed canonical hash"
+    ):
+        raise archive_x.ArchiveError("legacy canonical file changed before indexing")
+    if len(observation_ids) < 2 or len(set(observation_ids)) != len(
+        observation_ids
+    ):
+        raise archive_x.ArchiveError(
+            "legacy indexed interval lacks distinct observations"
+        )
+    for observation_id in observation_ids:
+        require_sha256(observation_id, "indexed observation ID")
+    normalized_records = []
+    for metadata in canonical_records:
+        normalized = archive_x.normalize_post(metadata, handle, "legacy")
+        if normalized is None:
+            raise archive_x.ArchiveError(
+                "legacy canonical record could not be normalized"
+            )
+        if str(normalized.get("requested_user_id") or "") != requested_user_id:
+            raise archive_x.ArchiveError(
+                "legacy canonical normalized identity changed"
+            )
+        normalized_records.append(normalized)
+    since_at = parse_utc(since, "indexed since")
+    until_at = parse_utc(until, "indexed until")
+    canonical_sha256_value = canonical_hash
+    # Bind the canonical file and every confirming observation without
+    # retaining raw IDs or private query material in the interval row.
+    evidence_hash = canonical_sha256(
+        {
+            "canonical_sha256": canonical_sha256_value,
+            "observation_ids": sorted(observation_ids),
+        }
+    )
+    stat = canonical_path.stat()
+    db_path = user_dir / "_state" / "context.sqlite3"
+    try:
+        with context_x.ContextDB(db_path) as database:
+            database.bind_identity(requested_user_id, handle)
+            return database.commit_legacy_interval(
+                interval_id=window_id_value,
+                root_window_id=window_id_value,
+                since_at=since,
+                until_at=until,
+                since_epoch=int(since_at.timestamp()),
+                until_epoch=int(until_at.timestamp()),
+                canonical_relative_path=relative,
+                canonical_sha256=canonical_sha256_value,
+                canonical_stat=stat,
+                run_id=run_id,
+                evidence_sha256=evidence_hash,
+                observation_count=len(observation_ids),
+                normalized_records=normalized_records,
+                observed_at=observed_at,
+            )
+    except (context_x.ContextError, sqlite3.Error) as exc:
+        raise archive_x.ArchiveError(
+            f"legacy indexed commit failed ({exc.__class__.__name__})"
+        ) from exc
+
+
+def enqueue_pending_portable_export(
+    legacy: dict[str, Any],
+    *,
+    window_id_value: str,
+    since: str,
+    until: str,
+    canonical_raw_path: str,
+    canonical_raw_sha256: str,
+    indexed_generation: int,
+) -> dict[str, Any]:
+    validate_legacy_state(legacy, expected_user_id=legacy.get("requested_user_id"))
+    pending = copy.deepcopy(legacy.get("pending_portable_exports") or [])
+    record = {
+        "window_id": window_id_value,
+        "since": since,
+        "until": until,
+        "canonical_raw_path": _relative_evidence_path(
+            canonical_raw_path, "pending canonical raw"
+        ),
+        "canonical_raw_sha256": require_sha256(
+            canonical_raw_sha256, "pending canonical raw hash"
+        ),
+        "indexed_generation": _positive_counter(
+            indexed_generation, "pending indexed generation", allow_zero=False
+        ),
+    }
+    existing = next(
+        (item for item in pending if item["window_id"] == window_id_value), None
+    )
+    if existing is not None and existing != record:
+        raise archive_x.ArchiveError("legacy pending export evidence changed")
+    if existing is None:
+        pending.append(record)
+    updated = copy.deepcopy(legacy)
+    updated["pending_portable_exports"] = pending
+    validate_legacy_state(updated, expected_user_id=updated["requested_user_id"])
+    return updated
+
+
+def flush_pending_portable_exports(
+    user_dir: Path,
+    state: dict[str, Any],
+    *,
+    state_path: Path,
+    run_dir: Path,
+    handle: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    legacy = state["legacy_backfill"]
+    pending = validate_pending_exports(legacy.get("pending_portable_exports"))
+    if not pending:
+        return state, None
+    del run_dir, handle
+    db_path = user_dir / "_state" / "context.sqlite3"
+    with context_x.ContextDB(db_path, create=False) as database:
+        indexed_generation = int(
+            database.connection.execute(
+                "SELECT current_generation FROM archive_generation WHERE singleton=1"
+            ).fetchone()[0]
+        )
+        counters = {
+            str(row[0]): int(row[1])
+            for row in database.connection.execute(
+                "SELECT counter_name,value FROM progress_counters"
+            )
+        }
+    updated = copy.deepcopy(state)
+    updated_legacy = updated["legacy_backfill"]
+    updated_legacy["pending_portable_exports"] = []
+    updated_legacy["last_indexed_checkpoint"] = {
+        "through_generation": max(item["indexed_generation"] for item in pending),
+        "window_count": len(pending),
+        "archive_generation": indexed_generation,
+        "dataset_posts": counters.get("archive_posts_total", 0),
+        "checkpointed_at": second_utc(archive_x.utc_now()),
+    }
+    last_completed = updated_legacy.get("last_completed_window")
+    if (
+        isinstance(last_completed, dict)
+        and int(last_completed.get("indexed_generation") or 0)
+        <= int(updated_legacy["last_indexed_checkpoint"]["through_generation"])
+    ):
+        last_completed["portable_export_pending"] = True
+    validate_legacy_state(
+        updated_legacy,
+        expected_user_id=str(updated.get("requested_user_id") or ""),
+    )
+    archive_x.atomic_write_json(state_path, updated)
+    return updated, {
+        "status": "deferred_to_unified_checkpoint",
+        "window_count": len(pending),
+        "raw_records": 0,
+        "payload_bytes_read": 0,
+        "dataset_posts": counters.get("archive_posts_total", 0),
+        "archive_generation": indexed_generation,
+    }
+
+
+def record_unified_export_checkpoint(
+    user_dir: Path,
+    export: dict[str, Any],
+) -> bool:
+    """Tie a published unified generation back to pending legacy evidence."""
+    if export.get("status") not in {"published", "unchanged"}:
+        return False
+    generation = int(
+        export.get("exported_generation") or export.get("generation") or 0
+    )
+    manifest_relative = str(export.get("manifest_path") or "")
+    relative = Path(manifest_relative)
+    if (
+        generation < 1
+        or not relative.parts
+        or relative.is_absolute()
+        or ".." in relative.parts
+    ):
+        raise archive_x.ArchiveError("unified legacy export evidence is invalid")
+    manifest_path = (user_dir / relative).resolve()
+    try:
+        manifest_path.relative_to((user_dir / "dataset" / "exports").resolve())
+    except ValueError as exc:
+        raise archive_x.ArchiveError(
+            "unified legacy export manifest escaped its generation root"
+        ) from exc
+    manifest = archive_x.load_json(manifest_path, None)
+    if not isinstance(manifest, dict) or int(manifest.get("generation") or 0) != generation:
+        raise archive_x.ArchiveError("unified legacy export manifest is invalid")
+    posts = (manifest.get("views") or {}).get("posts")
+    if not isinstance(posts, dict):
+        raise archive_x.ArchiveError("unified legacy posts export evidence is missing")
+    dataset_sha256 = require_sha256(posts.get("sha256"), "unified posts export hash")
+    dataset_posts = _positive_counter(
+        posts.get("rows"), "unified posts export rows", allow_zero=True
+    )
+    state_path = user_dir / "_state" / "state.json"
+    state = archive_x.load_json(state_path, None)
+    if not isinstance(state, dict) or not isinstance(
+        state.get("legacy_backfill"), dict
+    ):
+        return False
+    legacy = state["legacy_backfill"]
+    checkpoint = legacy.get("last_indexed_checkpoint")
+    if not isinstance(checkpoint, dict):
+        return False
+    if generation < int(checkpoint.get("archive_generation") or 0):
+        return False
+    updated = copy.deepcopy(state)
+    updated_legacy = updated["legacy_backfill"]
+    updated_legacy["last_portable_export"] = {
+        "through_generation": int(checkpoint["through_generation"]),
+        "window_count": int(checkpoint["window_count"]),
+        "archive_generation": generation,
+        "dataset_sha256": dataset_sha256,
+        "dataset_posts": dataset_posts,
+        "exported_at": second_utc(archive_x.utc_now()),
+    }
+    last_completed = updated_legacy.get("last_completed_window")
+    if (
+        isinstance(last_completed, dict)
+        and int(last_completed.get("indexed_generation") or 0)
+        <= int(checkpoint["through_generation"])
+    ):
+        last_completed["portable_export_pending"] = False
+        last_completed["dataset_sha256"] = dataset_sha256
+    validate_legacy_state(
+        updated_legacy,
+        expected_user_id=str(updated.get("requested_user_id") or ""),
+    )
+    archive_x.atomic_write_json(state_path, updated)
+    return True
+
+
 def resume_active_window(
     legacy: dict[str, Any],
     *,
@@ -1460,7 +2062,11 @@ def resume_active_window(
     if legacy["status"] != "active":
         raise archive_x.ArchiveError("legacy state has no active window to resume")
     active = legacy["active_window"]
-    if active["attempt"] >= attempt_limit:
+    locally_confirmable = all(
+        len(leaf.get("observations") or []) >= 2
+        for leaf in active["leaves"]
+    )
+    if active["attempt"] >= attempt_limit and not locally_confirmable:
         return mark_manual_review(
             legacy,
             window_id_value=active["window_id"],
@@ -1469,7 +2075,10 @@ def resume_active_window(
         )
     updated = copy.deepcopy(legacy)
     updated["active_window"]["owner_run_id"] = owner_run_id
-    updated["active_window"]["attempt"] += 1
+    if active["attempt"] < attempt_limit:
+        updated["active_window"]["attempt"] += 1
+    else:
+        updated["active_window"]["local_evidence_recovery"] = True
     updated["active_window"]["claimed_at"] = second_utc(
         parse_utc(resumed_at, "resumed_at")
     )
@@ -1512,8 +2121,18 @@ def split_active_leaf(
     midpoint = since_at + timedelta(seconds=seconds // 2)
     midpoint_text = second_utc(midpoint)
     children = [
-        {"since": leaf_since, "until": midpoint_text, "status": "pending"},
-        {"since": midpoint_text, "until": leaf_until, "status": "pending"},
+        {
+            "since": leaf_since,
+            "until": midpoint_text,
+            "status": "pending",
+            "observations": [],
+        },
+        {
+            "since": midpoint_text,
+            "until": leaf_until,
+            "status": "pending",
+            "observations": [],
+        },
     ]
     updated = copy.deepcopy(legacy)
     updated["active_window"]["leaves"][index : index + 1] = children
@@ -1567,8 +2186,383 @@ def compatible_walk_records(
     return chosen
 
 
+def walk_compatibility_sha256(result: dict[str, Any]) -> str:
+    records = result.get("records")
+    if not isinstance(records, dict):
+        raise archive_x.ArchiveError("legacy valid observation lacks records")
+    accepted_ids = records.get("accepted_ids")
+    accepted_records = records.get("accepted_records")
+    if not isinstance(accepted_ids, list) or not isinstance(accepted_records, list):
+        raise archive_x.ArchiveError("legacy valid observation records are invalid")
+    by_id = {
+        archive_x.id_string(record.get("tweet_id")): record
+        for record in accepted_records
+        if isinstance(record, dict)
+    }
+    stable = []
+    for post_id in accepted_ids:
+        post_id = archive_x.id_string(post_id)
+        record = by_id.get(post_id)
+        if post_id is None or not isinstance(record, dict):
+            raise archive_x.ArchiveError(
+                "legacy valid observation record evidence is incomplete"
+            )
+        stable.append(
+            [
+                post_id,
+                str(record.get("date") or ""),
+                archive_x.id_string((record.get("user") or {}).get("id")),
+                archive_x.id_string((record.get("author") or {}).get("id")),
+                archive_x.id_string(record.get("retweet_id")),
+                archive_x.id_string(record.get("reply_id")),
+            ]
+        )
+    return canonical_sha256(stable)
+
+
+def _verified_user_file(
+    user_dir: Path, relative: Any, expected_sha256: Any, field: str
+) -> Path:
+    relative_text = _relative_evidence_path(relative, field)
+    path = (user_dir / relative_text).resolve()
+    root = user_dir.resolve()
+    if root not in path.parents or not path.is_file():
+        raise archive_x.ArchiveError(f"legacy retained {field} file is missing")
+    expected = require_sha256(expected_sha256, f"retained {field} hash")
+    if archive_x.sha256_file(path) != expected:
+        raise archive_x.ArchiveError(f"legacy retained {field} hash changed")
+    return path
+
+
+def retained_observation(
+    user_dir: Path,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    if result.get("status") != "valid":
+        raise archive_x.ArchiveError("only a valid legacy walk can be retained")
+    since = str(result.get("since") or "")
+    until = str(result.get("until") or "")
+    parse_utc(since, "retained since")
+    parse_utc(until, "retained until")
+    raw_path = _verified_user_file(
+        user_dir, result.get("raw_path"), result.get("raw_sha256"), "raw"
+    )
+    telemetry_path = _verified_user_file(
+        user_dir,
+        result.get("telemetry_path"),
+        result.get("telemetry_sha256"),
+        "telemetry",
+    )
+    descriptor_relative = result.get("descriptor_artifact_path")
+    descriptor_hash = result.get("descriptor_artifact_sha256")
+    if descriptor_relative is not None or descriptor_hash is not None:
+        _verified_user_file(
+            user_dir, descriptor_relative, descriptor_hash, "descriptor"
+        )
+    compatibility = walk_compatibility_sha256(result)
+    request_limit = _positive_counter(
+        result.get("request_limit"), "retained request limit", allow_zero=False
+    )
+    empty_tail = _positive_counter(
+        result.get("empty_tail_pages"),
+        "retained empty tail",
+        allow_zero=False,
+    )
+    search_requests = _positive_counter(
+        result.get("search_requests"), "retained search requests", allow_zero=False
+    )
+    api_requests = _positive_counter(
+        result.get("api_requests"), "retained API requests", allow_zero=False
+    )
+    accepted_count = _positive_counter(
+        (result.get("records") or {}).get("accepted_count"),
+        "retained accepted records",
+    )
+    evidence_identity = {
+        "archive_run_id": str(result.get("archive_run_id") or ""),
+        "walk_id": str(result.get("walk_id") or ""),
+        "raw_path": str(raw_path.relative_to(user_dir)),
+        "raw_sha256": str(result.get("raw_sha256")),
+        "telemetry_path": str(telemetry_path.relative_to(user_dir)),
+        "telemetry_sha256": str(result.get("telemetry_sha256")),
+        "query_sha256": str(result.get("query_sha256")),
+    }
+    observation = {
+        "observation_id": canonical_sha256(evidence_identity),
+        **evidence_identity,
+        "since": since,
+        "until": until,
+        "compatibility_sha256": compatibility,
+        "request_limit": request_limit,
+        "empty_tail_pages": empty_tail,
+        "search_requests": search_requests,
+        "api_requests": api_requests,
+        "accepted_count": accepted_count,
+    }
+    if descriptor_relative is not None:
+        observation.update(
+            {
+                "descriptor_artifact_path": str(descriptor_relative),
+                "descriptor_artifact_sha256": str(descriptor_hash),
+                "descriptor_operation_id": str(
+                    result.get("descriptor_operation_id") or ""
+                ),
+                "descriptor_source_kind": "legacy",
+                "descriptor_source_operation": "legacy",
+            }
+        )
+    validate_retained_observation(
+        observation, leaf_since=since, leaf_until=until
+    )
+    return observation
+
+
+def append_retained_observation(
+    legacy: dict[str, Any],
+    *,
+    leaf_since: str,
+    leaf_until: str,
+    observation: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    validate_legacy_state(legacy, expected_user_id=legacy.get("requested_user_id"))
+    if legacy["status"] != "active":
+        raise archive_x.ArchiveError("legacy observation has no active window")
+    updated = copy.deepcopy(legacy)
+    leaf = next(
+        (
+            item
+            for item in updated["active_window"]["leaves"]
+            if item["since"] == leaf_since and item["until"] == leaf_until
+        ),
+        None,
+    )
+    if leaf is None or leaf["status"] != "pending":
+        raise archive_x.ArchiveError("legacy observation leaf guard failed")
+    validate_retained_observation(
+        observation, leaf_since=leaf_since, leaf_until=leaf_until
+    )
+    retained = leaf.setdefault("observations", [])
+    for existing in retained:
+        if existing["observation_id"] == observation["observation_id"]:
+            if existing != observation:
+                raise archive_x.ArchiveError(
+                    "legacy retained observation identity changed"
+                )
+            return updated, False
+        if existing["raw_path"] == observation["raw_path"]:
+            raise archive_x.ArchiveError(
+                "legacy source artifact cannot count as two observations"
+            )
+    if len(retained) >= MAX_RETAINED_OBSERVATIONS_PER_LEAF:
+        raise archive_x.ArchiveError("legacy retained observation limit reached")
+    retained.append(copy.deepcopy(observation))
+    validate_legacy_state(updated, expected_user_id=updated["requested_user_id"])
+    return updated, True
+
+
+def restore_retained_observation(
+    user_dir: Path,
+    observation: dict[str, Any],
+    *,
+    handle: str,
+    requested_user_id: str,
+    include_reposts: bool,
+) -> dict[str, Any]:
+    since = str(observation.get("since") or "")
+    until = str(observation.get("until") or "")
+    validate_retained_observation(
+        observation, leaf_since=since, leaf_until=until
+    )
+    raw_path = _verified_user_file(
+        user_dir, observation["raw_path"], observation["raw_sha256"], "raw"
+    )
+    telemetry_path = _verified_user_file(
+        user_dir,
+        observation["telemetry_path"],
+        observation["telemetry_sha256"],
+        "telemetry",
+    )
+    query, _url = legacy_query(
+        handle, since, until, include_reposts=include_reposts
+    )
+    if hashlib.sha256(query.encode("utf-8")).hexdigest() != observation[
+        "query_sha256"
+    ]:
+        raise archive_x.ArchiveError("legacy retained query evidence changed")
+    telemetry = archive_x.load_json(telemetry_path, None)
+    validate_walk_telemetry(
+        telemetry,
+        expected_query=query,
+        request_limit=observation["request_limit"],
+        empty_tail_pages=observation["empty_tail_pages"],
+        exit_code=0,
+        expected_user_id=requested_user_id,
+        require_bound_identity=True,
+    )
+    records = validate_walk_records(
+        raw_path,
+        since=since,
+        until=until,
+        requested_user_id=requested_user_id,
+        requested_handle=handle,
+        include_reposts=include_reposts,
+    )
+    restored = {
+        "archive_run_id": observation["archive_run_id"],
+        "walk_id": observation["walk_id"],
+        "since": since,
+        "until": until,
+        "query_sha256": observation["query_sha256"],
+        "status": "valid",
+        "records": records,
+        "raw_path": observation["raw_path"],
+        "raw_sha256": observation["raw_sha256"],
+        "telemetry_path": observation["telemetry_path"],
+        "telemetry_sha256": observation["telemetry_sha256"],
+        "request_limit": observation["request_limit"],
+        "empty_tail_pages": observation["empty_tail_pages"],
+        "search_requests": observation["search_requests"],
+        "api_requests": observation["api_requests"],
+        "terminal_reason": telemetry.get("terminal_reason"),
+    }
+    descriptor_relative = observation.get("descriptor_artifact_path")
+    if descriptor_relative is not None:
+        _verified_user_file(
+            user_dir,
+            descriptor_relative,
+            observation["descriptor_artifact_sha256"],
+            "descriptor",
+        )
+        restored.update(
+            {
+                "descriptor_artifact_path": descriptor_relative,
+                "descriptor_artifact_sha256": observation[
+                    "descriptor_artifact_sha256"
+                ],
+                "descriptor_operation_id": observation.get(
+                    "descriptor_operation_id"
+                ),
+                "descriptor_source_kind": "legacy",
+                "descriptor_source_operation": "legacy",
+            }
+        )
+    if walk_compatibility_sha256(restored) != observation["compatibility_sha256"]:
+        raise archive_x.ArchiveError(
+            "legacy retained observation compatibility changed"
+        )
+    return restored
+
+
+def confirmation_from_retained(
+    user_dir: Path,
+    observations: list[dict[str, Any]],
+    *,
+    handle: str,
+    requested_user_id: str,
+    include_reposts: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    restored = [
+        restore_retained_observation(
+            user_dir,
+            observation,
+            handle=handle,
+            requested_user_id=requested_user_id,
+            include_reposts=include_reposts,
+        )
+        for observation in observations
+    ]
+    digests = {walk_compatibility_sha256(result) for result in restored}
+    if len(digests) > 1:
+        raise archive_x.ArchiveError(
+            "independent legacy observations returned incompatible evidence"
+        )
+    if len(restored) < 2:
+        return None
+    return compatible_walk_records(restored[0], restored[1]), restored[:2]
+
+
+def update_adaptive_window_policy(
+    legacy: dict[str, Any],
+    *,
+    confirmed_observations: list[dict[str, Any]],
+    request_limit: int,
+    empty_tail_pages: int,
+) -> dict[str, Any]:
+    validate_legacy_state(legacy, expected_user_id=legacy.get("requested_user_id"))
+    if legacy["status"] != "active" or not confirmed_observations:
+        raise archive_x.ArchiveError("legacy adaptive policy lacks confirmed work")
+    active = legacy["active_window"]
+    policy = copy.deepcopy(
+        legacy.get("window_policy")
+        or new_window_policy(
+            int(
+                (
+                    parse_utc(active["until"], "active until")
+                    - parse_utc(active["since"], "active since")
+                ).total_seconds()
+            )
+        )
+    )
+    validate_window_policy(policy)
+    search_requests = max(
+        _positive_counter(
+            item["search_requests"], "adaptive search requests", allow_zero=False
+        )
+        for item in confirmed_observations
+    )
+    api_requests = max(
+        _positive_counter(
+            item["api_requests"], "adaptive API requests", allow_zero=False
+        )
+        for item in confirmed_observations
+    )
+    post_count = sum(
+        _positive_counter(item["accepted_count"], "adaptive accepted records")
+        for item in confirmed_observations[::2]
+    )
+    leaf_count = len(active["leaves"])
+    current = int(policy["next_window_seconds"])
+    if leaf_count > 1 or search_requests >= request_limit - 1:
+        next_seconds = max(int(policy["minimum_seconds"]), current // 2)
+        decision = "dense_shrink"
+    elif search_requests <= empty_tail_pages + 1 and post_count <= 20:
+        next_seconds = min(int(policy["maximum_seconds"]), current * 2)
+        decision = "sparse_grow" if next_seconds > current else "steady"
+    else:
+        next_seconds = current
+        decision = "steady"
+    actual_seconds = int(
+        (
+            parse_utc(active["until"], "active until")
+            - parse_utc(active["since"], "active since")
+        ).total_seconds()
+    )
+    if actual_seconds < current and active["since"] == legacy["floor_since"]:
+        decision = "floor_clip"
+    policy.update(
+        {
+            "next_window_seconds": next_seconds,
+            "last_decision": decision,
+            "last_search_requests": search_requests,
+            "last_api_requests": api_requests,
+            "last_post_count": post_count,
+            "last_leaf_count": leaf_count,
+            "last_window_id": active["window_id"],
+        }
+    )
+    validate_window_policy(policy)
+    updated = copy.deepcopy(legacy)
+    updated["window_policy"] = policy
+    validate_legacy_state(updated, expected_user_id=updated["requested_user_id"])
+    return updated
+
+
 def public_walk_result(result: dict[str, Any]) -> dict[str, Any]:
-    value = {key: item for key, item in result.items() if key != "records"}
+    value = {
+        key: item
+        for key, item in result.items()
+        if key not in {"records", "command"}
+    }
     records = result.get("records")
     if isinstance(records, dict):
         value["records"] = {
@@ -1688,6 +2682,7 @@ def run_legacy_archive(
     handle: str,
     version: str,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    runner: Any | None = None,
 ) -> dict[str, Any]:
     def report(event: str, **details: Any) -> None:
         if progress_callback is None:
@@ -1747,7 +2742,25 @@ def run_legacy_archive(
     }
     archive_x.atomic_write_json(manifest_path, manifest)
 
+    def flush_portable_export() -> None:
+        nonlocal state, legacy
+        state, export_result = flush_pending_portable_exports(
+            user_dir,
+            state,
+            state_path=state_path,
+            run_dir=run_dir,
+            handle=handle,
+        )
+        legacy = state["legacy_backfill"]
+        if export_result is not None:
+            manifest["portable_export"] = export_result
+            for result in manifest["windows"]:
+                if result.get("state_committed"):
+                    result["portable_export_pending"] = False
+            archive_x.atomic_write_json(manifest_path, manifest)
+
     if legacy["status"] == "complete":
+        flush_portable_export()
         manifest["status"] = "complete"
         manifest["completed_at"] = second_utc(archive_x.utc_now())
         archive_x.atomic_write_json(manifest_path, manifest)
@@ -1762,6 +2775,7 @@ def run_legacy_archive(
         state["legacy_backfill"] = legacy
         archive_x.atomic_write_json(state_path, state)
         if legacy["status"] == "manual_review":
+            flush_portable_export()
             manifest["status"] = "manual_review"
             manifest["completed_at"] = second_utc(archive_x.utc_now())
             archive_x.atomic_write_json(manifest_path, manifest)
@@ -1804,6 +2818,8 @@ def run_legacy_archive(
         confirmed_leaf_keys: set[tuple[str, str]] = set()
         canonical_by_id: dict[str, dict[str, Any]] = {}
         confirmed_walk_ids: list[str] = []
+        confirmed_descriptor_results: list[dict[str, Any]] = []
+        confirmed_policy_observations: list[dict[str, Any]] = []
 
         while True:
             legacy = state["legacy_backfill"]
@@ -1816,28 +2832,44 @@ def run_legacy_archive(
             if not pending:
                 break
             leaf = pending[0]
-            previous_valid = None
             confirmed_records = None
+            confirmed_results: list[dict[str, Any]] = []
+            evidence_error = None
             split = False
+            canonical_handle = str(state.get("canonical_handle") or handle)
+            try:
+                existing_confirmation = confirmation_from_retained(
+                    user_dir,
+                    list(leaf.get("observations") or []),
+                    handle=canonical_handle,
+                    requested_user_id=legacy["requested_user_id"],
+                    include_reposts=legacy["source"]["reposts_included"],
+                )
+            except archive_x.ArchiveError as exc:
+                evidence_error = str(exc)
+                existing_confirmation = None
+            if existing_confirmation is not None:
+                confirmed_records, confirmed_results = existing_confirmation
+                window_result["retained_observations_reused"] = int(
+                    window_result.get("retained_observations_reused") or 0
+                ) + 2
             for attempt in range(1, options.walk_attempts + 1):
-                if attempt > 1:
-                    archive_x.sleep_random(
-                        options.walk_delay,
-                        f"before independent legacy confirmation {attempt}",
-                    )
+                if confirmed_records is not None or evidence_error is not None:
+                    break
                 leaf_token = canonical_sha256(
                     {"since": leaf["since"], "until": leaf["until"]}
                 )[:12]
+                run_token = canonical_sha256(current_run_id)[:8]
                 result = run_legacy_walk(
                     repo_dir=repo_dir,
                     archive_root=archive_root,
                     user_dir=user_dir,
                     run_dir=run_dir,
-                    handle=str(state.get("canonical_handle") or handle),
+                    handle=canonical_handle,
                     requested_user_id=legacy["requested_user_id"],
                     archive_run_id=current_run_id,
                     window_id_value=active["window_id"],
-                    walk_id=f"{leaf_token}-walk-{attempt}",
+                    walk_id=f"{leaf_token}-{run_token}-walk-{attempt}",
                     since=leaf["since"],
                     until=leaf["until"],
                     cookie_file=options.cookies,
@@ -1848,6 +2880,7 @@ def run_legacy_archive(
                     retries=options.retries,
                     http_timeout=options.http_timeout,
                     stalled_rate_limit_cycles=options.stalled_rate_limit_cycles,
+                    runner=runner,
                 )
                 window_result["walks"].append(public_walk_result(result))
                 archive_x.atomic_write_json(manifest_path, manifest)
@@ -1880,6 +2913,7 @@ def run_legacy_archive(
                         )
                         state["legacy_backfill"] = updated
                         archive_x.atomic_write_json(state_path, state)
+                        flush_portable_export()
                         window_result["status"] = "manual_review"
                         window_result["reason"] = str(exc)
                         manifest["status"] = "manual_review"
@@ -1895,26 +2929,59 @@ def run_legacy_archive(
                     split = True
                     break
                 if result["status"] != "valid":
-                    previous_valid = None
                     continue
-                if previous_valid is not None:
-                    try:
-                        confirmed_records = compatible_walk_records(
-                            previous_valid, result
-                        )
-                    except archive_x.ArchiveError:
-                        previous_valid = result
-                        continue
-                    confirmed_walk_ids.extend(
-                        [previous_valid["walk_id"], result["walk_id"]]
+                observation = retained_observation(user_dir, result)
+                updated, _inserted = append_retained_observation(
+                    state["legacy_backfill"],
+                    leaf_since=leaf["since"],
+                    leaf_until=leaf["until"],
+                    observation=observation,
+                )
+                state["legacy_backfill"] = updated
+                archive_x.atomic_write_json(state_path, state)
+                legacy = updated
+                leaf = next(
+                    item
+                    for item in legacy["active_window"]["leaves"]
+                    if item["since"] == leaf["since"]
+                    and item["until"] == leaf["until"]
+                )
+                try:
+                    confirmation = confirmation_from_retained(
+                        user_dir,
+                        list(leaf.get("observations") or []),
+                        handle=canonical_handle,
+                        requested_user_id=legacy["requested_user_id"],
+                        include_reposts=legacy["source"]["reposts_included"],
                     )
+                except archive_x.ArchiveError as exc:
+                    evidence_error = str(exc)
                     break
-                previous_valid = result
+                if confirmation is not None:
+                    confirmed_records, confirmed_results = confirmation
+                    break
             if split:
                 continue
+            if evidence_error is not None:
+                reason = evidence_error
+                updated = mark_manual_review(
+                    state["legacy_backfill"],
+                    window_id_value=active["window_id"],
+                    reason=reason,
+                    observed_at=second_utc(archive_x.utc_now()),
+                )
+                state["legacy_backfill"] = updated
+                archive_x.atomic_write_json(state_path, state)
+                flush_portable_export()
+                window_result["status"] = "manual_review"
+                window_result["reason"] = reason
+                manifest["status"] = "manual_review"
+                manifest["completed_at"] = second_utc(archive_x.utc_now())
+                archive_x.atomic_write_json(manifest_path, manifest)
+                return manifest
             if confirmed_records is None:
                 reason = (
-                    f"no two consecutive matching valid walks after "
+                    f"no two matching valid legacy observations after "
                     f"{options.walk_attempts} attempts"
                 )
                 updated = mark_manual_review(
@@ -1925,12 +2992,20 @@ def run_legacy_archive(
                 )
                 state["legacy_backfill"] = updated
                 archive_x.atomic_write_json(state_path, state)
+                flush_portable_export()
                 window_result["status"] = "manual_review"
                 window_result["reason"] = reason
                 manifest["status"] = "manual_review"
                 manifest["completed_at"] = second_utc(archive_x.utc_now())
                 archive_x.atomic_write_json(manifest_path, manifest)
                 return manifest
+            selected_observations = list(leaf.get("observations") or [])[:2]
+            confirmed_walk_ids.extend(
+                observation["observation_id"]
+                for observation in selected_observations
+            )
+            confirmed_policy_observations.extend(selected_observations)
+            confirmed_descriptor_results.extend(confirmed_results)
             for metadata in confirmed_records:
                 post_id = archive_x.id_string(metadata.get("tweet_id"))
                 if post_id in canonical_by_id:
@@ -1956,30 +3031,57 @@ def run_legacy_archive(
         window_result["metadata_confirmed"] = True
         archive_x.atomic_write_json(manifest_path, manifest)
 
-        dataset_result = archive_x.update_post_dataset(
-            user_dir, handle, canonical_path, "legacy"
+        policy_legacy = update_adaptive_window_policy(
+            state["legacy_backfill"],
+            confirmed_observations=confirmed_policy_observations,
+            request_limit=options.request_limit,
+            empty_tail_pages=options.empty_tail_pages,
         )
-        dataset_path = user_dir / "dataset" / "posts.jsonl"
-        dataset_hash = archive_x.sha256_file(dataset_path)
+        observed_at = second_utc(archive_x.utc_now())
+        indexed = commit_indexed_legacy_window(
+            user_dir,
+            canonical_path=canonical_path,
+            canonical_hash=canonical_hash,
+            canonical_records=canonical_records,
+            handle=str(state.get("canonical_handle") or handle),
+            requested_user_id=legacy["requested_user_id"],
+            run_id=current_run_id,
+            window_id_value=active["window_id"],
+            since=active["since"],
+            until=active["until"],
+            observation_ids=confirmed_walk_ids,
+            observed_at=observed_at,
+        )
         updated_state = copy.deepcopy(state)
-        enqueue_legacy_media_posts(
-            updated_state,
-            canonical_records,
-            source_run_id=current_run_id,
-            observed_at=second_utc(archive_x.utc_now()),
+        policy_legacy = enqueue_pending_portable_export(
+            policy_legacy,
+            window_id_value=active["window_id"],
+            since=active["since"],
+            until=active["until"],
+            canonical_raw_path=str(canonical_path.relative_to(user_dir)),
+            canonical_raw_sha256=canonical_hash,
+            indexed_generation=int(indexed["generation"]),
         )
         updated_state["legacy_backfill"] = complete_window(
-            updated_state["legacy_backfill"],
+            policy_legacy,
             window_id_value=active["window_id"],
-            completed_at=second_utc(archive_x.utc_now()),
+            completed_at=observed_at,
             canonical_raw_sha256=canonical_hash,
-            dataset_sha256=dataset_hash,
+            dataset_sha256=None,
             walk_ids=confirmed_walk_ids,
+            indexed_generation=int(indexed["generation"]),
         )
         archive_x.atomic_write_json(state_path, updated_state)
         state = updated_state
-        window_result["dataset"] = dataset_result
-        window_result["dataset_sha256"] = dataset_hash
+        window_result["descriptor_commit"] = archive_x.persist_descriptor_evidence(
+            user_dir,
+            target_user_id=legacy["requested_user_id"],
+            canonical_handle=str(state.get("canonical_handle") or handle),
+            accepted_records=canonical_records,
+            endpoint_results=confirmed_descriptor_results,
+        )
+        window_result["indexed_commit"] = indexed
+        window_result["portable_export_pending"] = True
         window_result["state_committed"] = True
         window_result["status"] = "success"
         archive_x.atomic_write_json(manifest_path, manifest)
@@ -1989,20 +3091,10 @@ def run_legacy_archive(
             since=active["since"],
             until=active["until"],
             committed_windows=completed_count,
-            new_posts=int(dataset_result.get("new_run_posts") or 0),
-            dataset_posts=int(dataset_result.get("dataset_posts") or 0),
+            new_posts=int(indexed.get("new_posts") or 0),
+            dataset_posts=0,
         )
-        if (
-            (
-                options.max_root_windows is None
-                or completed_count < options.max_root_windows
-            )
-            and state["legacy_backfill"]["status"] != "complete"
-        ):
-            archive_x.sleep_random(
-                options.window_delay, "before next legacy window"
-            )
-
+    flush_portable_export()
     manifest["status"] = (
         "complete"
         if state["legacy_backfill"]["status"] == "complete"
@@ -2030,10 +3122,17 @@ def claim_window(
     floor = parse_utc(legacy["floor_since"], "floor_since")
     if until == floor:
         raise archive_x.ArchiveError("legacy frontier is already at its floor")
-    since = max(floor, until - timedelta(days=root_window_days))
+    policy = legacy.get("window_policy")
+    if policy is None:
+        policy = new_window_policy(root_window_days * 24 * 60 * 60)
+    else:
+        validate_window_policy(policy)
+    window_seconds = int(policy["next_window_seconds"])
+    since = max(floor, until - timedelta(seconds=window_seconds))
     since_text, until_text = second_utc(since), second_utc(until)
     updated = copy.deepcopy(legacy)
     updated["status"] = "active"
+    updated["window_policy"] = copy.deepcopy(policy)
     updated["active_window"] = {
         "window_id": window_id(since_text, until_text),
         "since": since_text,
@@ -2042,7 +3141,12 @@ def claim_window(
         "attempt": 1,
         "claimed_at": second_utc(parse_utc(claimed_at, "claimed_at")),
         "leaves": [
-            {"since": since_text, "until": until_text, "status": "pending"}
+            {
+                "since": since_text,
+                "until": until_text,
+                "status": "pending",
+                "observations": [],
+            }
         ],
     }
     validate_legacy_state(updated, expected_user_id=updated["requested_user_id"])
@@ -2078,15 +3182,25 @@ def complete_window(
     window_id_value: str,
     completed_at: str,
     canonical_raw_sha256: str,
-    dataset_sha256: str,
+    dataset_sha256: str | None,
     walk_ids: list[str],
+    indexed_generation: int | None = None,
 ) -> dict[str, Any]:
     validate_legacy_state(legacy, expected_user_id=legacy.get("requested_user_id"))
     active = legacy.get("active_window")
     if legacy["status"] != "active" or active["window_id"] != window_id_value:
         raise archive_x.ArchiveError("legacy completion window guard failed")
     require_sha256(canonical_raw_sha256, "canonical raw hash")
-    require_sha256(dataset_sha256, "dataset hash")
+    if dataset_sha256 is not None:
+        require_sha256(dataset_sha256, "dataset hash")
+    if indexed_generation is not None:
+        _positive_counter(
+            indexed_generation, "indexed generation", allow_zero=False
+        )
+    if dataset_sha256 is None and indexed_generation is None:
+        raise archive_x.ArchiveError(
+            "legacy completion lacks indexed or portable dataset authority"
+        )
     if (
         len(walk_ids) < 2
         or len(walk_ids) % 2
@@ -2099,15 +3213,20 @@ def complete_window(
     updated = copy.deepcopy(legacy)
     updated["next_until"] = active["since"]
     updated["active_window"] = None
-    updated["last_completed_window"] = {
+    completed = {
         "window_id": window_id_value,
         "since": active["since"],
         "until": active["until"],
         "completed_at": second_utc(parse_utc(completed_at, "completed_at")),
         "canonical_raw_sha256": canonical_raw_sha256,
-        "dataset_sha256": dataset_sha256,
         "walk_ids": sorted(walk_ids),
     }
+    if dataset_sha256 is not None:
+        completed["dataset_sha256"] = dataset_sha256
+    if indexed_generation is not None:
+        completed["indexed_generation"] = indexed_generation
+        completed["portable_export_pending"] = True
+    updated["last_completed_window"] = completed
     if updated["next_until"] == updated["floor_since"]:
         updated["status"] = "complete"
         updated["coverage_conclusion"] = "source_visible_to_account_creation"
@@ -2143,8 +3262,14 @@ def legacy_status_summary(state: dict[str, Any], handle: str) -> dict[str, Any]:
     floor = parse_utc(legacy["floor_since"], "floor_since")
     next_window = None
     if frontier > floor:
+        policy = legacy.get("window_policy")
+        next_seconds = (
+            int(validate_window_policy(policy)["next_window_seconds"])
+            if policy is not None
+            else DEFAULT_ROOT_WINDOW_DAYS * 24 * 60 * 60
+        )
         next_since = max(
-            floor, frontier - timedelta(days=DEFAULT_ROOT_WINDOW_DAYS)
+            floor, frontier - timedelta(seconds=next_seconds)
         )
         next_window = {
             "since": second_utc(next_since),
@@ -2186,6 +3311,10 @@ def legacy_status_summary(state: dict[str, Any], handle: str) -> dict[str, Any]:
         "next_window": next_window,
         "active_window": legacy.get("active_window"),
         "last_completed_window": legacy.get("last_completed_window"),
+        "window_policy": legacy.get("window_policy"),
+        "pending_portable_export_count": len(
+            legacy.get("pending_portable_exports") or []
+        ),
         "manual_review": legacy.get("manual_review"),
         "pending_media_count": len(
             state.get("pending_media")

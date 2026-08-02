@@ -302,6 +302,7 @@ class ArchiveEndpointRecoveryTests(unittest.TestCase):
         self.assertEqual(result["resume_cursor"], "3_50/")
         self.assertTrue(result["synthetic_resume_cursor"])
         self.assertTrue(result["raw_path"].endswith(".incomplete.jsonl"))
+        self.assertIn("--no-download", result["command"])
 
     def test_stalled_endpoint_does_not_rewind_advanced_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:

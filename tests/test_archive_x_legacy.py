@@ -1,4 +1,5 @@
 import importlib
+import hashlib
 import io
 import json
 import sys
@@ -7,7 +8,7 @@ import types
 import unittest
 from argparse import Namespace
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +21,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 archive_x = importlib.import_module("archive_x")
 archive_x_legacy = importlib.import_module("archive_x_legacy")
+archive_x_local = importlib.import_module("archive_x_local")
 
 FIXTURE = json.loads(
     (REPO / "tests" / "fixtures" / "x_legacy_transition.json").read_text(
@@ -1088,12 +1090,53 @@ def valid_walk(kwargs, post_id="29000000000", date="2010-10-29 12:00:00", count=
         "count": count,
         "archived_at": "2026-07-22T12:00:00Z",
     }
+    user_dir = Path(kwargs["user_dir"])
+    run_dir = Path(kwargs["run_dir"])
+    raw_path = run_dir / "raw" / f"{kwargs['walk_id']}.fixture.posts.jsonl"
+    archive_x.atomic_write_jsonl(raw_path, [metadata])
+    query, _url = archive_x_legacy.legacy_query(
+        kwargs["handle"],
+        kwargs["since"],
+        kwargs["until"],
+        include_reposts=kwargs["include_reposts"],
+    )
+    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    telemetry_path = run_dir / f"{kwargs['walk_id']}.fixture.telemetry.json"
+    archive_x.atomic_write_json(
+        telemetry_path,
+        {
+            "schema_version": 1,
+            "request_limit": kwargs["request_limit"],
+            "empty_tail_pages": kwargs["empty_tail_pages"],
+            "api_requests": 1,
+            "search_requests": 1,
+            "request_cap_reached": False,
+            "terminal_reason": "no_cursor",
+            "exit_code": 0,
+            "pages": [
+                {
+                    "request_number": 1,
+                    "query_sha256": query_hash,
+                    "submitted_cursor_sha256": None,
+                    "returned_cursor_sha256": None,
+                    "cursor_repeated": False,
+                    "tweet_entry_count": 1,
+                    "api_error_count": 0,
+                }
+            ],
+            "profile_user_ids": [kwargs["requested_user_id"]],
+            "profile_requests": 0,
+            "identity_source": "bound_numeric_id",
+            "opaque_cursor_values_persisted": False,
+        },
+    )
     return {
+        "archive_run_id": kwargs["archive_run_id"],
         "walk_id": kwargs["walk_id"],
         "endpoint": kwargs["walk_id"],
         "since": kwargs["since"],
         "until": kwargs["until"],
-        "query_sha256": "a" * 64,
+        "query_sha256": query_hash,
         "status": "valid",
         "exit_code": 0,
         "duration_seconds": 1.0,
@@ -1102,6 +1145,12 @@ def valid_walk(kwargs, post_id="29000000000", date="2010-10-29 12:00:00", count=
         "stalled_rate_limit_cycles": 0,
         "validation_error": None,
         "terminal_reason": "no_cursor",
+        "request_limit": kwargs["request_limit"],
+        "empty_tail_pages": kwargs["empty_tail_pages"],
+        "search_requests": 1,
+        "api_requests": 1,
+        "profile_requests": 0,
+        "identity_source": "bound_numeric_id",
         "records": {
             "raw_count": 1,
             "accepted_count": 1,
@@ -1109,10 +1158,10 @@ def valid_walk(kwargs, post_id="29000000000", date="2010-10-29 12:00:00", count=
             "accepted_records": [metadata],
             "overlap_excluded_ids": [],
         },
-        "raw_path": f"runs/fake/{kwargs['walk_id']}.jsonl",
-        "raw_sha256": "b" * 64,
-        "telemetry_path": f"runs/fake/{kwargs['walk_id']}.telemetry.json",
-        "telemetry_sha256": "c" * 64,
+        "raw_path": str(raw_path.relative_to(user_dir)),
+        "raw_sha256": archive_x.sha256_file(raw_path),
+        "telemetry_path": str(telemetry_path.relative_to(user_dir)),
+        "telemetry_sha256": archive_x.sha256_file(telemetry_path),
         "config_path": f"runs/fake/{kwargs['walk_id']}.config.json",
         "config_sha256": "d" * 64,
         "log_path": f"runs/fake/{kwargs['walk_id']}.log",
@@ -1120,7 +1169,117 @@ def valid_walk(kwargs, post_id="29000000000", date="2010-10-29 12:00:00", count=
     }
 
 
+class LegacyRecordValidationTests(unittest.TestCase):
+    def test_empty_repost_and_query_overlap_are_canonicalized_exactly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw_path = Path(directory) / "walk.jsonl"
+            common = {
+                "archived_at": "2026-08-01T00:00:00Z",
+                "reply_id": 0,
+                "count": 0,
+            }
+            records = [
+                {
+                    **common,
+                    "tweet_id": 101,
+                    "date": "2010-10-29 12:00:00",
+                    "author": {"id": 12345, "name": "alice"},
+                    "user": {"id": 12345, "name": "alice"},
+                    "retweet_id": 0,
+                },
+                {
+                    **common,
+                    "tweet_id": 102,
+                    "date": "2010-10-28 23:59:59",
+                    "author": {"id": 12345, "name": "alice"},
+                    "user": {"id": 12345, "name": "alice"},
+                    "retweet_id": 0,
+                },
+                {
+                    **common,
+                    "tweet_id": 103,
+                    "date": "2010-10-30 00:00:00",
+                    "author": {"id": 12345, "name": "alice"},
+                    "user": {"id": 12345, "name": "alice"},
+                    "retweet_id": 0,
+                },
+                {
+                    **common,
+                    "tweet_id": 104,
+                    "date": "2010-10-29 18:00:00",
+                    "author": {"id": 99999, "name": "bob"},
+                    "user": {"id": 12345, "name": "alice"},
+                    "retweet_id": 77,
+                },
+            ]
+            archive_x.atomic_write_jsonl(raw_path, records)
+
+            validated = archive_x_legacy.validate_walk_records(
+                raw_path,
+                since="2010-10-29T00:00:00Z",
+                until="2010-10-30T00:00:00Z",
+                requested_user_id="12345",
+                requested_handle="alice",
+                include_reposts=True,
+            )
+
+            self.assertEqual(validated["accepted_ids"], ["101", "104"])
+            self.assertEqual(validated["overlap_excluded_ids"], ["102", "103"])
+            with self.assertRaisesRegex(
+                archive_x.ArchiveError, "frozen repost policy"
+            ):
+                archive_x_legacy.validate_walk_records(
+                    raw_path,
+                    since="2010-10-29T00:00:00Z",
+                    until="2010-10-30T00:00:00Z",
+                    requested_user_id="12345",
+                    requested_handle="alice",
+                    include_reposts=False,
+                )
+
+            archive_x.atomic_write_jsonl(raw_path, [])
+            empty = archive_x_legacy.validate_walk_records(
+                raw_path,
+                since="2010-10-29T00:00:00Z",
+                until="2010-10-30T00:00:00Z",
+                requested_user_id="12345",
+                requested_handle="alice",
+                include_reposts=True,
+            )
+            self.assertEqual(empty["accepted_ids"], [])
+            self.assertEqual(empty["accepted_count"], 0)
+
+
 class LegacyOrchestrationTests(unittest.TestCase):
+    def test_legacy_command_uses_the_same_actual_request_lane(self):
+        pacing = archive_x_legacy.pacing_x
+        options = pacing.SchedulerOptions(
+            database=Path("/archive/state.sqlite3"),
+            scope_id="12345",
+            delay_low=4.0,
+            delay_high=8.0,
+            lease_seconds=180.0,
+            backoff_429_seconds=300.0,
+        )
+        command = archive_x_legacy.legacy_gallery_command(
+            REPO,
+            Path("/archive/config.json"),
+            Path("/archive/walk.json"),
+            Path("/archive/requests.json"),
+            request_limit=6,
+            empty_tail_pages=2,
+            retries=1,
+            http_timeout=60,
+            requested_user_id="12345",
+            url="https://x.com/search?q=redacted",
+            scheduler_options=options,
+        )
+
+        self.assertEqual(command[command.index("--sleep-retries") + 1], "0")
+        self.assertEqual(command[command.index("--sleep-429") + 1], "0")
+        for option in pacing.SCHEDULER_OPTIONS:
+            self.assertIn(option, command)
+
     def test_no_root_budget_runs_to_exact_floor(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1200,18 +1359,24 @@ class LegacyOrchestrationTests(unittest.TestCase):
             root = Path(directory)
             user_dir, state_path, original = initialized_fixture_archive(root)
             progress_events = []
+            runner = object()
+            observed_runners = []
 
             def fake_walk(**kwargs):
+                observed_runners.append(kwargs.get("runner"))
                 return valid_walk(kwargs, count=1)
 
             with mock.patch.object(
                 archive_x_legacy, "run_legacy_walk", side_effect=fake_walk
             ), mock.patch.object(
-                archive_x_legacy.archive_x, "sleep_random", return_value=0
+                archive_x_legacy.archive_x,
+                "sleep_random",
+                side_effect=AssertionError("stacked legacy pacing ran"),
             ):
                 result = archive_x_legacy.run_legacy_archive(
                     legacy_run_args(root), REPO, root, "alice", "1.32.4",
                     progress_callback=progress_events.append,
+                    runner=runner,
                 )
 
             state = archive_x.load_json(state_path, {})
@@ -1222,13 +1387,36 @@ class LegacyOrchestrationTests(unittest.TestCase):
             )
             self.assertEqual(state["resume"], original["resume"])
             self.assertEqual(
-                [item["key"] for item in state["pending_media"] if item.get("key")],
-                ["post:29000000000"],
+                state.get("pending_media", []), original.get("pending_media", [])
             )
             posts = list(archive_x.iter_jsonl(user_dir / "dataset" / "posts.jsonl"))
-            self.assertEqual(len(posts), 3)
-            self.assertIn("29000000000", {item["post_id"] for item in posts})
+            self.assertEqual(len(posts), 2)
+            with archive_x_legacy.context_x.ContextDB(
+                user_dir / "_state" / "context.sqlite3", create=False
+            ) as database:
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM archive_posts "
+                        "WHERE post_id='29000000000'"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    database.connection.execute(
+                        """SELECT state FROM asset_jobs
+                             WHERE owner_kind='post'
+                               AND owner_id='29000000000'
+                               AND media_ordinal=1"""
+                    ).fetchone()[0],
+                    "needs_refresh",
+                )
             self.assertTrue(result["windows"][0]["state_committed"])
+            self.assertTrue(
+                all(
+                    "command" not in walk
+                    for walk in result["windows"][0]["walks"]
+                )
+            )
             self.assertEqual(
                 [event["event"] for event in progress_events],
                 [
@@ -1236,7 +1424,110 @@ class LegacyOrchestrationTests(unittest.TestCase):
                     "window_committed",
                 ],
             )
-            self.assertEqual(progress_events[-1]["dataset_posts"], 3)
+            self.assertEqual(progress_events[-1]["dataset_posts"], 0)
+            self.assertEqual(result["portable_export"]["dataset_posts"], 1)
+            self.assertEqual(result["portable_export"]["window_count"], 1)
+            self.assertEqual(observed_runners, [runner, runner])
+            self.assertEqual(
+                result["portable_export"]["status"],
+                "deferred_to_unified_checkpoint",
+            )
+
+    def test_confirmed_legacy_descriptor_queues_direct_asset_without_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, _state_path, _ = initialized_fixture_archive(root)
+
+            def descriptor_walk(**kwargs):
+                result = valid_walk(kwargs, count=1)
+                operation_id = (
+                    f"{kwargs['archive_run_id']}:{kwargs['walk_id']}"
+                )
+                url = "https://pbs.twimg.com/media/legacy-fixture.jpg?name=orig"
+                filename = "2010-10-29T12-00-00_29000000000_1_alice.jpg"
+                row = {
+                    "schema": archive_x_legacy.descriptor_x.SCHEMA,
+                    "schema_version": archive_x_legacy.descriptor_x.SCHEMA_VERSION,
+                    "operation_id": operation_id,
+                    "run_id": kwargs["archive_run_id"],
+                    "source_kind": "legacy",
+                    "source_operation": "legacy",
+                    "owner_kind": "post",
+                    "owner_id": "29000000000",
+                    "post_id": "29000000000",
+                    "media_ordinal": 1,
+                    "media_type": "photo",
+                    "extension": "jpg",
+                    "private_url": url,
+                    "url_sha256": hashlib.sha256(url.encode()).hexdigest(),
+                    "url_host": "pbs.twimg.com",
+                    "filename": filename,
+                    "relative_directory": "users/alice/media/2010/10",
+                    "relative_path": f"users/alice/media/2010/10/{filename}",
+                    "width": 1200,
+                    "height": 800,
+                    "duration_seconds": None,
+                    "bitrate": None,
+                    "alt_text": "legacy fixture",
+                    "variant": {"type": "photo", "width": 1200, "height": 800},
+                    "captured_at": "2026-08-01T00:00:00Z",
+                }
+                row["descriptor_sha256"] = hashlib.sha256(
+                    archive_x_legacy.descriptor_x.canonical_json(
+                        archive_x_legacy.descriptor_x.descriptor_payload(row)
+                    ).encode()
+                ).hexdigest()
+                row = archive_x_legacy.descriptor_x.normalize_record(row)
+                artifact = (
+                    Path(kwargs["run_dir"])
+                    / "raw"
+                    / f"{kwargs['walk_id']}.fixture.descriptors.jsonl"
+                )
+                archive_x.atomic_write_jsonl(artifact, [row])
+                result.update(
+                    {
+                        "descriptor_artifact_path": str(
+                            artifact.relative_to(user_dir)
+                        ),
+                        "descriptor_artifact_sha256": archive_x.sha256_file(
+                            artifact
+                        ),
+                        "descriptor_operation_id": operation_id,
+                        "descriptor_source_kind": "legacy",
+                        "descriptor_source_operation": "legacy",
+                    }
+                )
+                return result
+
+            with mock.patch.object(
+                archive_x_legacy, "run_legacy_walk", side_effect=descriptor_walk
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ):
+                result = archive_x_legacy.run_legacy_archive(
+                    legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                )
+
+            self.assertEqual(
+                result["windows"][0]["descriptor_commit"]["rows_accepted"], 2
+            )
+            with archive_x_legacy.context_x.ContextDB(
+                user_dir / "_state" / "context.sqlite3", create=False
+            ) as database:
+                descriptors = database.connection.execute(
+                    "SELECT COUNT(*) FROM descriptor_generations "
+                    "WHERE owner_kind='post' AND owner_id='29000000000'"
+                ).fetchone()[0]
+                direct_jobs = database.connection.execute(
+                    "SELECT COUNT(*) FROM asset_jobs WHERE owner_id='29000000000'"
+                ).fetchone()[0]
+                refreshes = database.connection.execute(
+                    "SELECT COUNT(*) FROM descriptor_refresh_jobs "
+                    "WHERE owner_id='29000000000'"
+                ).fetchone()[0]
+            self.assertGreaterEqual(descriptors, 1)
+            self.assertEqual(direct_jobs, 1)
+            self.assertEqual(refreshes, 0)
 
     def test_mismatched_walks_enter_manual_review_without_advancing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1330,9 +1621,66 @@ class LegacyOrchestrationTests(unittest.TestCase):
                 "2010-10-29T00:00:00Z",
             )
 
+    def test_manifest_does_not_persist_command_or_private_search_query(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialized_fixture_archive(root)
+
+            with mock.patch.object(
+                archive_x_legacy,
+                "run_legacy_walk",
+                side_effect=lambda **kwargs: valid_walk(kwargs),
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ):
+                result = archive_x_legacy.run_legacy_archive(
+                    legacy_run_args(root),
+                    REPO,
+                    root,
+                    "alice",
+                    "1.32.4",
+                )
+
+            public_manifest = json.dumps(result, sort_keys=True)
+            self.assertNotIn('"command"', public_manifest)
+            self.assertNotIn("from:alice", public_manifest)
+            self.assertNotIn("since_time:", public_manifest)
+
 
 class LegacyRecoveryTests(unittest.TestCase):
-    def test_crash_after_dataset_merge_replays_and_deduplicates(self):
+    def test_keyboard_interrupt_after_first_valid_walk_retains_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _user_dir, state_path, _ = initialized_fixture_archive(root)
+            calls = 0
+
+            def interrupt_after_first(**kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return valid_walk(kwargs)
+                raise KeyboardInterrupt
+
+            with mock.patch.object(
+                archive_x_legacy,
+                "run_legacy_walk",
+                side_effect=interrupt_after_first,
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    archive_x_legacy.run_legacy_archive(
+                        legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                    )
+
+            retained = archive_x.load_json(state_path, {})["legacy_backfill"]
+            self.assertEqual(retained["status"], "active")
+            self.assertEqual(
+                len(retained["active_window"]["leaves"][0]["observations"]),
+                1,
+            )
+
+    def test_crash_after_indexed_commit_replays_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             user_dir, state_path, original = initialized_fixture_archive(root)
@@ -1361,8 +1709,23 @@ class LegacyRecoveryTests(unittest.TestCase):
             self.assertEqual(after_crash["resume"], original["resume"])
             self.assertEqual(
                 len(list(archive_x.iter_jsonl(user_dir / "dataset" / "posts.jsonl"))),
-                3,
+                2,
             )
+            with archive_x_legacy.context_x.ContextDB(
+                user_dir / "_state" / "context.sqlite3", create=False
+            ) as database:
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM legacy_intervals"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM archive_posts WHERE post_id='29000000000'"
+                    ).fetchone()[0],
+                    1,
+                )
 
             with mock.patch.object(
                 archive_x_legacy, "run_legacy_walk", side_effect=fake_walk
@@ -1381,8 +1744,17 @@ class LegacyRecoveryTests(unittest.TestCase):
             )
             self.assertEqual(
                 len(list(archive_x.iter_jsonl(user_dir / "dataset" / "posts.jsonl"))),
-                3,
+                2,
             )
+            with archive_x_legacy.context_x.ContextDB(
+                user_dir / "_state" / "context.sqlite3", create=False
+            ) as database:
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM legacy_intervals"
+                    ).fetchone()[0],
+                    1,
+                )
             self.assertIn(
                 "interrupted",
                 {item["status"] for item in result["recovered_manifests"]},
@@ -1496,8 +1868,90 @@ class LegacyRecoveryTests(unittest.TestCase):
             )
             self.assertEqual(
                 len(list(archive_x.iter_jsonl(user_dir / "dataset" / "posts.jsonl"))),
-                3,
+                2,
             )
+            with archive_x_legacy.context_x.ContextDB(
+                user_dir / "_state" / "context.sqlite3", create=False
+            ) as database:
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM legacy_intervals"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_export_placement_failure_stays_pending_and_replays_without_x(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, state_path, _ = initialized_fixture_archive(root)
+            state = archive_x.load_json(state_path, {})
+            state["legacy_backfill"]["floor_since"] = "2010-10-29T00:00:00Z"
+            archive_x.atomic_write_json(state_path, state)
+
+            original_write = archive_x.atomic_write_json
+            injected = False
+
+            def fail_export_clear(path, value):
+                nonlocal injected
+                legacy_state = (
+                    value.get("legacy_backfill")
+                    if isinstance(value, dict)
+                    else None
+                )
+                if (
+                    not injected
+                    and Path(path) == state_path
+                    and isinstance(legacy_state, dict)
+                    and legacy_state.get("last_indexed_checkpoint")
+                    and legacy_state.get("pending_portable_exports") == []
+                ):
+                    injected = True
+                    raise OSError("injected export-clear failure")
+                return original_write(path, value)
+
+            with mock.patch.object(
+                archive_x_legacy,
+                "run_legacy_walk",
+                side_effect=lambda **kwargs: valid_walk(kwargs),
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ), mock.patch.object(
+                archive_x_legacy.archive_x,
+                "atomic_write_json",
+                side_effect=fail_export_clear,
+            ):
+                with self.assertRaisesRegex(OSError, "export-clear failure"):
+                    archive_x_legacy.run_legacy_archive(
+                        legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                    )
+
+            pending = archive_x.load_json(state_path, {})["legacy_backfill"]
+            self.assertEqual(pending["status"], "complete")
+            self.assertEqual(len(pending["pending_portable_exports"]), 1)
+            with archive_x_legacy.context_x.ContextDB(
+                user_dir / "_state" / "context.sqlite3", create=False
+            ) as database:
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM archive_posts "
+                        "WHERE post_id='29000000000'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+            with mock.patch.object(
+                archive_x_legacy,
+                "run_legacy_walk",
+                side_effect=AssertionError("X must not run during export repair"),
+            ):
+                repaired = archive_x_legacy.run_legacy_archive(
+                    legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                )
+
+            final = archive_x.load_json(state_path, {})["legacy_backfill"]
+            self.assertEqual(repaired["status"], "complete")
+            self.assertEqual(final["pending_portable_exports"], [])
+            self.assertEqual(final["last_indexed_checkpoint"]["window_count"], 1)
 
     def test_manual_review_retry_is_exact_and_preserves_frontier(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1593,6 +2047,682 @@ class LegacyRecoveryTests(unittest.TestCase):
             retried = archive_x.load_json(state_path, {})
             self.assertEqual(retried["legacy_backfill"]["status"], "pending")
             self.assertEqual(retried["resume"], original["resume"])
+
+
+class AdaptiveLegacyPolicyTests(unittest.TestCase):
+    def test_sparse_360_day_fixture_reduces_search_calls_over_ninety_percent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _user_dir, state_path, _ = initialized_fixture_archive(Path(directory))
+            state = archive_x.load_json(state_path, {})
+            legacy = state["legacy_backfill"]
+            initial = datetime(2010, 10, 30, tzinfo=timezone.utc)
+            legacy["initial_until"] = archive_x_legacy.second_utc(initial)
+            legacy["next_until"] = archive_x_legacy.second_utc(initial)
+            legacy["floor_since"] = archive_x_legacy.second_utc(
+                initial - timedelta(days=360)
+            )
+            widths = []
+            index = 0
+            while legacy["status"] != "complete":
+                active = archive_x_legacy.claim_window(
+                    legacy,
+                    owner_run_id=f"fixture-{index}",
+                    claimed_at="2026-08-01T00:00:00Z",
+                    root_window_days=3,
+                )
+                window = active["active_window"]
+                width = int(
+                    (
+                        archive_x_legacy.parse_utc(window["until"], "until")
+                        - archive_x_legacy.parse_utc(window["since"], "since")
+                    ).total_seconds()
+                    // 86_400
+                )
+                widths.append(width)
+                observations = [
+                    {
+                        "search_requests": 3,
+                        "api_requests": 3,
+                        "accepted_count": 0,
+                    },
+                    {
+                        "search_requests": 3,
+                        "api_requests": 3,
+                        "accepted_count": 0,
+                    },
+                ]
+                active = archive_x_legacy.update_adaptive_window_policy(
+                    active,
+                    confirmed_observations=observations,
+                    request_limit=6,
+                    empty_tail_pages=2,
+                )
+                legacy = archive_x_legacy.complete_window(
+                    active,
+                    window_id_value=window["window_id"],
+                    completed_at="2026-08-01T00:00:00Z",
+                    canonical_raw_sha256=f"{index + 1:064x}",
+                    dataset_sha256="f" * 64,
+                    walk_ids=[f"walk-{index}-a", f"walk-{index}-b"],
+                )
+                index += 1
+
+        self.assertEqual(widths, [3, 6, 12, 24, 48, 90, 90, 87])
+        fixed_windows = 360 // 3
+        fixed_search_calls = fixed_windows * 2 * 3
+        adaptive_search_calls = len(widths) * 2 * 3
+        fixed_total_api_calls = fixed_search_calls + fixed_windows * 2
+        adaptive_total_api_calls = adaptive_search_calls  # bound ID: no profile call
+        self.assertEqual(fixed_search_calls, 720)
+        self.assertEqual(adaptive_search_calls, 48)
+        self.assertEqual(fixed_total_api_calls, 960)
+        self.assertEqual(adaptive_total_api_calls, 48)
+        self.assertGreaterEqual(
+            1 - adaptive_search_calls / fixed_search_calls,
+            0.50,
+        )
+        self.assertEqual(legacy["next_until"], legacy["floor_since"])
+
+    def test_dense_valid_window_shrinks_only_the_next_unclaimed_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _user_dir, state_path, _ = initialized_fixture_archive(Path(directory))
+            legacy = archive_x.load_json(state_path, {})["legacy_backfill"]
+            active = archive_x_legacy.claim_window(
+                legacy,
+                owner_run_id="fixture",
+                claimed_at="2026-08-01T00:00:00Z",
+                root_window_days=3,
+            )
+            original = active["active_window"].copy()
+            adapted = archive_x_legacy.update_adaptive_window_policy(
+                active,
+                confirmed_observations=[
+                    {"search_requests": 5, "api_requests": 5, "accepted_count": 30},
+                    {"search_requests": 5, "api_requests": 5, "accepted_count": 30},
+                ],
+                request_limit=6,
+                empty_tail_pages=2,
+            )
+
+        self.assertEqual(adapted["active_window"]["since"], original["since"])
+        self.assertEqual(adapted["active_window"]["until"], original["until"])
+        self.assertEqual(
+            adapted["window_policy"]["next_window_seconds"], 129_600
+        )
+        self.assertEqual(
+            adapted["window_policy"]["last_decision"], "dense_shrink"
+        )
+
+    def test_adaptive_and_fixed_windows_commit_the_same_canonical_posts(self):
+        initial = datetime(2010, 10, 30, tzinfo=timezone.utc)
+        source_records = []
+        for index, age_days in enumerate((2, 17, 32, 47, 62, 77)):
+            posted = initial - timedelta(days=age_days, hours=12)
+            source_records.append(
+                {
+                    "tweet_id": 29_000_000_100 + index,
+                    "date": posted.strftime("%Y-%m-%d %H:%M:%S"),
+                    "author": {"id": 12345, "name": "alice"},
+                    "user": {"id": 12345, "name": "alice"},
+                    "reply_id": 0,
+                    "retweet_id": 0,
+                    "count": 0,
+                    "archived_at": "2026-08-01T00:00:00Z",
+                }
+            )
+
+        def exercise(root: Path, *, adaptive: bool):
+            user_dir, state_path, _ = initialized_fixture_archive(root)
+            state = archive_x.load_json(state_path, {})
+            state["legacy_backfill"]["initial_until"] = (
+                archive_x_legacy.second_utc(initial)
+            )
+            state["legacy_backfill"]["next_until"] = (
+                archive_x_legacy.second_utc(initial)
+            )
+            state["legacy_backfill"]["floor_since"] = (
+                archive_x_legacy.second_utc(initial - timedelta(days=90))
+            )
+            archive_x.atomic_write_json(state_path, state)
+            calls = []
+
+            def source_walk(**kwargs):
+                calls.append((kwargs["since"], kwargs["until"]))
+                since = archive_x_legacy.parse_utc(kwargs["since"], "since")
+                until = archive_x_legacy.parse_utc(kwargs["until"], "until")
+                selected = [
+                    record
+                    for record in source_records
+                    if since
+                    <= archive_x.parse_datetime(record["date"])
+                    < until
+                ]
+                placeholder_date = (since + (until - since) / 2).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                result = valid_walk(
+                    kwargs,
+                    post_id=str(
+                        selected[0]["tweet_id"] if selected else 29_999_999_999
+                    ),
+                    date=(selected[0]["date"] if selected else placeholder_date),
+                )
+                raw_path = user_dir / result["raw_path"]
+                archive_x.atomic_write_jsonl(raw_path, selected)
+                result["raw_sha256"] = archive_x.sha256_file(raw_path)
+                result["records"] = {
+                    "raw_count": len(selected),
+                    "accepted_count": len(selected),
+                    "accepted_ids": sorted(
+                        (str(item["tweet_id"]) for item in selected), key=int
+                    ),
+                    "accepted_records": selected,
+                    "overlap_excluded_ids": [],
+                }
+                telemetry_path = user_dir / result["telemetry_path"]
+                telemetry = archive_x.load_json(telemetry_path, {})
+                telemetry["pages"][0]["tweet_entry_count"] = len(selected)
+                archive_x.atomic_write_json(telemetry_path, telemetry)
+                result["telemetry_sha256"] = archive_x.sha256_file(
+                    telemetry_path
+                )
+                return result
+
+            patches = [
+                mock.patch.object(
+                    archive_x_legacy, "run_legacy_walk", side_effect=source_walk
+                ),
+                mock.patch.object(
+                    archive_x_legacy.archive_x, "sleep_random", return_value=0
+                ),
+            ]
+            if not adaptive:
+                patches.append(
+                    mock.patch.object(
+                        archive_x_legacy,
+                        "update_adaptive_window_policy",
+                        side_effect=lambda current, **_kwargs: current,
+                    )
+                )
+            with patches[0], patches[1]:
+                if adaptive:
+                    result = archive_x_legacy.run_legacy_archive(
+                        legacy_run_args(
+                            root, max_root_windows=None, root_window_days=3
+                        ),
+                        REPO,
+                        root,
+                        "alice",
+                        "1.32.4",
+                    )
+                else:
+                    with patches[2]:
+                        result = archive_x_legacy.run_legacy_archive(
+                            legacy_run_args(
+                                root, max_root_windows=None, root_window_days=3
+                            ),
+                            REPO,
+                            root,
+                            "alice",
+                            "1.32.4",
+                        )
+            self.assertEqual(result["status"], "complete")
+            with archive_x_legacy.context_x.ContextDB(
+                user_dir / "_state" / "context.sqlite3", create=False
+            ) as database:
+                canonical = {
+                    str(row[0])
+                    for row in database.connection.execute(
+                        "SELECT post_id FROM archive_posts"
+                    )
+                }
+            return canonical, len(calls)
+
+        with tempfile.TemporaryDirectory() as fixed_directory, (
+            tempfile.TemporaryDirectory()
+        ) as adaptive_directory:
+            fixed, fixed_calls = exercise(Path(fixed_directory), adaptive=False)
+            adaptive, adaptive_calls = exercise(
+                Path(adaptive_directory), adaptive=True
+            )
+
+        expected = {str(record["tweet_id"]) for record in source_records}
+        self.assertEqual(fixed, expected)
+        self.assertEqual(adaptive, expected)
+        self.assertLessEqual(adaptive_calls, fixed_calls // 2)
+
+
+class DurableLegacyEvidenceTests(unittest.TestCase):
+    def test_valid_invalid_valid_confirms_without_erasing_first_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _user_dir, state_path, _ = initialized_fixture_archive(root)
+            calls = 0
+
+            def sequence(**kwargs):
+                nonlocal calls
+                calls += 1
+                result = valid_walk(kwargs)
+                if calls == 2:
+                    result.update(
+                        {
+                            "status": "ambiguous",
+                            "terminal_reason": "api_error",
+                            "records": None,
+                            "validation_error": "transient fixture",
+                        }
+                    )
+                return result
+
+            with mock.patch.object(
+                archive_x_legacy, "run_legacy_walk", side_effect=sequence
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ):
+                result = archive_x_legacy.run_legacy_archive(
+                    legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                )
+
+            state = archive_x.load_json(state_path, {})
+            self.assertEqual(calls, 3)
+            self.assertEqual(result["status"], "limited")
+            self.assertEqual(state["legacy_backfill"]["status"], "pending")
+            self.assertEqual(
+                len(state["legacy_backfill"]["last_completed_window"]["walk_ids"]),
+                2,
+            )
+
+    def test_restart_reuses_one_valid_observation_and_requests_only_one_more(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _user_dir, state_path, _ = initialized_fixture_archive(root)
+            first_calls = 0
+
+            def crash_after_first(**kwargs):
+                nonlocal first_calls
+                first_calls += 1
+                if first_calls == 1:
+                    return valid_walk(kwargs)
+                raise archive_x.ArchiveError("injected after first observation")
+
+            with mock.patch.object(
+                archive_x_legacy,
+                "run_legacy_walk",
+                side_effect=crash_after_first,
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ):
+                with self.assertRaisesRegex(
+                    archive_x.ArchiveError, "after first observation"
+                ):
+                    archive_x_legacy.run_legacy_archive(
+                        legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                    )
+
+            retained = archive_x.load_json(state_path, {})["legacy_backfill"]
+            self.assertEqual(
+                len(retained["active_window"]["leaves"][0]["observations"]), 1
+            )
+            resumed_calls = 0
+
+            def one_more(**kwargs):
+                nonlocal resumed_calls
+                resumed_calls += 1
+                return valid_walk(kwargs)
+
+            with mock.patch.object(
+                archive_x_legacy, "run_legacy_walk", side_effect=one_more
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ):
+                result = archive_x_legacy.run_legacy_archive(
+                    legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                )
+
+            self.assertEqual(result["status"], "limited")
+            self.assertEqual(resumed_calls, 1)
+
+    def test_restart_after_two_persisted_observations_needs_no_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _user_dir, state_path, _ = initialized_fixture_archive(root)
+
+            with mock.patch.object(
+                archive_x_legacy,
+                "run_legacy_walk",
+                side_effect=lambda **kwargs: valid_walk(kwargs),
+            ), mock.patch.object(
+                archive_x_legacy,
+                "update_adaptive_window_policy",
+                side_effect=archive_x.ArchiveError(
+                    "injected after second observation"
+                ),
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ):
+                with self.assertRaisesRegex(
+                    archive_x.ArchiveError, "after second observation"
+                ):
+                    archive_x_legacy.run_legacy_archive(
+                        legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                    )
+
+            retained = archive_x.load_json(state_path, {})["legacy_backfill"]
+            self.assertEqual(
+                len(retained["active_window"]["leaves"][0]["observations"]), 2
+            )
+            retained["active_window"]["attempt"] = 3
+            retained_state = archive_x.load_json(state_path, {})
+            retained_state["legacy_backfill"] = retained
+            archive_x.atomic_write_json(state_path, retained_state)
+            with mock.patch.object(
+                archive_x_legacy,
+                "run_legacy_walk",
+                side_effect=AssertionError("network must not run"),
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ) as _sleep:
+                result = archive_x_legacy.run_legacy_archive(
+                    legacy_run_args(root), REPO, root, "alice", "1.32.4"
+                )
+
+            self.assertEqual(result["status"], "limited")
+            self.assertEqual(result["windows"][0]["retained_observations_reused"], 2)
+
+    def test_same_artifact_cannot_count_twice_and_corruption_stops_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, state_path, _ = initialized_fixture_archive(root)
+            state = archive_x.load_json(state_path, {})
+            active = archive_x_legacy.claim_window(
+                state["legacy_backfill"],
+                owner_run_id="fixture-run",
+                claimed_at="2026-08-01T00:00:00Z",
+                root_window_days=1,
+            )
+            run_dir = user_dir / "runs" / "fixture-evidence"
+            kwargs = {
+                "user_dir": user_dir,
+                "run_dir": run_dir,
+                "handle": "alice",
+                "requested_user_id": "12345",
+                "archive_run_id": "fixture-evidence",
+                "walk_id": "fixture-walk",
+                "since": active["active_window"]["since"],
+                "until": active["active_window"]["until"],
+                "include_reposts": True,
+                "request_limit": 6,
+                "empty_tail_pages": 2,
+            }
+            result = valid_walk(kwargs)
+            observation = archive_x_legacy.retained_observation(user_dir, result)
+            retained, inserted = archive_x_legacy.append_retained_observation(
+                active,
+                leaf_since=kwargs["since"],
+                leaf_until=kwargs["until"],
+                observation=observation,
+            )
+            repeated, inserted_again = archive_x_legacy.append_retained_observation(
+                retained,
+                leaf_since=kwargs["since"],
+                leaf_until=kwargs["until"],
+                observation=observation,
+            )
+            self.assertTrue(inserted)
+            self.assertFalse(inserted_again)
+            self.assertIsNone(
+                archive_x_legacy.confirmation_from_retained(
+                    user_dir,
+                    repeated["active_window"]["leaves"][0]["observations"],
+                    handle="alice",
+                    requested_user_id="12345",
+                    include_reposts=True,
+                )
+            )
+            forged = dict(observation)
+            forged["observation_id"] = "f" * 64
+            with self.assertRaisesRegex(
+                archive_x.ArchiveError, "cannot count as two"
+            ):
+                archive_x_legacy.append_retained_observation(
+                    retained,
+                    leaf_since=kwargs["since"],
+                    leaf_until=kwargs["until"],
+                    observation=forged,
+                )
+            archive_x.atomic_write_jsonl(
+                user_dir / observation["raw_path"],
+                [{"tweet_id": 999, "date": "2010-10-29 12:00:00"}],
+            )
+            with self.assertRaisesRegex(archive_x.ArchiveError, "hash changed"):
+                archive_x_legacy.restore_retained_observation(
+                    user_dir,
+                    observation,
+                    handle="alice",
+                    requested_user_id="12345",
+                    include_reposts=True,
+                )
+
+
+class LegacyIndexedCommitTests(unittest.TestCase):
+    def test_two_windows_use_two_indexed_commits_and_defer_portable_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, state_path, _ = initialized_fixture_archive(root)
+            state = archive_x.load_json(state_path, {})
+            state["legacy_backfill"]["floor_since"] = "2010-10-27T00:00:00Z"
+            archive_x.atomic_write_json(state_path, state)
+
+            def window_walk(**kwargs):
+                since = archive_x_legacy.parse_utc(kwargs["since"], "since")
+                until = archive_x_legacy.parse_utc(kwargs["until"], "until")
+                midpoint = since + (until - since) / 2
+                post_id = str(28_000_000_000 + int(since.timestamp()) % 1_000_000)
+                return valid_walk(
+                    kwargs,
+                    post_id=post_id,
+                    date=midpoint.strftime("%Y-%m-%d %H:%M:%S"),
+                )
+
+            original_export = archive_x.update_post_dataset
+            with mock.patch.object(
+                archive_x_legacy, "run_legacy_walk", side_effect=window_walk
+            ), mock.patch.object(
+                archive_x_legacy.archive_x, "sleep_random", return_value=0
+            ), mock.patch.object(
+                archive_x_legacy.archive_x,
+                "update_post_dataset",
+                wraps=original_export,
+            ) as materialize:
+                result = archive_x_legacy.run_legacy_archive(
+                    legacy_run_args(root, max_root_windows=None),
+                    REPO,
+                    root,
+                    "alice",
+                    "1.32.4",
+                )
+
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(len(result["windows"]), 2)
+            self.assertEqual(result["portable_export"]["window_count"], 2)
+            self.assertEqual(result["portable_export"]["payload_bytes_read"], 0)
+            self.assertEqual(materialize.call_count, 0)
+            export = archive_x_local.checkpoint_exports(
+                user_dir,
+                user_dir / "_state" / "context.sqlite3",
+                force=True,
+            )
+            self.assertTrue(
+                archive_x_legacy.record_unified_export_checkpoint(
+                    user_dir, export
+                )
+            )
+            exported_state = archive_x.load_json(state_path, {})[
+                "legacy_backfill"
+            ]
+            self.assertFalse(
+                exported_state["last_completed_window"][
+                    "portable_export_pending"
+                ]
+            )
+            self.assertEqual(
+                exported_state["last_portable_export"]["window_count"], 2
+            )
+            with archive_x_legacy.context_x.ContextDB(
+                user_dir / "_state" / "context.sqlite3", create=False
+            ) as database:
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM legacy_intervals"
+                    ).fetchone()[0],
+                    2,
+                )
+                plan = " ".join(
+                    str(row[3])
+                    for row in database.connection.execute(
+                        "EXPLAIN QUERY PLAN SELECT interval_id "
+                        "FROM legacy_intervals WHERE until_epoch<=? "
+                        "ORDER BY until_epoch DESC,since_epoch,interval_id LIMIT 1",
+                        (2_000_000_000,),
+                    )
+                )
+            self.assertIn("legacy_intervals_bounds", plan)
+            self.assertNotIn("USE TEMP B-TREE", plan)
+
+    def test_indexed_commit_rolls_back_fully_and_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, _state_path, _ = initialized_fixture_archive(root)
+            canonical = user_dir / "runs" / "fixture-index" / "raw" / "window.jsonl"
+            metadata = {
+                "tweet_id": 28_000_000_001,
+                "date": "2010-10-29 12:00:00",
+                "author": {"id": 12345, "name": "alice"},
+                "user": {"id": 12345, "name": "alice"},
+                "reply_id": 0,
+                "retweet_id": 0,
+                "archived_at": "2026-08-01T00:00:00Z",
+            }
+            archive_x.atomic_write_jsonl(canonical, [metadata])
+            digest = archive_x.sha256_file(canonical)
+            db_path = user_dir / "_state" / "context.sqlite3"
+            with archive_x_legacy.context_x.ContextDB(db_path) as database:
+                database.bind_identity("12345", "alice")
+                database.connection.execute(
+                    "CREATE TRIGGER fixture_legacy_abort BEFORE INSERT ON "
+                    "legacy_intervals BEGIN SELECT RAISE(ABORT,'fixture'); END"
+                )
+            kwargs = {
+                "canonical_path": canonical,
+                "canonical_hash": digest,
+                "canonical_records": [metadata],
+                "handle": "alice",
+                "requested_user_id": "12345",
+                "run_id": "fixture-index",
+                "window_id_value": "legacy-fixture-index",
+                "since": "2010-10-29T00:00:00Z",
+                "until": "2010-10-30T00:00:00Z",
+                "observation_ids": ["a" * 64, "b" * 64],
+                "observed_at": "2026-08-01T00:00:00Z",
+            }
+            with self.assertRaisesRegex(
+                archive_x.ArchiveError, "indexed commit failed"
+            ):
+                archive_x_legacy.commit_indexed_legacy_window(
+                    user_dir, **kwargs
+                )
+            with archive_x_legacy.context_x.ContextDB(
+                db_path, create=False
+            ) as database:
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT current_generation FROM archive_generation"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM archive_posts"
+                    ).fetchone()[0],
+                    0,
+                )
+                database.connection.execute("DROP TRIGGER fixture_legacy_abort")
+            committed = archive_x_legacy.commit_indexed_legacy_window(
+                user_dir, **kwargs
+            )
+            repeated = archive_x_legacy.commit_indexed_legacy_window(
+                user_dir, **kwargs
+            )
+            self.assertEqual(committed["generation"], 1)
+            self.assertFalse(committed["idempotent"])
+            self.assertTrue(repeated["idempotent"])
+
+    def test_indexed_legacy_commit_seeds_reply_edge_and_local_parent_directly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_dir, _state_path, _ = initialized_fixture_archive(root)
+            canonical = user_dir / "runs" / "fixture-edge" / "raw" / "window.jsonl"
+            parent = {
+                "tweet_id": 28_000_000_001,
+                "date": "2010-10-29 11:00:00",
+                "author": {"id": 12345, "name": "alice"},
+                "user": {"id": 12345, "name": "alice"},
+                "reply_id": 0,
+                "conversation_id": 28_000_000_001,
+                "retweet_id": 0,
+                "archived_at": "2026-08-01T00:00:00Z",
+            }
+            child = {
+                **parent,
+                "tweet_id": 28_000_000_002,
+                "date": "2010-10-29 12:00:00",
+                "reply_id": 28_000_000_001,
+            }
+            archive_x.atomic_write_jsonl(canonical, [parent, child])
+            db_path = user_dir / "_state" / "context.sqlite3"
+            with archive_x_legacy.context_x.ContextDB(db_path) as database:
+                database.bind_identity("12345", "alice")
+
+            committed = archive_x_legacy.commit_indexed_legacy_window(
+                user_dir,
+                canonical_path=canonical,
+                canonical_hash=archive_x.sha256_file(canonical),
+                canonical_records=[parent, child],
+                handle="alice",
+                requested_user_id="12345",
+                run_id="fixture-edge",
+                window_id_value="legacy-fixture-edge",
+                since="2010-10-29T00:00:00Z",
+                until="2010-10-30T00:00:00Z",
+                observation_ids=["a" * 64, "b" * 64],
+                observed_at="2026-08-01T00:00:00Z",
+            )
+
+            self.assertEqual(committed["new_edges"], 1)
+            self.assertEqual(committed["local_parents"], 1)
+            with archive_x_legacy.context_x.ContextDB(
+                db_path, create=False
+            ) as database:
+                self.assertEqual(
+                    tuple(
+                        database.connection.execute(
+                            "SELECT child_id,parent_id FROM reply_edges"
+                        ).fetchone()
+                    ),
+                    ("28000000002", "28000000001"),
+                )
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT state FROM targets WHERE post_id='28000000001'"
+                    ).fetchone()[0],
+                    "captured",
+                )
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT edge_count FROM archive_sources"
+                    ).fetchone()[0],
+                    1,
+                )
 
 
 if __name__ == "__main__":

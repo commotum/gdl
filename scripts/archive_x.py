@@ -13,8 +13,10 @@ import mimetypes
 import os
 import random
 import re
+import secrets
 import shlex
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -24,6 +26,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 from urllib.parse import urlparse
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import archive_x_descriptors as descriptor_x
+import archive_x_request_telemetry as request_telemetry_x
 
 try:
     import fcntl
@@ -409,6 +417,147 @@ def verify_gallery_dl_x_runner(repo_dir: Path, version: str) -> None:
             "gallery-dl X runner reported an unexpected version: "
             f"expected {version}, found {reported or 'no output'}"
         )
+
+
+def x_scheduler_options(
+    user_dir: Path,
+    account_id: str,
+    request_delay: str,
+) -> Any:
+    """Build the private actual-request lane only after numeric identity proof."""
+    pacing = importlib.import_module("archive_x_pacing")
+    if not account_id.isdecimal() or int(account_id) < 1:
+        raise ArchiveError("X scheduler account identity is invalid")
+    low, high = pacing.parse_delay(request_delay)
+    low = max(pacing.DEFAULT_DELAY_LOW_SECONDS, low)
+    high = max(low, high)
+    return pacing.SchedulerOptions(
+        database=user_dir / "_state" / "context.sqlite3",
+        scope_id=account_id,
+        delay_low=low,
+        delay_high=high,
+        lease_seconds=pacing.DEFAULT_REQUEST_LEASE_SECONDS,
+        backoff_429_seconds=pacing.DEFAULT_429_BACKOFF_SECONDS,
+    )
+
+
+def existing_x_scheduler_options(
+    user_dir: Path,
+    state: dict[str, Any],
+    request_delay: str,
+) -> Any | None:
+    """Read an existing v3 identity lane without migrating before proof."""
+    database = user_dir / "_state" / "context.sqlite3"
+    if not database.is_file():
+        return None
+    pacing = importlib.import_module("archive_x_pacing")
+    expected = str(state.get("requested_user_id") or "")
+    try:
+        connection = sqlite3.connect(
+            database.resolve().as_uri() + "?mode=ro", uri=True
+        )
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if not {"archive_account", "pacing"} <= tables:
+                return None
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(pacing)")
+            }
+            if not pacing.DurableRequestScheduler.REQUIRED_COLUMNS <= columns:
+                return None
+            account = connection.execute(
+                "SELECT user_id FROM archive_account WHERE singleton=1"
+            ).fetchone()
+            pacing_row = connection.execute(
+                "SELECT COUNT(*) FROM pacing WHERE singleton=1"
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise ArchiveError(
+            "existing X scheduler state could not be validated"
+        ) from exc
+    if account is None or not str(account[0]).isdecimal():
+        raise ArchiveError("existing X scheduler account identity is invalid")
+    account_id = str(account[0])
+    if not expected.isdecimal() or expected != account_id:
+        raise ArchiveError(
+            "existing X scheduler identity does not match archive state"
+        )
+    if pacing_row is None or int(pacing_row[0]) != 1:
+        raise ArchiveError("existing X scheduler pacing row is invalid")
+    return x_scheduler_options(user_dir, account_id, request_delay)
+
+
+def bridge_identity_probe_boundary(
+    options: Any,
+    *,
+    probe_completed_at: float,
+) -> None:
+    """Persist the one pre-scheduler probe gap after identity is proven."""
+    if probe_completed_at < 0:
+        raise ArchiveError("identity-probe pacing timestamp is invalid")
+    boundary = probe_completed_at + random.uniform(
+        float(options.delay_low), float(options.delay_high)
+    )
+    try:
+        connection = sqlite3.connect(options.database, timeout=5.0)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            account = connection.execute(
+                "SELECT user_id FROM archive_account WHERE singleton=1"
+            ).fetchone()
+            row = connection.execute(
+                "SELECT next_request_at FROM pacing WHERE singleton=1"
+            ).fetchone()
+            if account is None or str(account[0]) != options.scope_id:
+                raise ArchiveError(
+                    "identity-probe pacing account does not match archive state"
+                )
+            if row is None:
+                raise ArchiveError("identity-probe pacing row is missing")
+            if boundary > float(row[0] or 0):
+                connection.execute(
+                    """UPDATE pacing SET next_request_at=?,
+                              not_before_reason='spacing',updated_at=?
+                         WHERE singleton=1""",
+                    (boundary, iso_utc(utc_now())),
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+    except ArchiveError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise ArchiveError(
+            "identity-probe pacing boundary could not be persisted"
+        ) from exc
+
+
+def x_runner_control_client(
+    repo_dir: Path,
+    account_id: str,
+    *,
+    legacy: bool = False,
+) -> Any:
+    """Return one lazy bounded same-account runner; callers own its lifetime."""
+    control = importlib.import_module("archive_x_runner_control")
+    runner_name = (
+        "gallery_dl_x_legacy_runner.py" if legacy else "gallery_dl_x_runner.py"
+    )
+    return control.RunnerControlClient(
+        [sys.executable, str(repo_dir / "scripts" / runner_name)],
+        control.WorkerOptions(control.account_scope_digest(account_id)),
+    )
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -957,8 +1106,33 @@ def build_gallery_config(
     include_reposts: bool,
     checksums: bool,
     cursor: str | None,
+    descriptor_artifact: Path | None = None,
+    descriptor_operation_id: str | None = None,
+    descriptor_source_kind: str | None = None,
+    descriptor_source_operation: str | None = None,
+    descriptor_owner_kind: str = "post",
 ) -> dict[str, Any]:
     postprocessors: list[dict[str, Any]] = []
+    descriptor_values = (
+        descriptor_artifact,
+        descriptor_operation_id,
+        descriptor_source_kind,
+        descriptor_source_operation,
+    )
+    if any(value is not None for value in descriptor_values):
+        if not all(value is not None for value in descriptor_values):
+            raise ArchiveError("descriptor capture configuration is incomplete")
+        postprocessors.append(
+            descriptor_x.postprocessor_config(
+                artifact_path=descriptor_artifact,
+                archive_root=archive_root,
+                operation_id=descriptor_operation_id,
+                run_id=archive_run_id,
+                source_kind=descriptor_source_kind,
+                source_operation=descriptor_source_operation,
+                owner_kind=descriptor_owner_kind,
+            )
+        )
     if checksums:
         postprocessors.append(
             {"name": "hash", "mode": "sha256", "event": "file"}
@@ -1185,6 +1359,8 @@ def run_gallery_dl(
     *,
     progress_path: Path | None = None,
     stalled_rate_limit_cycles: int = 0,
+    runner: Any | None = None,
+    control_lease_token: str | None = None,
 ) -> tuple[
     int,
     str | None,
@@ -1252,18 +1428,13 @@ def run_gallery_dl(
         os.chmod(log_path, 0o600)
         log.write("command: " + shlex.join(command) + "\n")
         log.flush()
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        try:
-            for line in process.stdout:
+        if runner is not None:
+            control = importlib.import_module("archive_x_runner_control")
+            if len(command) < 3 or command[0] != sys.executable:
+                raise ArchiveError("controlled gallery runner command is invalid")
+
+            def controlled_output(line: str) -> None:
+                nonlocal stalled
                 print(f"[{prefix}] {line}", end="")
                 log.write(line)
                 log.flush()
@@ -1279,25 +1450,75 @@ def run_gallery_dl(
                     print(f"[{prefix}] {message}", end="")
                     log.write(message)
                     log.flush()
-                    try:
-                        process.send_signal(signal.SIGINT)
-                    except ProcessLookupError:
-                        pass
-                    # Do not wait for EOF here: a child that ignores SIGINT
-                    # could otherwise leave the watchdog blocked forever.
-                    break
-            if stalled:
-                remainder, status = stop_child(interrupt_already_sent=True)
+                    runner.signal_interrupt()
+
+            try:
+                result = runner.run(
+                    item_id=secrets.token_hex(16),
+                    lease_token=control_lease_token or secrets.token_hex(16),
+                    argv=command[2:],
+                    output=controlled_output,
+                )
+                status = int(result.status)
+            except KeyboardInterrupt:
+                interrupted = True
+                status = 130
+            except control.RunnerWorkerLost as exc:
+                if stalled and exc.began:
+                    status = 130
+                else:
+                    raise ArchiveError(
+                        "controlled gallery runner exited before a result"
+                    ) from exc
+            except control.ControlProtocolError as exc:
+                raise ArchiveError("controlled gallery runner failed closed") from exc
+        else:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            try:
+                for line in process.stdout:
+                    print(f"[{prefix}] {line}", end="")
+                    log.write(line)
+                    log.flush()
+                    observe(line)
+                    if not stalled and watchdog.observe(line):
+                        stalled = True
+                        message = (
+                            "[archive-x][warning] No raw metadata progress across "
+                            f"{watchdog.consecutive_stalls} consecutive X "
+                            "rate-limit windows; stopping this endpoint with a "
+                            "resumable checkpoint.\n"
+                        )
+                        print(f"[{prefix}] {message}", end="")
+                        log.write(message)
+                        log.flush()
+                        try:
+                            process.send_signal(signal.SIGINT)
+                        except ProcessLookupError:
+                            pass
+                        # Do not wait for EOF here: a child that ignores SIGINT
+                        # could otherwise leave the watchdog blocked forever.
+                        break
+                if stalled:
+                    remainder, status = stop_child(interrupt_already_sent=True)
+                    record_remainder(remainder)
+                else:
+                    status = process.wait()
+            except KeyboardInterrupt:
+                interrupted = True
+                remainder, status = stop_child(interrupt_already_sent=False)
                 record_remainder(remainder)
-            else:
-                status = process.wait()
-        except KeyboardInterrupt:
-            interrupted = True
-            remainder, status = stop_child(interrupt_already_sent=False)
-            record_remainder(remainder)
-        finally:
-            log.flush()
-            process.stdout.close()
+            finally:
+                log.flush()
+                process.stdout.close()
     if stalled or interrupted or (status != 0 and other_error_count):
         # A checkpoint can be newer than gallery-dl's final cursor after a
         # SIGINT or extraction failure, but an earlier checkpoint can also
@@ -1373,10 +1594,32 @@ def gallery_command(
     http_timeout: int,
     rate_limit: str,
     url: str,
+    request_telemetry_path: Path | None = None,
+    request_operation: str | None = None,
+    download: bool = True,
+    scheduler_options: Any | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
         str(repo_dir / "scripts" / "gallery_dl_x_runner.py"),
+    ]
+    if (request_telemetry_path is None) != (request_operation is None):
+        raise ArchiveError(
+            "request telemetry path and operation must be provided together"
+        )
+    if request_telemetry_path is not None and request_operation is not None:
+        command.extend(
+            (
+                "--archive-x-request-telemetry",
+                str(request_telemetry_path),
+                "--archive-x-operation",
+                request_operation,
+            )
+        )
+    if scheduler_options is not None:
+        pacing = importlib.import_module("archive_x_pacing")
+        command.extend(pacing.options_as_runner_args(scheduler_options))
+    command.extend((
         "--config-ignore",
         "-c",
         str(repo_dir / "gallery-dl.conf"),
@@ -1387,20 +1630,63 @@ def gallery_command(
         "--http-timeout",
         str(http_timeout),
         "--sleep-retries",
-        "30-60",
+        "0" if scheduler_options is not None else "30-60",
         "--sleep-429",
-        "300",
+        "0" if scheduler_options is not None else "300",
         "--limit-rate",
         rate_limit,
         "--retries",
         str(retries),
-    ]
+    ))
+    if not download:
+        command.append("--no-download")
     if date_after is not None:
         command.extend(("--date-after", iso_utc(date_after)))
     if post_limit is not None:
         command.extend(("--post-range", f"1-{post_limit}"))
     command.append(url)
     return command
+
+
+def request_operation_for_endpoint(endpoint: str) -> str:
+    if endpoint == "info":
+        return "info"
+    if endpoint == "timeline":
+        return "timeline"
+    if endpoint == "avatar":
+        return "profile_avatar"
+    if endpoint == "background":
+        return "profile_background"
+    if endpoint.startswith("retry-media-"):
+        return "retry_media"
+    raise ArchiveError(f"unsupported request telemetry endpoint: {endpoint}")
+
+
+def descriptor_scope_for_endpoint(endpoint: str) -> tuple[str, str, str]:
+    if endpoint == "timeline":
+        return "modern", "modern", "post"
+    if endpoint.startswith("retry-media-"):
+        return "retry", "retry", "post"
+    if endpoint == "avatar":
+        return "profile", "info", "profile_avatar"
+    if endpoint == "background":
+        return "profile", "info", "profile_background"
+    if endpoint == "info":
+        return "info", "info", "post"
+    raise ArchiveError(f"unsupported descriptor endpoint: {endpoint}")
+
+
+def request_telemetry_summary(
+    path: Path, expected_operation: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return a safe aggregate without making telemetry archive-authoritative."""
+    try:
+        summary = request_telemetry_x.read_summary(
+            path, expected_operation=expected_operation
+        )
+    except request_telemetry_x.RequestTelemetryError:
+        return None, "missing_invalid_or_private"
+    return summary, None
 
 
 def finalize_raw_file(partial: Path, success: bool) -> Path:
@@ -1434,9 +1720,24 @@ def archive_endpoint(
     http_timeout: int | None = None,
     include_reposts: bool | None = None,
     stalled_rate_limit_cycles: int | None = None,
+    download_media: bool | None = None,
+    scheduler_options: Any | None = None,
+    runner: Any | None = None,
 ) -> dict[str, Any]:
     raw_partial = run_dir / "raw" / f"{endpoint}.posts.jsonl.partial"
+    descriptor_partial = (
+        run_dir / "raw" / f"{endpoint}.descriptors.jsonl.partial"
+    )
     config_path = run_dir / f"{endpoint}.gallery-dl.json"
+    request_path = run_dir / f"{endpoint}.requests.json"
+    request_operation = request_operation_for_endpoint(endpoint)
+    (
+        descriptor_source_kind,
+        descriptor_source_operation,
+        descriptor_owner_kind,
+    ) = descriptor_scope_for_endpoint(endpoint)
+    descriptor_operation_id = f"{archive_run_id}:{endpoint}"
+    descriptor_x.prepare_artifact(descriptor_partial)
     config = build_gallery_config(
         handle=handle,
         endpoint=endpoint,
@@ -1446,9 +1747,9 @@ def archive_endpoint(
         cookie_file=args.cookies,
         archive_run_id=archive_run_id,
         archived_at=archived_at,
-        request_delay=args.request_delay,
+        request_delay="0" if scheduler_options is not None else args.request_delay,
         download_delay=args.download_delay,
-        extractor_delay=args.extractor_delay,
+        extractor_delay="0" if scheduler_options is not None else args.extractor_delay,
         include_reposts=(
             not args.no_reposts
             if include_reposts is None
@@ -1456,6 +1757,11 @@ def archive_endpoint(
         ),
         checksums=not args.no_checksums,
         cursor=cursor,
+        descriptor_artifact=descriptor_partial,
+        descriptor_operation_id=descriptor_operation_id,
+        descriptor_source_kind=descriptor_source_kind,
+        descriptor_source_operation=descriptor_source_operation,
+        descriptor_owner_kind=descriptor_owner_kind,
     )
     atomic_write_json(config_path, config)
     config_hash = sha256_file(config_path)
@@ -1475,6 +1781,14 @@ def archive_endpoint(
         ),
         rate_limit=args.rate_limit,
         url=url,
+        request_telemetry_path=request_path,
+        request_operation=request_operation,
+        download=(
+            endpoint != "timeline"
+            if download_media is None
+            else download_media
+        ),
+        scheduler_options=scheduler_options,
     )
     print(f"Archiving {handle}: {endpoint} ({url})")
     effective_stalled_cycles = (
@@ -1501,6 +1815,7 @@ def archive_endpoint(
             if endpoint == "timeline"
             else 0
         ),
+        runner=runner,
     )
     synthetic_cursor = False
     if stalled:
@@ -1534,6 +1849,12 @@ def archive_endpoint(
     if status != 0 and metadata_complete and not raw_has_record:
         metadata_complete = False
     raw_path = finalize_raw_file(raw_partial, metadata_complete)
+    descriptor_path = descriptor_x.finalize_artifact(
+        descriptor_partial, complete=metadata_complete
+    )
+    request_summary, request_error = request_telemetry_summary(
+        request_path, request_operation
+    )
     if interrupted:
         endpoint_status = "interrupted"
     elif stalled:
@@ -1564,10 +1885,102 @@ def archive_endpoint(
         "other_error_count": other_error_count,
         "raw_has_record": raw_has_record,
         "raw_path": str(raw_path.relative_to(user_dir)),
+        "descriptor_artifact_path": str(
+            descriptor_path.relative_to(user_dir)
+        ),
+        "descriptor_artifact_sha256": descriptor_x.sha256_file(
+            descriptor_path
+        ),
+        "descriptor_artifact_bytes": descriptor_path.stat().st_size,
+        "descriptor_operation_id": descriptor_operation_id,
+        "descriptor_source_kind": descriptor_source_kind,
+        "descriptor_source_operation": descriptor_source_operation,
         "config_path": str(config_path.relative_to(user_dir)),
         "config_sha256": config_hash,
+        "request_telemetry_path": (
+            str(request_path.relative_to(user_dir))
+            if request_path.is_file()
+            else None
+        ),
+        "request_telemetry_sha256": (
+            sha256_file(request_path) if request_path.is_file() else None
+        ),
+        "request_telemetry": request_summary,
+        "request_telemetry_error": request_error,
         "command": command,
     }
+
+
+def load_endpoint_descriptor_batch(
+    user_dir: Path, endpoint_result: dict[str, Any]
+) -> descriptor_x.DescriptorBatch:
+    relative = endpoint_result.get("descriptor_artifact_path")
+    operation_id = str(endpoint_result.get("descriptor_operation_id") or "")
+    run_id_value = operation_id.partition(":")[0]
+    path = user_dir / str(relative or "")
+    if (
+        not relative
+        or not operation_id
+        or not run_id_value
+        or not path.is_file()
+    ):
+        raise descriptor_x.DescriptorError(
+            "endpoint descriptor artifact evidence is incomplete"
+        )
+    batch = descriptor_x.load_artifact(
+        path,
+        user_dir=user_dir,
+        operation_id=operation_id,
+        run_id=run_id_value,
+        source_kind=str(endpoint_result.get("descriptor_source_kind") or ""),
+        source_operation=str(
+            endpoint_result.get("descriptor_source_operation") or ""
+        ),
+    )
+    expected_hash = str(endpoint_result.get("descriptor_artifact_sha256") or "")
+    if batch.source_sha256 != expected_hash:
+        raise descriptor_x.DescriptorError(
+            "endpoint descriptor artifact digest changed"
+        )
+    return batch
+
+
+def persist_descriptor_evidence(
+    user_dir: Path,
+    *,
+    target_user_id: str,
+    canonical_handle: str,
+    accepted_records: Iterable[dict[str, Any]],
+    endpoint_results: Iterable[dict[str, Any]] = (),
+    batches: Iterable[descriptor_x.DescriptorBatch] = (),
+    allow_profile: bool = False,
+) -> dict[str, Any]:
+    """Persist selected descriptor evidence without making metadata depend on it."""
+    context_x = importlib.import_module("archive_x_context")
+    records = tuple(accepted_records)
+    loaded = list(batches)
+    load_errors: list[str] = []
+    for result in endpoint_results:
+        try:
+            loaded.append(load_endpoint_descriptor_batch(user_dir, result))
+        except (descriptor_x.DescriptorError, OSError) as exc:
+            load_errors.append(exc.__class__.__name__)
+    with context_x.ContextDB(user_dir / "_state" / "context.sqlite3") as database:
+        database.bind_identity(target_user_id, canonical_handle)
+        summary = database.persist_descriptor_batches(
+            loaded,
+            records,
+            allow_profile=allow_profile,
+        )
+    summary = dict(summary)
+    summary["artifact_load_errors"] = len(load_errors)
+    if load_errors:
+        summary["artifact_load_error_classes"] = sorted(set(load_errors))
+        if summary.get("status") == "complete":
+            summary["status"] = "degraded"
+    for batch in loaded:
+        descriptor_x.discard_ephemeral_artifact(batch)
+    return summary
 
 
 def select_timeline_state(
@@ -2118,17 +2531,45 @@ def reclassify_pending_media_from_logs(
     return max(0, after - before)
 
 
+def recovery_manifest_paths(
+    user_dir: Path, manifest_paths: Iterable[Path] | None
+) -> list[Path]:
+    """Resolve either a one-time historical scan or indexed recovery candidates."""
+    if manifest_paths is None:
+        candidates = (user_dir / "runs").glob("*/manifest.json")
+    else:
+        candidates = manifest_paths
+    runs_root = (user_dir / "runs").resolve()
+    resolved: set[Path] = set()
+    for candidate in candidates:
+        path = Path(candidate).resolve()
+        try:
+            relative = path.relative_to(runs_root)
+        except (OSError, ValueError) as exc:
+            raise ArchiveError("recovery manifest escaped the user run root") from exc
+        if (
+            len(relative.parts) != 2
+            or relative.name != "manifest.json"
+            or ".." in relative.parts
+            or not path.is_file()
+        ):
+            raise ArchiveError("recovery manifest path is invalid")
+        resolved.add(path)
+    return sorted(resolved)
+
+
 def recover_download_only_runs(
     state: dict[str, Any],
     user_dir: Path,
     *,
     modern_head_mode: bool = False,
+    manifest_paths: Iterable[Path] | None = None,
 ) -> list[str]:
     """Migrate older runs whose timeline ended but one asset failed."""
     recovered_value = state.get("recovered_download_only_runs")
     recovered = set(recovered_value if isinstance(recovered_value, list) else ())
     newly_recovered: list[str] = []
-    for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
+    for manifest_path in recovery_manifest_paths(user_dir, manifest_paths):
         manifest = load_json(manifest_path, {})
         if not isinstance(manifest, dict) or manifest.get("limited_run"):
             continue
@@ -2209,11 +2650,14 @@ def recover_download_only_runs(
 
 
 def finalize_abandoned_manifests(
-    user_dir: Path, *, recovered_at: str
+    user_dir: Path,
+    *,
+    recovered_at: str,
+    manifest_paths: Iterable[Path] | None = None,
 ) -> list[str]:
     """Close stale running manifests after the global archive lock is held."""
     finalized: list[str] = []
-    for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
+    for manifest_path in recovery_manifest_paths(user_dir, manifest_paths):
         manifest = load_json(manifest_path, {})
         if not isinstance(manifest, dict) or manifest.get("status") != "running":
             continue
@@ -2285,6 +2729,7 @@ def recover_stalled_interrupted_runs(
     *,
     minimum_waits: int,
     modern_head_mode: bool = False,
+    manifest_paths: Iterable[Path] | None = None,
 ) -> list[str]:
     """Recover a search-stage cursor when gallery-dl omitted one on SIGINT."""
     recovered_value = state.get("recovered_stalled_runs")
@@ -2292,7 +2737,7 @@ def recover_stalled_interrupted_runs(
     newly_recovered: list[str] = []
     candidates: list[tuple[str, dict[str, Any]]] = []
 
-    for manifest_path in sorted((user_dir / "runs").glob("*/manifest.json")):
+    for manifest_path in recovery_manifest_paths(user_dir, manifest_paths):
         manifest = load_json(manifest_path, {})
         if not isinstance(manifest, dict) or manifest.get("limited_run"):
             continue
@@ -2419,70 +2864,39 @@ def archive_user(
     user_dir = archive_root / "users" / handle
     run_dir = user_dir / "runs" / current_run_id
     state_path = user_dir / "_state" / "state.json"
+    context_db_path = user_dir / "_state" / "context.sqlite3"
+    local_module = importlib.import_module("archive_x_local")
     user_dir.mkdir(parents=True, exist_ok=True)
     state_path.parent.mkdir(parents=True, exist_ok=True)
 
     state = load_json(state_path, {})
     if not isinstance(state, dict):
         state = {}
-    if isinstance(state.get("legacy_backfill"), dict):
-        legacy_module = importlib.import_module("archive_x_legacy")
-        prepared = legacy_module.automatic_initialize_legacy(
-            user_dir, initialized_at=iso_utc(started)
-        )
-        state = prepared["state"]
     run_dir.mkdir(parents=True, exist_ok=False)
     write_dataset_readme(user_dir)
     modern_head_mode = bool(
         isinstance(state.get("legacy_backfill"), dict)
         and isinstance(state.get("modern_head"), dict)
     )
-    finalized_abandoned_runs = finalize_abandoned_manifests(
-        user_dir, recovered_at=iso_utc(started)
+    indexed_manifests = local_module.indexed_recovery_manifest_candidates(
+        user_dir, context_db_path
     )
-    if finalized_abandoned_runs:
-        print(
-            f"Finalized abandoned run manifest(s) for @{handle}: "
-            f"{', '.join(finalized_abandoned_runs)}"
-        )
-    recovered_stalled_runs = recover_stalled_interrupted_runs(
-        state,
-        user_dir,
-        minimum_waits=getattr(args, "stalled_rate_limit_cycles", 3),
-        modern_head_mode=modern_head_mode,
+    recovery_manifests = (
+        indexed_manifests
+        if indexed_manifests is not None
+        else recovery_manifest_paths(user_dir, None)
     )
-    recovered_runs = recover_download_only_runs(
-        state, user_dir, modern_head_mode=modern_head_mode
-    )
-    media_state_before_reclassification = copy.deepcopy(state)
-    newly_unavailable_media = reclassify_pending_media_from_logs(state, user_dir)
-    media_reclassification_changed = (
-        state != media_state_before_reclassification
-    )
-    if (
-        recovered_stalled_runs
-        or recovered_runs
-        or media_reclassification_changed
-    ):
-        atomic_write_json(state_path, state)
-    if recovered_stalled_runs:
-        print(
-            f"Recovered resumable search state for @{handle} from stalled "
-            f"run(s): {', '.join(recovered_stalled_runs)}"
-        )
-    if recovered_runs:
-        print(
-            f"Recovered completed timeline state for @{handle} from "
-            f"download-only run(s): {', '.join(recovered_runs)}"
-        )
-    if newly_unavailable_media:
-        print(
-            f"Classified {newly_unavailable_media} repeatedly missing media "
-            f"item(s) for @{handle} as unavailable; normal runs will not retry them."
-        )
-    cursor, chain_started_at, date_after = select_timeline_state(
-        args, state, started
-    )
+    # Historical recovery is discovered read-only here, but no prior manifest,
+    # state queue, or indexed archive truth may change until the live info
+    # response proves this handle still belongs to the bound numeric account.
+    finalized_abandoned_runs: list[str] = []
+    recovered_stalled_runs: list[str] = []
+    recovered_runs: list[str] = []
+    newly_unavailable_media = 0
+    media_reclassification_changed = False
+    cursor: str | None = None
+    chain_started_at = iso_utc(started)
+    date_after: datetime | None = None
     manifest: dict[str, Any] = {
         "schema": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -2505,7 +2919,7 @@ def archive_user(
         "extractor_delay_seconds": args.extractor_delay,
         "date_after": iso_utc(date_after) if date_after else None,
         "resumed_from_cursor": cursor,
-        "timeline_mode": "modern_head" if modern_head_mode else "history",
+        "timeline_mode": "pending_identity",
         "limited_run": bool(timeline_post_limit),
         "retry_failed_only": bool(args.retry_failed_only),
         "finalized_abandoned_runs": finalized_abandoned_runs,
@@ -2520,6 +2934,17 @@ def archive_user(
 
     # Resolve and bind the stable numeric account ID before timeline media can
     # touch this handle's archive.  This fails closed if a handle is recycled.
+    try:
+        info_scheduler = existing_x_scheduler_options(
+            user_dir, state, args.request_delay
+        )
+    except ArchiveError as exc:
+        manifest["status"] = "failed"
+        manifest["failure_stage"] = "preidentity_scheduler"
+        manifest["error"] = str(exc)
+        manifest["completed_at"] = iso_utc(utc_now())
+        atomic_write_json(manifest_path, manifest)
+        return manifest
     info_result = archive_endpoint(
         args=args,
         repo_dir=repo_dir,
@@ -2532,7 +2957,10 @@ def archive_user(
         archived_at=iso_utc(started),
         date_after=None,
         cursor=None,
+        download_media=False,
+        scheduler_options=info_scheduler,
     )
+    info_probe_completed_at = time.time()
     manifest["endpoints"].append(info_result)
     atomic_write_json(manifest_path, manifest)
     info_raw = user_dir / info_result["raw_path"]
@@ -2575,8 +3003,181 @@ def archive_user(
         f"https://x.com/{canonical_handle or handle}"
     )
     atomic_write_json(state_path, state)
+
+    # The identity guard now authorizes recovery and migration of the existing
+    # archive.  Keep this entire block ahead of timeline selection so recovered
+    # cursors and terminal media evidence affect this same invocation.
+    try:
+        if isinstance(state.get("legacy_backfill"), dict):
+            legacy_module = importlib.import_module("archive_x_legacy")
+            prepared = legacy_module.automatic_initialize_legacy(
+                user_dir, initialized_at=iso_utc(started)
+            )
+            state = prepared["state"]
+        modern_head_mode = bool(
+            isinstance(state.get("legacy_backfill"), dict)
+            and isinstance(state.get("modern_head"), dict)
+        )
+        finalized_abandoned_runs = finalize_abandoned_manifests(
+            user_dir,
+            recovered_at=iso_utc(started),
+            manifest_paths=recovery_manifests,
+        )
+        recovered_stalled_runs = recover_stalled_interrupted_runs(
+            state,
+            user_dir,
+            minimum_waits=getattr(args, "stalled_rate_limit_cycles", 3),
+            modern_head_mode=modern_head_mode,
+            manifest_paths=recovery_manifests,
+        )
+        recovered_runs = recover_download_only_runs(
+            state,
+            user_dir,
+            modern_head_mode=modern_head_mode,
+            manifest_paths=recovery_manifests,
+        )
+        media_state_before_reclassification = copy.deepcopy(state)
+        newly_unavailable_media = reclassify_pending_media_from_logs(
+            state, user_dir
+        )
+        media_reclassification_changed = (
+            state != media_state_before_reclassification
+        )
+        cursor, chain_started_at, date_after = select_timeline_state(
+            args, state, started
+        )
+        atomic_write_json(state_path, state)
+    except ArchiveError as exc:
+        manifest["status"] = "failed"
+        manifest["failure_stage"] = "post_identity_recovery"
+        manifest["error"] = str(exc)
+        manifest["completed_at"] = iso_utc(utc_now())
+        atomic_write_json(manifest_path, manifest)
+        return manifest
+
+    manifest.update(
+        {
+            "finalized_abandoned_runs": finalized_abandoned_runs,
+            "recovered_stalled_runs": recovered_stalled_runs,
+            "recovered_download_only_runs": recovered_runs,
+            "newly_unavailable_media": newly_unavailable_media,
+            "media_reclassification_changed": media_reclassification_changed,
+            "resumed_from_cursor": cursor,
+            "date_after": iso_utc(date_after) if date_after else None,
+            "timeline_mode": "modern_head" if modern_head_mode else "history",
+        }
+    )
+    atomic_write_json(manifest_path, manifest)
+    if finalized_abandoned_runs:
+        print(
+            f"Finalized abandoned run manifest(s) for @{handle}: "
+            f"{', '.join(finalized_abandoned_runs)}"
+        )
+    if recovered_stalled_runs:
+        print(
+            f"Recovered resumable search state for @{handle} from stalled "
+            f"run(s): {', '.join(recovered_stalled_runs)}"
+        )
+    if recovered_runs:
+        print(
+            f"Recovered completed timeline state for @{handle} from "
+            f"download-only run(s): {', '.join(recovered_runs)}"
+        )
+    if newly_unavailable_media:
+        print(
+            f"Classified {newly_unavailable_media} repeatedly missing media "
+            f"item(s) for @{handle} as unavailable; normal runs will not retry them."
+        )
     update_profile_dataset(
         user_dir, handle, info_raw, iso_utc(started)
+    )
+
+    # Only after the numeric identity guard may the one-time local migration
+    # or any indexed archive truth be changed.  Recovery candidates discovered
+    # read-only above are refreshed here before historical sources are marked
+    # processed, so a crash-checkpointed manifest cannot lose its raw source.
+    context_module = importlib.import_module("archive_x_context")
+    try:
+        with context_module.ContextDB(context_db_path) as database:
+            database.bind_identity(
+                observed_user_id, canonical_handle or handle
+            )
+        manifest_history = local_module.reconcile_manifest_history(
+            user_dir, context_db_path
+        )
+        for candidate in recovery_manifests:
+            if candidate.is_file():
+                local_module.register_run_manifest(
+                    user_dir, context_db_path, candidate, processed=True
+                )
+        source_history = local_module.reconcile_source_history(
+            user_dir, context_db_path, max_depth=1000
+        )
+        media_history = local_module.reconcile_media_index(
+            user_dir,
+            context_db_path,
+            requested_handle=canonical_handle or handle,
+        )
+        context_media_jobs = local_module.reconcile_context_media_jobs(
+            context_db_path
+        )
+        legacy_media_queue = local_module.reconcile_state_media_queue(
+            user_dir, context_db_path, state
+        )
+        atomic_write_json(state_path, state)
+        manifest["local_reconciliation"] = {
+            "manifest_history": manifest_history,
+            "source_history": source_history,
+            "media_history": media_history,
+            "context_media_jobs": context_media_jobs,
+            "legacy_media_queue": legacy_media_queue,
+        }
+        atomic_write_json(manifest_path, manifest)
+        local_module.register_run_manifest(
+            user_dir, context_db_path, manifest_path, processed=False
+        )
+    except (ArchiveError, OSError) as exc:
+        manifest["status"] = "failed"
+        manifest["failure_stage"] = "local_reconciliation"
+        manifest["error"] = str(exc)
+        manifest["completed_at"] = iso_utc(utc_now())
+        atomic_write_json(manifest_path, manifest)
+        return manifest
+
+    info_records = tuple(iter_jsonl(info_raw))
+    profile_batches: tuple[descriptor_x.DescriptorBatch, ...] = ()
+    profile_descriptor_error = None
+    if info_records:
+        try:
+            profile_batches = (
+                descriptor_x.profile_batch_from_info(
+                    info_records[0],
+                    user_dir=user_dir,
+                    operation_id=f"{current_run_id}:info-profile",
+                    run_id=current_run_id,
+                    captured_at=iso_utc(started),
+                    source_relative_path=str(info_raw.relative_to(user_dir)),
+                    source_sha256=sha256_file(info_raw),
+                ),
+            )
+        except descriptor_x.DescriptorError as exc:
+            profile_descriptor_error = exc.__class__.__name__
+    manifest["profile_descriptor_commit"] = persist_descriptor_evidence(
+        user_dir,
+        target_user_id=observed_user_id,
+        canonical_handle=canonical_handle or handle,
+        accepted_records=(),
+        batches=profile_batches,
+        allow_profile=True,
+    )
+    if profile_descriptor_error:
+        manifest["profile_descriptor_commit"][
+            "builder_error_class"
+        ] = profile_descriptor_error
+        manifest["profile_descriptor_commit"]["status"] = "degraded"
+    atomic_write_json(manifest_path, manifest)
+    local_module.register_run_manifest(
+        user_dir, context_db_path, manifest_path, processed=False
     )
 
     normal_transition_run = bool(
@@ -2619,106 +3220,60 @@ def archive_user(
             )
         atomic_write_json(manifest_path, manifest)
 
-    pending_before = prune_completed_pending_media(state, user_dir)
-    due_before = pending_media_due(state, user_dir, now=started)
-    retried_post_ids: list[str] = []
-    if due_before:
-        retry_post_ids = sorted(
-            {
-                str(record["post_id"])
-                for record in due_before
-                if record.get("post_id")
-            }
-        )
-        for post_id in retry_post_ids:
-            try:
-                sleep_random(
-                    args.endpoint_delay,
-                    f"before {handle}:retry-media-{post_id}",
-                )
-            except KeyboardInterrupt:
-                manifest["status"] = "interrupted"
-                manifest["completed_at"] = iso_utc(utc_now())
-                atomic_write_json(manifest_path, manifest)
-                raise
-            result = archive_endpoint(
-                args=args,
-                repo_dir=repo_dir,
-                archive_root=archive_root,
-                user_dir=user_dir,
-                handle=handle,
-                endpoint=f"retry-media-{post_id}",
-                run_dir=run_dir,
-                archive_run_id=current_run_id,
-                archived_at=iso_utc(started),
-                date_after=None,
-                cursor=None,
-                target_url=f"https://x.com/{handle}/status/{post_id}",
-                retries=max(args.retries, args.media_retries),
-                http_timeout=max(args.http_timeout, args.media_timeout),
-                # A queued failure may itself be a repost. Recovery must not
-                # silently skip it merely because a later invocation chooses
-                # --no-reposts for new timeline material.
-                include_reposts=True,
-            )
-            manifest["endpoints"].append(result)
-            atomic_write_json(manifest_path, manifest)
-            retried_post_ids.append(post_id)
-            if result.get("failed_downloads"):
-                merge_pending_media(
-                    state,
-                    result["failed_downloads"],
-                    source_run_id=current_run_id,
-                    observed_at=iso_utc(utc_now()),
-                )
-            prune_completed_pending_media(state, user_dir)
-            atomic_write_json(state_path, state)
-            if result.get("interrupted"):
-                manifest["status"] = "interrupted"
-                manifest["media_dataset"] = update_media_dataset(
-                    user_dir, handle
-                )
-                manifest["completed_at"] = iso_utc(utc_now())
-                atomic_write_json(manifest_path, manifest)
-                raise KeyboardInterrupt
-
-    remaining_pending = prune_completed_pending_media(state, user_dir)
-    recovery_summary = media_queue_summary(state, user_dir)
+    # Historical state-JSON failures were migrated above.  Do not launch one
+    # fresh X extractor per failed post: unified follow-up drains usable
+    # descriptors directly from the CDN, then performs only bounded exceptional
+    # descriptor refreshes.
+    with context_module.ContextDB(context_db_path, create=False) as database:
+        asset_availability = database.asset_availability(now=time.time())
+    legacy_queue_migration = state.get("legacy_media_queue_migration") or {}
     manifest["media_recovery"] = {
-        "pending_before": len(pending_before),
-        "due_before": len(due_before),
-        "retried_post_ids": retried_post_ids,
-        "pending_after": len(remaining_pending),
-        "due_after": recovery_summary["due"],
-        "deferred_after": recovery_summary["deferred"],
-        "unavailable_after": recovery_summary["unavailable"],
+        "mode": "descriptor_direct",
+        "pending_before": int(asset_availability.get("total") or 0),
+        "due_before": int(asset_availability.get("ready") or 0),
+        "retried_post_ids": [],
+        "pending_after": int(asset_availability.get("total") or 0),
+        "due_after": int(asset_availability.get("ready") or 0),
+        "deferred_after": max(
+            0,
+            int(asset_availability.get("total") or 0)
+            - int(asset_availability.get("ready") or 0),
+        ),
+        "unavailable_after": 0,
+        "legacy_manual_review": int(
+            legacy_queue_migration.get("manual_review") or 0
+        ),
     }
-    atomic_write_json(state_path, state)
 
     if args.retry_failed_only:
-        manifest["media_dataset"] = update_media_dataset(user_dir, handle)
-        manifest["pending_media"] = remaining_pending
-        manifest["unavailable_media"] = state.get("unavailable_media", [])
-        manifest["status"] = (
-            "partial"
-            if remaining_pending
-            else (
-                "complete_with_unavailable_media"
-                if recovery_summary["unavailable"]
-                else "success"
-            )
-        )
+        manifest["status"] = "success"
         manifest["completed_at"] = iso_utc(utc_now())
         atomic_write_json(manifest_path, manifest)
+        local_module.register_run_manifest(
+            user_dir, context_db_path, manifest_path, processed=True
+        )
         return manifest
 
-    try:
-        sleep_random(args.endpoint_delay, f"before {handle}:timeline")
-    except KeyboardInterrupt:
-        manifest["status"] = "interrupted"
-        manifest["completed_at"] = iso_utc(utc_now())
-        atomic_write_json(manifest_path, manifest)
-        raise
+    timeline_scheduler = x_scheduler_options(
+        user_dir, observed_user_id, args.request_delay
+    )
+    if info_scheduler is None:
+        try:
+            # A new/pre-v3 archive has no account database before its first
+            # probe. Persist that one gap after binding; local migration time
+            # can naturally absorb it, and the actual timeline boundary is
+            # still enforced by the durable lane without a stacked sleep.
+            bridge_identity_probe_boundary(
+                timeline_scheduler,
+                probe_completed_at=info_probe_completed_at,
+            )
+        except ArchiveError as exc:
+            manifest["status"] = "failed"
+            manifest["failure_stage"] = "identity_probe_pacing"
+            manifest["error"] = str(exc)
+            manifest["completed_at"] = iso_utc(utc_now())
+            atomic_write_json(manifest_path, manifest)
+            return manifest
 
     legacy_module = importlib.import_module("archive_x_legacy")
     transition_watchdog = legacy_module.transition_watchdog_policy(
@@ -2742,6 +3297,7 @@ def archive_user(
         date_after=date_after,
         cursor=cursor,
         stalled_rate_limit_cycles=transition_watchdog["cycles"],
+        scheduler_options=timeline_scheduler,
     )
     manifest["endpoints"].append(timeline_result)
     atomic_write_json(manifest_path, manifest)
@@ -2764,10 +3320,46 @@ def archive_user(
         state["recovered_download_only_runs"] = sorted(processed_runs)
     prune_completed_pending_media(state, user_dir)
 
-    manifest["post_dataset"] = update_post_dataset(
-        user_dir, handle, timeline_raw, "timeline"
+    timeline_batches: tuple[descriptor_x.DescriptorBatch, ...] = ()
+    timeline_descriptor_error: str | None = None
+    try:
+        timeline_batches = (
+            load_endpoint_descriptor_batch(user_dir, timeline_result),
+        )
+    except (descriptor_x.DescriptorError, OSError) as exc:
+        timeline_descriptor_error = exc.__class__.__name__
+    try:
+        manifest["post_dataset"] = local_module.ingest_source_once(
+            user_dir,
+            context_db_path,
+            requested_handle=canonical_handle or handle,
+            target_user_id=observed_user_id,
+            spec=local_module.SourceSpec(
+                path=timeline_raw,
+                source_kind="modern",
+                run_id=current_run_id,
+                operation_id=f"{current_run_id}:timeline",
+                endpoint="timeline",
+            ),
+            max_depth=1000,
+            descriptor_batches=timeline_batches,
+        )
+    finally:
+        for batch in timeline_batches:
+            descriptor_x.discard_ephemeral_artifact(batch)
+    timeline_result["descriptor_commit"] = dict(
+        manifest["post_dataset"].get("descriptor_commit") or {}
     )
-    manifest["media_dataset"] = update_media_dataset(user_dir, handle)
+    if timeline_descriptor_error:
+        timeline_result["descriptor_commit"]["artifact_load_errors"] = 1
+        timeline_result["descriptor_commit"][
+            "artifact_load_error_classes"
+        ] = [timeline_descriptor_error]
+        timeline_result["descriptor_commit"]["status"] = "degraded"
+    manifest["media_dataset"] = {
+        "status": "indexed_incrementally",
+        "recursive_sidecar_scan": False,
+    }
 
     # Advance crawl state only after raw records have been merged into the
     # derived datasets.  A crash before here retains the prior cursor and
@@ -2803,73 +3395,24 @@ def archive_user(
             manifest["status"] = "failed"
         manifest["completed_at"] = iso_utc(utc_now())
         atomic_write_json(manifest_path, manifest)
+        local_module.register_run_manifest(
+            user_dir, context_db_path, manifest_path, processed=False
+        )
         if timeline_result.get("interrupted"):
             raise KeyboardInterrupt
         return manifest
 
-    if timeline_post_limit:
-        manifest["status"] = "limited"
-    else:
-        profile_partial = False
-        for endpoint in ("avatar", "background"):
-            try:
-                sleep_random(args.endpoint_delay, f"before {handle}:{endpoint}")
-            except KeyboardInterrupt:
-                manifest["status"] = "interrupted"
-                manifest["media_dataset"] = update_media_dataset(
-                    user_dir, handle
-                )
-                manifest["completed_at"] = iso_utc(utc_now())
-                atomic_write_json(manifest_path, manifest)
-                raise
-            result = archive_endpoint(
-                args=args,
-                repo_dir=repo_dir,
-                archive_root=archive_root,
-                user_dir=user_dir,
-                handle=handle,
-                endpoint=endpoint,
-                run_dir=run_dir,
-                archive_run_id=current_run_id,
-                archived_at=iso_utc(started),
-                date_after=None,
-                cursor=None,
-            )
-            manifest["endpoints"].append(result)
-            atomic_write_json(manifest_path, manifest)
-            if result.get("interrupted"):
-                manifest["status"] = "interrupted"
-                manifest["media_dataset"] = update_media_dataset(
-                    user_dir, handle
-                )
-                manifest["completed_at"] = iso_utc(utc_now())
-                atomic_write_json(manifest_path, manifest)
-                raise KeyboardInterrupt
-            if result["exit_code"] != 0:
-                profile_partial = True
-                break
-        remaining_pending = prune_completed_pending_media(state, user_dir)
-        unavailable_media = state.get("unavailable_media")
-        unavailable_count = (
-            len(unavailable_media) if isinstance(unavailable_media, list) else 0
-        )
-        manifest["pending_media"] = remaining_pending
-        manifest["status"] = (
-            "partial"
-            if profile_partial or remaining_pending
-            else (
-                "complete_with_unavailable_media"
-                if unavailable_count
-                else "success"
-            )
-        )
-
-    manifest["media_dataset"] = update_media_dataset(user_dir, handle)
-    manifest["pending_media"] = prune_completed_pending_media(state, user_dir)
-    manifest["unavailable_media"] = state.get("unavailable_media", [])
+    manifest["status"] = "limited" if timeline_post_limit else "success"
+    manifest["profile_media"] = {
+        "status": "queued_from_info_descriptors",
+        "separate_x_extractors": 0,
+    }
     atomic_write_json(state_path, state)
     manifest["completed_at"] = iso_utc(utc_now())
     atomic_write_json(manifest_path, manifest)
+    local_module.register_run_manifest(
+        user_dir, context_db_path, manifest_path, processed=True
+    )
     return manifest
 
 
@@ -2907,18 +3450,18 @@ def dry_run_summary(
         print("mode: retry recorded incomplete media; no timeline crawl")
         print(
             "failed-media recovery: "
-            f"{max(args.retries, args.media_retries)} retries, "
-            f"{max(args.http_timeout, args.media_timeout)}s inactivity timeout"
+            f"{args.media_retries} direct attempt(s), "
+            f"{args.media_timeout}s inactivity timeout, bounded exact refresh"
         )
     else:
-        print("phase 1: modern timeline/profile/media update")
+        print("phase 1: modern timeline plus descriptor-based profile/media update")
         print("phase 2: guarded automatic legacy detection/resume to source-visible floor")
         print(
             "legacy protocol: 3-day roots with safe subdivision; "
             "2 matching walks and 2 distinct empty tail pages per walk"
         )
-        print("phase 3: seed and drain ancestor-only reply context plus context media")
-        print("profile media endpoints after timeline: avatar, background")
+        print("phase 3: seed reply ancestors and drain their direct media jobs")
+        print("profile media: reused from the mandatory info descriptor; no extra X endpoint")
     print(f"reposts: {'included and labeled' if not args.no_reposts else 'excluded'}")
     print("quoted-source media: excluded")
     print(
@@ -2927,8 +3470,11 @@ def dry_run_summary(
     )
     if not args.no_reposts:
         print("repost attribution: best effort where X omits wrapper-author identity")
-    print(f"request delay: {args.request_delay}s")
-    print(f"download delay: {args.download_delay}s")
+    print(
+        "actual X request lane: "
+        f"{args.request_delay}s requested, minimum 4s, durable across restart"
+    )
+    print(f"direct media bandwidth limit: {args.rate_limit}")
     print(
         "no-progress watchdog: one unchanged window at a verified legacy-era "
         f"floor; {args.stalled_rate_limit_cycles} for ambiguous boundaries"
@@ -2958,6 +3504,11 @@ def dry_run_summary(
 
     context_module = importlib.import_module("archive_x_context")
     legacy_module = importlib.import_module("archive_x_legacy")
+
+    def integrity_label(summary: dict[str, Any]) -> str:
+        value = summary.get("integrity_ok")
+        return "ok" if value is True else "FAILED" if value is False else "not checked"
+
     for handle in targets:
         user_dir = archive_root / "users" / handle
         state = load_json(user_dir / "_state" / "state.json", None)
@@ -2998,7 +3549,7 @@ def dry_run_summary(
             else:
                 print(
                     f"  context media: {summary['media_pending']} pending item(s); "
-                    f"integrity={'ok' if summary['integrity_ok'] else 'FAILED'}"
+                    f"integrity={integrity_label(summary)}"
                 )
             continue
         legacy = state.get("legacy_backfill")
@@ -3067,7 +3618,7 @@ def dry_run_summary(
                 f"{summary['metadata_pending']} metadata pending, "
                 f"{summary['manual_review']} manual review, "
                 f"{summary['media_pending']} media pending, "
-                f"integrity={'ok' if summary['integrity_ok'] else 'FAILED'}"
+                f"integrity={integrity_label(summary)}"
             )
         if args.post_limit or args.since is not None:
             print("  note: legacy/context network work is shown but skipped this run")
@@ -3094,7 +3645,18 @@ def print_invocation_summary(results: list[dict[str, Any]]) -> None:
         for name in phase_names:
             phase = phases.get(name)
             if isinstance(phase, dict) and phase.get("status"):
-                print(f"    {name}: {phase['status']}")
+                detail = ""
+                if name == "context_export" and (
+                    "durable_generation" in phase
+                    or "exported_generation" in phase
+                ):
+                    detail = (
+                        " (durable generation "
+                        f"{int(phase.get('durable_generation') or 0):,}; "
+                        "published generation "
+                        f"{int(phase.get('exported_generation') or 0):,})"
+                    )
+                print(f"    {name}: {phase['status']}{detail}")
 
 
 def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
@@ -3170,7 +3732,10 @@ def build_parser(repo_dir: Path) -> argparse.ArgumentParser:
         "--request-delay",
         type=duration_arg,
         default="4-8",
-        help="delay between X extraction requests (default: 4-8)",
+        help=(
+            "actual X request gap; values below 4s retain the 4s safety floor "
+            "(default: 4-8)"
+        ),
     )
     parser.add_argument(
         "--download-delay",

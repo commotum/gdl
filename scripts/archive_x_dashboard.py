@@ -146,6 +146,15 @@ def render_user(
             f"{separator}+{progress.human_number(max(0, delta['context_media_manual_review']))} review"
             f"{separator}{rate_text}"
         )
+    durable_generation = int(totals.get("archive_durable_generation") or 0)
+    exported_generation = int(totals.get("archive_exported_generation") or 0)
+    dirty_views = int(totals.get("archive_dirty_views") or 0)
+    if durable_generation != exported_generation or dirty_views:
+        lines[5] = (
+            f"Export     durable {progress.human_number(durable_generation)}"
+            f"{separator}published {progress.human_number(exported_generation)}"
+            f"{separator}{progress.human_number(dirty_views)} views pending"
+        )
     return [clip(line, width, unicode) for line in lines]
 
 

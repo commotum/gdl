@@ -12,7 +12,7 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
-import gallery_dl
+from gallery_dl import text
 from gallery_dl.extractor.twitter import (
     TwitterAPI,
     TwitterSearchExtractor,
@@ -22,6 +22,7 @@ import gallery_dl_x_runner as base_runner
 
 
 TELEMETRY_SCHEMA_VERSION = 1
+BOUND_USER_ID_OPTION = "--archive-x-legacy-bound-user-id"
 SEARCH_TIMELINE_SUFFIX = "SearchTimeline"
 SUPPORTED_SEARCH_TIMELINE_SHA256 = (
     "a6a27d4168ae98bee3ed1608bd8c8acec674d07e5ff4acad9651b20af32a48c3"
@@ -190,6 +191,7 @@ class TelemetryRecorder:
         path: Path,
         request_limit: int,
         empty_tail_pages: int,
+        bound_user_id: str | None = None,
     ):
         self.path = path
         self.request_limit = request_limit
@@ -198,7 +200,13 @@ class TelemetryRecorder:
         self.search_requests = 0
         self.capped = False
         self.pages: list[dict[str, Any]] = []
-        self.profile_user_ids: set[str] = set()
+        self.profile_user_ids: set[str] = (
+            {bound_user_id} if bound_user_id is not None else set()
+        )
+        self.profile_requests = 0
+        self.identity_source = (
+            "bound_numeric_id" if bound_user_id is not None else "profile_api"
+        )
 
     def call(self, original, api, endpoint, params, *args, **kwargs):
         is_search = endpoint.endswith(SEARCH_TIMELINE_SUFFIX)
@@ -237,6 +245,7 @@ class TelemetryRecorder:
                 }
             )
         elif endpoint.endswith("UserByScreenName"):
+            self.profile_requests += 1
             self.profile_user_ids.update(profile_user_ids(data))
         return data
 
@@ -257,6 +266,8 @@ class TelemetryRecorder:
             "exit_code": status,
             "pages": self.pages,
             "profile_user_ids": sorted(self.profile_user_ids, key=int),
+            "profile_requests": self.profile_requests,
+            "identity_source": self.identity_source,
             "opaque_cursor_values_persisted": False,
         }
 
@@ -274,10 +285,11 @@ class TelemetryRecorder:
 
 def parse_runner_options(
     argv: list[str],
-) -> tuple[Path | None, int | None, int | None, list[str]]:
+) -> tuple[Path | None, int | None, int | None, str | None, list[str]]:
     telemetry = None
     request_limit = None
     empty_tail_pages = None
+    bound_user_id = None
     remaining = []
     index = 0
     while index < len(argv):
@@ -286,6 +298,7 @@ def parse_runner_options(
             "--archive-x-legacy-telemetry",
             "--archive-x-legacy-request-limit",
             "--archive-x-legacy-empty-tail-pages",
+            BOUND_USER_ID_OPTION,
         }:
             if index + 1 >= len(argv):
                 raise ValueError(f"{value} requires a value")
@@ -294,6 +307,8 @@ def parse_runner_options(
                 telemetry = Path(option)
             elif value.endswith("empty-tail-pages"):
                 empty_tail_pages = int(option)
+            elif value == BOUND_USER_ID_OPTION:
+                bound_user_id = option
             else:
                 request_limit = int(option)
             index += 2
@@ -323,42 +338,102 @@ def parse_runner_options(
         raise ValueError(
             "legacy empty-tail pages must be positive and below the request limit"
         )
-    return telemetry, request_limit, empty_tail_pages, remaining
+    if bound_user_id is not None and (
+        telemetry is None
+        or not bound_user_id.isdecimal()
+        or int(bound_user_id) < 1
+    ):
+        raise ValueError(
+            "legacy bound user ID requires telemetry and must be numeric"
+        )
+    return telemetry, request_limit, empty_tail_pages, bound_user_id, remaining
 
 
-def main(argv: list[str] | None = None) -> int:
-    values = list(sys.argv[1:] if argv is None else argv)
+def bound_identity_tweets(extractor: TwitterSearchExtractor, user_id: str):
+    """Run one pinned search without repeating UserByScreenName."""
+    query = text.unquote(extractor.user.replace("+", " "))
+    handle = None
+    for item in query.split():
+        item = item.strip("()")
+        if item.startswith("from:"):
+            if handle:
+                handle = None
+                break
+            handle = item[5:]
+    if not handle:
+        raise base_runner.ShimCompatibilityError(
+            "bound legacy search query lacks one account scope"
+        )
+    extractor._user_obj = {"rest_id": user_id}
+    extractor._user = {
+        "id": int(user_id),
+        "name": handle,
+        "nick": handle,
+    }
+    return extractor.api.search_timeline(query)
+
+
+def run_once(values: list[str], *, runner_starts: int = 1) -> int:
     try:
         (
             telemetry_path,
             request_limit,
             empty_tail_pages,
-            gallery_args,
+            bound_user_id,
+            remaining_args,
         ) = parse_runner_options(values)
+        request_telemetry_path, operation, remaining_args = (
+            base_runner.request_telemetry.parse_runner_options(
+                remaining_args
+            )
+        )
+        scheduler_options, gallery_args = base_runner.pacing.parse_runner_options(
+            remaining_args
+        )
+        if scheduler_options is not None and operation is None:
+            raise base_runner.pacing.PacingError(
+                "request telemetry operation is required with scheduler options"
+            )
         require_supported_legacy_gallery_dl()
         base_runner.install_patch()
     except (
         ValueError,
+        base_runner.pacing.PacingError,
+        base_runner.request_telemetry.RequestTelemetryError,
         base_runner.ShimCompatibilityError,
     ) as exc:
         print(f"gallery-dl X legacy runner: {exc}", file=sys.stderr)
         return 32
 
-    if telemetry_path is None:
-        original_argv = sys.argv
+    def execute_base() -> int:
+        runner_options = {}
+        if scheduler_options is not None:
+            runner_options["scheduler_options"] = scheduler_options
+        if runner_starts != 1:
+            runner_options["runner_starts"] = runner_starts
         try:
-            sys.argv = [original_argv[0], *gallery_args]
-            return gallery_dl.main()
-        finally:
-            sys.argv = original_argv
+            return base_runner.run_gallery_args(
+                gallery_args,
+                request_telemetry_path,
+                operation,
+                **runner_options,
+            )
+        except base_runner.pacing.PacingError as exc:
+            print(f"gallery-dl X legacy runner: {exc}", file=sys.stderr)
+            return 32
+
+    if telemetry_path is None:
+        return execute_base()
 
     recorder = TelemetryRecorder(
         telemetry_path,
         request_limit,
         empty_tail_pages,
+        bound_user_id,
     )
     original_call = TwitterAPI._call
     original_checkpoint = base_runner._checkpoint_cursor
+    original_search_tweets = TwitterSearchExtractor.tweets
 
     def observed_call(api, endpoint, params, *args, **kwargs):
         return recorder.call(original_call, api, endpoint, params, *args, **kwargs)
@@ -367,18 +442,43 @@ def main(argv: list[str] | None = None) -> int:
     # recovery authority, so redact it from the base runner's quota checkpoint.
     base_runner._checkpoint_cursor = lambda _api: "legacy-cursor-redacted"
     TwitterAPI._call = observed_call
+    if bound_user_id is not None:
+        TwitterSearchExtractor.tweets = lambda extractor: bound_identity_tweets(
+            extractor, bound_user_id
+        )
     status = 1
-    original_argv = sys.argv
     try:
-        sys.argv = [original_argv[0], *gallery_args]
-        result = gallery_dl.main()
-        status = int(result or 0)
+        status = execute_base()
     finally:
-        sys.argv = original_argv
         TwitterAPI._call = original_call
+        TwitterSearchExtractor.tweets = original_search_tweets
         base_runner._checkpoint_cursor = original_checkpoint
         recorder.write(status)
     return status
+
+
+def main(argv: list[str] | None = None) -> int:
+    values = list(sys.argv[1:] if argv is None else argv)
+    try:
+        worker_options, remaining = base_runner.runner_control.parse_worker_options(
+            values
+        )
+        if worker_options is not None and remaining:
+            raise base_runner.runner_control.ControlProtocolError(
+                "control-worker startup does not accept gallery arguments"
+            )
+        if worker_options is not None:
+            require_supported_legacy_gallery_dl()
+            base_runner.install_patch()
+    except (
+        base_runner.runner_control.ControlProtocolError,
+        base_runner.ShimCompatibilityError,
+    ) as exc:
+        print(f"gallery-dl X legacy runner: {exc}", file=sys.stderr)
+        return 32
+    if worker_options is not None:
+        return base_runner.runner_control.worker_loop(worker_options, run_once)
+    return run_once(remaining)
 
 
 if __name__ == "__main__":

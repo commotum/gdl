@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
-import copy
 import time
 from argparse import Namespace
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Callable
 
 import archive_x
 import archive_x_context as context_x
 import archive_x_legacy as legacy_x
+import archive_x_local as local_x
+import archive_x_media as media_x
+import archive_x_refresh as refresh_x
 
 
 SUCCESSFUL_MODERN = {
@@ -91,7 +94,7 @@ def legacy_state_status(user_dir: Path) -> str:
     return str(legacy["status"])
 
 
-def run_legacy_scheduler(
+def _run_legacy_scheduler_impl(
     args: Namespace,
     repo_dir: Path,
     archive_root: Path,
@@ -99,6 +102,7 @@ def run_legacy_scheduler(
     handles: list[str],
     *,
     progress: Any | None = None,
+    runners: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     results = {
         handle: {
@@ -126,6 +130,8 @@ def run_legacy_scheduler(
 
     def run_one(handle: str, max_windows: int | None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
+        if runners is not None and handle in runners:
+            kwargs["runner"] = runners[handle]
         if progress is not None:
             def report(event: dict[str, Any]) -> None:
                 name = str(event.get("event") or "legacy_progress")
@@ -213,9 +219,40 @@ def run_legacy_scheduler(
                 active.remove(handle)
         if active and not made_progress:
             raise archive_x.ArchiveError("legacy scheduler made no durable progress")
-        if active:
-            archive_x.sleep_random("30-60", "before next legacy round")
     return results
+
+
+def run_legacy_scheduler(
+    args: Namespace,
+    repo_dir: Path,
+    archive_root: Path,
+    version: str,
+    handles: list[str],
+    *,
+    progress: Any | None = None,
+    persistent_runner: bool = False,
+) -> dict[str, Any]:
+    with ExitStack() as stack:
+        runners: dict[str, Any] | None = None
+        if persistent_runner:
+            runners = {}
+            for handle in handles:
+                user_dir = user_dir_for(archive_root, handle)
+                account_id, _canonical = context_x.target_identity(user_dir)
+                runners[handle] = stack.enter_context(
+                    archive_x.x_runner_control_client(
+                        repo_dir, account_id, legacy=True
+                    )
+                )
+        return _run_legacy_scheduler_impl(
+            args,
+            repo_dir,
+            archive_root,
+            version,
+            handles,
+            progress=progress,
+            runners=runners,
+        )
 
 
 def retry_shared_media(
@@ -225,58 +262,194 @@ def retry_shared_media(
     handle: str,
     version: str,
 ) -> dict[str, Any]:
-    user_dir = user_dir_for(archive_root, handle)
-    state_path = user_dir / "_state" / "state.json"
-    state = archive_x.load_json(state_path, {})
-    state_before = copy.deepcopy(state)
-    archive_x.reclassify_pending_media_from_logs(state, user_dir)
-    if state != state_before:
-        archive_x.atomic_write_json(state_path, state)
-    summary = archive_x.media_queue_summary(state, user_dir)
-    before = summary["pending"]
-    if not before:
+    del version  # direct assets and bounded refresh use the already pinned workers
+    return run_media_pipeline(
+        args,
+        repo_dir,
+        archive_root,
+        handle,
+        max_assets=getattr(args, "context_media_max_posts", None),
+        max_refreshes=getattr(args, "context_media_max_posts", None),
+        persistent_runner=True,
+    )
+
+
+def _asset_state_counts(db_path: Path) -> dict[str, int]:
+    with context_x.ContextDB(db_path, create=False) as database:
         return {
-            "status": (
-                "complete_with_unavailable_media"
-                if summary["unavailable"]
-                else "complete"
-            ),
+            str(row[0]): int(row[1])
+            for row in database.connection.execute(
+                "SELECT state,COUNT(*) FROM asset_jobs GROUP BY state"
+            )
+        }
+
+
+def run_media_pipeline(
+    args: Namespace,
+    repo_dir: Path,
+    archive_root: Path,
+    handle: str,
+    *,
+    max_assets: int | None = None,
+    max_refreshes: int | None = None,
+    persistent_runner: bool = False,
+) -> dict[str, Any]:
+    """Drain descriptors directly, refresh exceptions once, then drain again."""
+    user_dir = user_dir_for(archive_root, handle)
+    db_path = user_dir / "_state" / "context.sqlite3"
+    if not db_path.is_file():
+        return {
+            "status": "complete",
             "pending_before": 0,
             "pending_after": 0,
-            **summary,
+            "unavailable": 0,
+            "manual_review": 0,
+            "descriptor_hits": 0,
+            "direct_attempted": 0,
+            "captured": 0,
+            "existing": 0,
+            "downloaded": 0,
+            "cdn_bytes": 0,
+            "refresh_attempted": 0,
+            "x_api_requests": 0,
+            "x_support_requests": 0,
+            "passes": [],
         }
-    if not summary["due"]:
-        return {
-            "status": "partial",
-            "pending_before": before,
-            "pending_after": before,
-            **summary,
-        }
-    retry_args = copy.copy(args)
-    retry_args.retry_failed_only = True
-    retry_args.full_rescan = False
-    retry_args.since = None
-    retry_args.post_limit = None
-    run = archive_x.archive_user(
-        retry_args, repo_dir, archive_root, handle, version
+    before = _asset_state_counts(db_path)
+    passes: list[dict[str, Any]] = []
+    totals = {
+        "direct_attempted": 0,
+        "captured": 0,
+        "existing": 0,
+        "downloaded": 0,
+        "cdn_bytes": 0,
+        "refresh_attempted": 0,
+        "x_api_requests": 0,
+        "x_support_requests": 0,
+    }
+    session = media_x.requests.Session()
+    session.trust_env = False
+    try:
+        with ExitStack() as stack:
+            runner = None
+            if persistent_runner:
+                account_id, _canonical = context_x.target_identity(user_dir)
+                runner = stack.enter_context(
+                    archive_x.x_runner_control_client(repo_dir, account_id)
+                )
+            for _cycle in range(3):
+                asset_remaining = (
+                    None
+                    if max_assets is None
+                    else max(0, max_assets - totals["direct_attempted"])
+                )
+                direct: dict[str, Any] = {"attempted": 0}
+                if asset_remaining is None or asset_remaining > 0:
+                    direct = media_x.run_direct_media_worker(
+                        archive_root=archive_root,
+                        user_dir=user_dir,
+                        db_path=db_path,
+                        max_assets=asset_remaining,
+                        max_attempts=max(
+                            1, int(getattr(args, "media_retries", 2))
+                        ),
+                        timeout=(
+                            min(
+                                30.0,
+                                float(getattr(args, "http_timeout", 60)),
+                            ),
+                            float(getattr(args, "media_timeout", 300)),
+                        ),
+                        rate_limit=getattr(args, "rate_limit", "8M"),
+                        session=session,
+                    )
+                    totals["direct_attempted"] += int(
+                        direct.get("attempted") or 0
+                    )
+                    totals["captured"] += int(direct.get("captured") or 0)
+                    totals["existing"] += int(direct.get("existing") or 0)
+                    totals["downloaded"] += int(direct.get("downloaded") or 0)
+                    totals["cdn_bytes"] += int(direct.get("bytes") or 0)
+
+                refresh_remaining = (
+                    None
+                    if max_refreshes is None
+                    else max(
+                        0, max_refreshes - totals["refresh_attempted"]
+                    )
+                )
+                refresh: dict[str, Any] = {"attempted": 0}
+                if refresh_remaining is None or refresh_remaining > 0:
+                    refresh = refresh_x.run_descriptor_refresh_worker(
+                        repo_dir=repo_dir,
+                        archive_root=archive_root,
+                        user_dir=user_dir,
+                        db_path=db_path,
+                        handle=handle,
+                        cookie_file=args.cookies,
+                        max_posts=refresh_remaining,
+                        request_delay=args.request_delay,
+                        max_attempts=3,
+                        runner=runner,
+                    )
+                    totals["refresh_attempted"] += int(
+                        refresh.get("attempted") or 0
+                    )
+                    totals["x_api_requests"] += int(
+                        refresh.get("x_api_requests") or 0
+                    )
+                    totals["x_support_requests"] += int(
+                        refresh.get("x_support_requests") or 0
+                    )
+                passes.append({"direct": direct, "refresh": refresh})
+                if not int(direct.get("attempted") or 0) and not int(
+                    refresh.get("attempted") or 0
+                ):
+                    break
+                if (
+                    max_assets is not None
+                    and totals["direct_attempted"] >= max_assets
+                    and max_refreshes is not None
+                    and totals["refresh_attempted"] >= max_refreshes
+                ):
+                    break
+    finally:
+        session.close()
+
+    after = _asset_state_counts(db_path)
+    actionable = sum(
+        after.get(state, 0)
+        for state in ("pending", "leased", "retryable", "needs_refresh")
     )
-    state = archive_x.load_json(state_path, {})
-    after_summary = archive_x.media_queue_summary(state, user_dir)
-    after = after_summary["pending"]
+    manual = after.get("manual_review", 0)
+    unavailable = after.get("unavailable", 0)
+    bounded = bool(
+        (max_assets is not None and totals["direct_attempted"] >= max_assets)
+        or (
+            max_refreshes is not None
+            and totals["refresh_attempted"] >= max_refreshes
+        )
+    )
+    if actionable:
+        status = "limited" if bounded else "partial"
+    elif manual:
+        status = "manual_review"
+    elif unavailable:
+        status = "complete_with_unavailable_media"
+    else:
+        status = "complete"
     return {
-        "status": (
-            "partial"
-            if after
-            else (
-                "complete_with_unavailable_media"
-                if after_summary["unavailable"]
-                else "complete"
-            )
+        "status": status,
+        "pending_before": sum(
+            before.get(state, 0)
+            for state in ("pending", "leased", "retryable", "needs_refresh")
         ),
-        "run_id": run["run_id"],
-        "pending_before": before,
-        "pending_after": after,
-        **after_summary,
+        "pending_after": actionable,
+        "unavailable": unavailable,
+        "manual_review": manual,
+        "descriptor_hits": totals["direct_attempted"],
+        **totals,
+        "passes": passes,
     }
 
 
@@ -307,6 +480,7 @@ def run_context_worker(
     media: bool,
     max_posts: int | None,
     progress: Any | None = None,
+    runner: Any | None = None,
 ) -> dict[str, Any]:
     user_dir, db_path = context_x.user_paths(archive_root, handle)
     counts = context_x.run_worker(
@@ -333,6 +507,7 @@ def run_context_worker(
                 progress=durable,
             )
         ),
+        runner=runner,
     )
     result = context_phase_status(db_path, media=media)
     if max_posts is not None and result["status"] == "pending":
@@ -341,7 +516,7 @@ def run_context_worker(
     return result
 
 
-def run_context_scheduler(
+def _run_context_scheduler_impl(
     args: Namespace,
     repo_dir: Path,
     archive_root: Path,
@@ -349,6 +524,7 @@ def run_context_scheduler(
     *,
     media: bool,
     progress: Any | None = None,
+    runners: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     requested_limit = getattr(
         args, "context_media_max_posts" if media else "context_max_posts", None
@@ -360,6 +536,8 @@ def run_context_scheduler(
                 kwargs = {"media": media, "max_posts": requested_limit}
                 if progress is not None:
                     kwargs["progress"] = progress
+                if runners is not None and handle in runners:
+                    kwargs["runner"] = runners[handle]
                 results[handle] = run_context_worker(
                     args, repo_dir, archive_root, handle, **kwargs
                 )
@@ -395,6 +573,8 @@ def run_context_scheduler(
                 kwargs = {"media": media, "max_posts": quantum}
                 if progress is not None:
                     kwargs["progress"] = progress
+                if runners is not None and handle in runners:
+                    kwargs["runner"] = runners[handle]
                 result = run_context_worker(
                     args, repo_dir, archive_root, handle, **kwargs
                 )
@@ -430,6 +610,37 @@ def run_context_scheduler(
                 )
             time.sleep(max(0.01, min(min(future) - time.time(), 60.0)))
     return results
+
+
+def run_context_scheduler(
+    args: Namespace,
+    repo_dir: Path,
+    archive_root: Path,
+    handles: list[str],
+    *,
+    media: bool,
+    progress: Any | None = None,
+    persistent_runner: bool = False,
+) -> dict[str, Any]:
+    with ExitStack() as stack:
+        runners: dict[str, Any] | None = None
+        if persistent_runner:
+            runners = {}
+            for handle in handles:
+                user_dir, _db_path = context_x.user_paths(archive_root, handle)
+                account_id, _canonical = context_x.target_identity(user_dir)
+                runners[handle] = stack.enter_context(
+                    archive_x.x_runner_control_client(repo_dir, account_id)
+                )
+        return _run_context_scheduler_impl(
+            args,
+            repo_dir,
+            archive_root,
+            handles,
+            media=media,
+            progress=progress,
+            runners=runners,
+        )
 
 
 def overall_status(phases: dict[str, Any]) -> str:
@@ -568,7 +779,7 @@ def run_unified_followups(
             phase(handle, "legacy", "running", "checking legacy coverage")
         legacy = run_legacy_scheduler(
             args, repo_dir, archive_root, version, eligible,
-            progress=progress,
+            progress=progress, persistent_runner=True,
         )
         for handle in eligible:
             combined[handle]["legacy"] = legacy[handle]
@@ -580,30 +791,15 @@ def run_unified_followups(
 
     for handle in eligible:
         phase(handle, "shared_media", "running", "checking authored media")
-        if args.retry_failed_only:
-            recovery = modern_results[handle].get("media_recovery") or {}
+        try:
+            combined[handle]["shared_media"] = retry_shared_media(
+                args, repo_dir, archive_root, handle, version
+            )
+        except archive_x.ArchiveError as exc:
             combined[handle]["shared_media"] = {
-                "status": (
-                    "partial"
-                    if int(recovery.get("pending_after") or 0)
-                    else (
-                        "complete_with_unavailable_media"
-                        if int(recovery.get("unavailable_after") or 0)
-                        else "complete"
-                    )
-                ),
-                **recovery,
+                "status": "failed",
+                "error": str(exc),
             }
-        else:
-            try:
-                combined[handle]["shared_media"] = retry_shared_media(
-                    args, repo_dir, archive_root, handle, version
-                )
-            except archive_x.ArchiveError as exc:
-                combined[handle]["shared_media"] = {
-                    "status": "failed",
-                    "error": str(exc),
-                }
         emit()
         phase(
             handle, "shared_media",
@@ -649,7 +845,7 @@ def run_unified_followups(
             )
         metadata = run_context_scheduler(
             args, repo_dir, archive_root, context_handles, media=False,
-            progress=progress,
+            progress=progress, persistent_runner=True,
         )
         for handle in context_handles:
             combined[handle]["context_metadata"] = metadata[handle]
@@ -660,57 +856,59 @@ def run_unified_followups(
             )
             emit()
 
-    media_handles = list(context_handles)
-    blocked_media: dict[str, dict[str, Any]] = {}
-    if not args.retry_failed_only:
-        media_handles = []
-        for handle in context_handles:
-            metadata_status = str(
-                combined[handle].get("context_metadata", {}).get("status", "")
-            )
-            if metadata_status in {
-                "failed", "interrupted", "stalled", "ambiguous", "blocked"
-            }:
-                blocked_media[handle] = {
-                    "status": "blocked",
-                    "reason": f"context_metadata_{metadata_status}",
-                }
-            else:
-                media_handles.append(handle)
-    for handle in media_handles:
-        phase(handle, "context_media", "running", "fetching context media")
-    for handle in blocked_media:
+    media: dict[str, dict[str, Any]] = {}
+    for handle in context_handles:
+        if args.retry_failed_only:
+            media[handle] = dict(combined[handle]["shared_media"])
+            continue
         phase(
             handle,
             "context_media",
-            "blocked",
-            "context media deferred after metadata failure",
+            "running",
+            "downloading saved media descriptors",
         )
-    media = run_context_scheduler(
-        args, repo_dir, archive_root, media_handles, media=True,
-        progress=progress,
-    ) if media_handles else {}
+        try:
+            media[handle] = run_media_pipeline(
+                args,
+                repo_dir,
+                archive_root,
+                handle,
+                max_assets=getattr(args, "context_media_max_posts", None),
+                max_refreshes=getattr(args, "context_media_max_posts", None),
+                persistent_runner=True,
+            )
+        except (archive_x.ArchiveError, context_x.ContextError) as exc:
+            media[handle] = {"status": "failed", "error": str(exc)}
     for handle in context_handles:
-        combined[handle]["context_media"] = (
-            blocked_media.get(handle) or media[handle]
-        )
+        combined[handle]["context_media"] = media[handle]
         phase(
             handle, "context_media",
             str(combined[handle]["context_media"].get("status", "complete")),
             "context media checked",
         )
-        phase(handle, "context_export", "running", "exporting context datasets")
+        phase(handle, "context_export", "running", "checking export checkpoint")
         try:
             user_dir, db_path = context_x.user_paths(archive_root, handle)
             with context_x.ContextDB(db_path, create=False) as database:
-                errors = database.integrity_errors()
-            if errors:
-                raise context_x.ContextError("; ".join(errors))
-            combined[handle]["context_export"] = {
-                "status": "complete",
-                **context_x.export_datasets(user_dir, db_path),
-            }
-        except context_x.ContextError as exc:
+                local_ready = database.connection.execute(
+                    "SELECT 1 FROM current_pointers "
+                    "WHERE pointer_name='local_history_reconciled'"
+                ).fetchone() is not None
+            export = (
+                local_x.checkpoint_exports(user_dir, db_path)
+                if local_ready
+                else {
+                    "status": "complete",
+                    **context_x.export_datasets(user_dir, db_path),
+                }
+            )
+            export["legacy_checkpoint_recorded"] = (
+                legacy_x.record_unified_export_checkpoint(user_dir, export)
+                if local_ready
+                else False
+            )
+            combined[handle]["context_export"] = export
+        except (context_x.ContextError, archive_x.ArchiveError) as exc:
             combined[handle]["context_export"] = {
                 "status": "failed",
                 "error": str(exc),
@@ -719,7 +917,7 @@ def run_unified_followups(
         phase(
             handle, "context_export",
             str(combined[handle]["context_export"].get("status", "complete")),
-            "context datasets exported",
+            "portable export checkpoint recorded",
         )
 
     for handle in combined:

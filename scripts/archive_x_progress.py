@@ -39,6 +39,10 @@ MEDIA_STATES = {
     "none", "pending", "leased", "captured", "retryable", "unavailable",
     "manual_review",
 }
+ASSET_STATES = {
+    "pending", "leased", "captured", "retryable", "needs_refresh",
+    "unavailable", "manual_review",
+}
 SECRET_KEY = re.compile(
     r"(cookie|authorization|auth[_-]?token|csrf|ct0|proxy|cursor|password)",
     re.I,
@@ -54,6 +58,8 @@ ALLOWED_USER = {
 }
 ALLOWED_TOTALS = {
     "archive_posts", "archive_media_files", "archive_media_bytes",
+    "archive_durable_generation", "archive_exported_generation",
+    "archive_dirty_views",
     "context_captured", "context_parents_saved", "context_unavailable",
     "context_manual_review", "context_known_remaining",
     "context_media_remaining", "context_media_actionable",
@@ -86,7 +92,8 @@ ALLOWED_PHASE_STATUSES = {
     "retrying", "retryable", "manual_review", "blocked", "failed",
     "interrupted", "ambiguous", "initialized", "not_initialized", "valid",
     "not_applicable", "already_initialized",
-    "skipped_diagnostic", "skipped_retry_only",
+    "skipped_diagnostic", "skipped_retry_only", "published", "deferred",
+    "unchanged", "empty",
 }
 
 
@@ -208,34 +215,83 @@ def _open_context(db_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _context_fast_metrics(connection: sqlite3.Connection) -> dict[str, int]:
-    """Collect the indexed counters that are safe to refresh frequently."""
-    states = _group(connection, "state")
-    media = _group(connection, "media_state")
-    unknown_states = set(states) - TARGET_STATES
-    unknown_media = set(media) - MEDIA_STATES
-    if unknown_states or unknown_media:
-        raise ProgressError("context database contains unknown states")
-    parents = int(connection.execute(
-        "SELECT COUNT(*) FROM observations WHERE source_kind='x:focal'"
-    ).fetchone()[0])
-    reasons = {
-        str(row[0] or "other"): int(row[1])
+def _maintained_counters(
+    connection: sqlite3.Connection,
+) -> dict[str, int] | None:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='progress_counters'"
+    ).fetchone()
+    if table is None:
+        return None
+    counters = {
+        str(row[0]): int(row[1])
         for row in connection.execute(
-            "SELECT last_error_class,COUNT(*) FROM targets "
-            "WHERE state='unavailable' GROUP BY last_error_class"
+            "SELECT counter_name,value FROM progress_counters"
         )
     }
-    private = sum(
-        value for key, value in reasons.items()
-        if key in {"private", "protected", "auth_required"}
-    )
-    deleted = sum(value for key, value in reasons.items() if "deleted" in key)
-    suspended = sum(
-        value for key, value in reasons.items() if "suspend" in key
-    )
+    required = {
+        "targets_total",
+        "observations_focal",
+        "reply_edges_total",
+        *(f"targets_state_{state}" for state in TARGET_STATES),
+        *(f"targets_media_{state}" for state in MEDIA_STATES),
+    }
+    return counters if required <= set(counters) else None
+
+
+def _context_fast_metrics(connection: sqlite3.Connection) -> dict[str, int]:
+    """Collect the indexed counters that are safe to refresh frequently."""
+    counters = _maintained_counters(connection)
+    if counters is not None:
+        states = {
+            state: counters.get(f"targets_state_{state}", 0)
+            for state in TARGET_STATES
+        }
+        media = {
+            state: counters.get(f"targets_media_{state}", 0)
+            for state in MEDIA_STATES
+        }
+        asset_total = counters.get("asset_jobs_total", 0)
+        if asset_total:
+            media = {
+                state: counters.get(f"asset_jobs_state_{state}", 0)
+                for state in ASSET_STATES
+            }
+        parents = counters["observations_focal"]
+        private = counters.get("targets_unavailable_private", 0)
+        deleted = counters.get("targets_unavailable_deleted", 0)
+        suspended = counters.get("targets_unavailable_suspended", 0)
+        other = counters.get("targets_unavailable_other", 0)
+    else:
+        states = _group(connection, "state")
+        media = _group(connection, "media_state")
+        unknown_states = set(states) - TARGET_STATES
+        unknown_media = set(media) - MEDIA_STATES
+        if unknown_states or unknown_media:
+            raise ProgressError("context database contains unknown states")
+        parents = int(connection.execute(
+            "SELECT COUNT(*) FROM observations WHERE source_kind='x:focal'"
+        ).fetchone()[0])
+        reasons = {
+            str(row[0] or "other"): int(row[1])
+            for row in connection.execute(
+                "SELECT last_error_class,COUNT(*) FROM targets "
+                "WHERE state='unavailable' GROUP BY last_error_class"
+            )
+        }
+        private = sum(
+            value for key, value in reasons.items()
+            if key in {"private", "protected", "auth_required"}
+        )
+        deleted = sum(value for key, value in reasons.items() if "deleted" in key)
+        suspended = sum(
+            value for key, value in reasons.items() if "suspend" in key
+        )
+        other = max(
+            0,
+            states.get("unavailable", 0) - private - deleted - suspended,
+        )
     unavailable = states.get("unavailable", 0)
-    classified = private + deleted + suspended
     return {
         "context_captured": states.get("captured", 0),
         "context_parents_saved": parents,
@@ -245,19 +301,23 @@ def _context_fast_metrics(connection: sqlite3.Connection) -> dict[str, int]:
             states.get(name, 0) for name in ("pending", "leased", "retryable")
         ),
         "context_media_actionable": sum(
-            media.get(name, 0) for name in ("pending", "leased", "retryable")
+            media.get(name, 0)
+            for name in ("pending", "leased", "retryable", "needs_refresh")
         ),
         "context_media_captured": media.get("captured", 0),
         "context_media_unavailable": media.get("unavailable", 0),
         "context_media_manual_review": media.get("manual_review", 0),
         "context_media_remaining": sum(
             media.get(name, 0)
-            for name in ("pending", "leased", "retryable", "manual_review")
+            for name in (
+                "pending", "leased", "retryable", "needs_refresh",
+                "manual_review",
+            )
         ),
         "boundaries_deleted": deleted,
         "boundaries_private": private,
         "boundaries_suspended": suspended,
-        "boundaries_other": max(0, unavailable - classified),
+        "boundaries_other": other,
     }
 
 
@@ -271,6 +331,27 @@ def collect_context_fast_metrics(db_path: Path) -> dict[str, int]:
 
 
 def _context_closure_metrics(connection: sqlite3.Connection) -> dict[str, int]:
+    counters = _maintained_counters(connection)
+    closure_names = (
+        "fully_captured",
+        "unavailable_boundary",
+        "retry_delayed",
+        "pending",
+        "manual_review",
+    )
+    if counters is not None and all(
+        f"conversations_state_{state}" in counters for state in closure_names
+    ):
+        closure = {
+            state: counters[f"conversations_state_{state}"]
+            for state in closure_names
+        }
+        return {
+            "conversations_closed": (
+                closure["fully_captured"] + closure["unavailable_boundary"]
+            ),
+            "conversations_total": sum(closure.values()),
+        }
     closure = {
         "fully_captured": 0, "unavailable_boundary": 0,
         "retry_delayed": 0, "pending": 0, "manual_review": 0,
@@ -346,6 +427,14 @@ def infer_media_phase_started_at(
 def collect_media_terminal_since(db_path: Path, since: float) -> int:
     connection = _open_context(db_path)
     try:
+        counters = _maintained_counters(connection)
+        if counters is not None and counters.get("asset_jobs_total", 0):
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM asset_jobs "
+                "WHERE state IN ('captured','unavailable','manual_review') "
+                "AND updated_at>=?",
+                (_timestamp(since),),
+            ).fetchone()[0])
         return int(connection.execute(
             "SELECT COUNT(*) FROM targets "
             "WHERE media_state IN ('captured','unavailable','manual_review') "
@@ -431,6 +520,49 @@ def _latest_manifest(user_dir: Path) -> dict[str, Any]:
 def collect_archive_metrics(
     user_dir: Path, modern_result: dict[str, Any] | None = None
 ) -> dict[str, int]:
+    db_path = user_dir / "_state" / "context.sqlite3"
+    indexed: dict[str, int] | None = None
+    if db_path.is_file():
+        connection = _open_context(db_path)
+        try:
+            counters = _maintained_counters(connection)
+            ready = connection.execute(
+                "SELECT 1 FROM current_pointers "
+                "WHERE pointer_name='local_history_reconciled'"
+            ).fetchone()
+            if counters is not None and ready is not None:
+                indexed = {
+                    "archive_posts": counters.get("archive_posts_total", 0),
+                    "archive_media_files": counters.get("archive_media_files", 0),
+                    "archive_media_bytes": counters.get("archive_media_bytes", 0),
+                }
+        except sqlite3.Error:
+            indexed = None
+        finally:
+            connection.close()
+    if indexed is not None:
+        if modern_result:
+            post_block = _metric_block(
+                modern_result, ("dataset", "post_dataset"), DATASET_COUNT_KEYS
+            )
+            media_block = _metric_block(
+                modern_result,
+                ("media", "media_dataset"),
+                MEDIA_FILE_KEYS + MEDIA_BYTE_KEYS,
+            )
+            indexed["archive_posts"] = max(
+                indexed["archive_posts"],
+                *(int(post_block.get(key) or 0) for key in DATASET_COUNT_KEYS),
+            )
+            indexed["archive_media_files"] = max(
+                indexed["archive_media_files"],
+                *(int(media_block.get(key) or 0) for key in MEDIA_FILE_KEYS),
+            )
+            indexed["archive_media_bytes"] = max(
+                indexed["archive_media_bytes"],
+                *(int(media_block.get(key) or 0) for key in MEDIA_BYTE_KEYS),
+            )
+        return indexed
     sources = [_latest_manifest(user_dir)]
     if modern_result:
         sources.append(modern_result)
@@ -462,6 +594,46 @@ def collect_archive_metrics(
         "archive_media_files": maximum(media_sets, MEDIA_FILE_KEYS),
         "archive_media_bytes": maximum(media_sets, MEDIA_BYTE_KEYS),
     }
+
+
+def collect_export_metrics(db_path: Path) -> dict[str, int]:
+    """Read constant-size durable/export generation state without payload I/O."""
+    result = {
+        "archive_durable_generation": 0,
+        "archive_exported_generation": 0,
+        "archive_dirty_views": 0,
+    }
+    connection = _open_context(db_path)
+    try:
+        try:
+            generation = connection.execute(
+                "SELECT current_generation FROM archive_generation WHERE singleton=1"
+            ).fetchone()
+            pointer = connection.execute(
+                """SELECT generation FROM current_pointers
+                     WHERE pointer_name='portable_export'"""
+            ).fetchone()
+            dirty = connection.execute(
+                """SELECT COUNT(*) FROM export_views
+                     WHERE status<>'current'
+                        OR durable_generation<>exported_generation"""
+            ).fetchone()
+        except sqlite3.Error:
+            return result
+        result.update(
+            {
+                "archive_durable_generation": (
+                    int(generation[0]) if generation is not None else 0
+                ),
+                "archive_exported_generation": (
+                    int(pointer[0]) if pointer is not None else 0
+                ),
+                "archive_dirty_views": int(dirty[0]) if dirty is not None else 0,
+            }
+        )
+    finally:
+        connection.close()
+    return result
 
 
 RATE_RESET_RE = re.compile(r"Archive rate-limit reset=(\d+)")
@@ -700,6 +872,10 @@ def collect_user_totals(
     totals.update(collect_archive_metrics(user_dir, modern_result))
     db_path = user_dir / "_state" / "context.sqlite3"
     if db_path.is_file():
+        try:
+            totals.update(collect_export_metrics(db_path))
+        except sqlite3.Error:
+            pass
         totals.update(
             collect_context_metrics(db_path)
             if include_context_closure
@@ -954,6 +1130,7 @@ class LiveProgressReader:
         context_activity = None
         if db_path.is_file():
             try:
+                totals.update(collect_export_metrics(db_path))
                 totals.update(collect_context_fast_metrics(db_path))
                 context_activity = self._context_activity(db_path)
                 if handle not in self._closure:

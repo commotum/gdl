@@ -148,7 +148,8 @@ class LegacyRunnerTests(unittest.TestCase):
             self.assertEqual(recorder.path.stat().st_mode & 0o777, 0o600)
 
     def test_runner_options_are_removed_before_gallery(self):
-        path, limit, empty_tail_pages, remaining = runner.parse_runner_options(
+        path, limit, empty_tail_pages, bound_user_id, remaining = (
+            runner.parse_runner_options(
             [
                 "--archive-x-legacy-telemetry",
                 "/tmp/t.json",
@@ -156,13 +157,76 @@ class LegacyRunnerTests(unittest.TestCase):
                 "6",
                 "--archive-x-legacy-empty-tail-pages",
                 "2",
+                "--archive-x-legacy-bound-user-id",
+                "12345",
                 "--version",
             ]
+            )
         )
         self.assertEqual(path, Path("/tmp/t.json"))
         self.assertEqual(limit, 6)
         self.assertEqual(empty_tail_pages, 2)
+        self.assertEqual(bound_user_id, "12345")
         self.assertEqual(remaining, ["--version"])
+
+    def test_bound_search_identity_avoids_profile_api_call(self):
+        extractor = types.SimpleNamespace(
+            user="from%3Aalice+since_time%3A1+until_time%3A2",
+            api=types.SimpleNamespace(search_timeline=mock.Mock(return_value=iter(()))),
+            _user=None,
+            _user_obj=None,
+        )
+
+        result = runner.bound_identity_tweets(extractor, "12345")
+
+        self.assertEqual(list(result), [])
+        extractor.api.search_timeline.assert_called_once_with(
+            "from:alice since_time:1 until_time:2"
+        )
+        self.assertEqual(extractor._user["id"], 12345)
+        self.assertEqual(extractor._user["name"], "alice")
+        self.assertEqual(extractor._user_obj, {"rest_id": "12345"})
+        recorder = runner.TelemetryRecorder(
+            Path("unused.json"), 6, 2, "12345"
+        )
+        value = recorder.value(0)
+        self.assertEqual(value["profile_user_ids"], ["12345"])
+        self.assertEqual(value["profile_requests"], 0)
+        self.assertEqual(value["identity_source"], "bound_numeric_id")
+
+    def test_main_forwards_generic_actual_request_telemetry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy_path = root / "legacy.json"
+            request_path = root / "requests.json"
+            with mock.patch.object(
+                runner, "require_supported_legacy_gallery_dl"
+            ), mock.patch.object(
+                runner.base_runner, "install_patch"
+            ), mock.patch.object(
+                runner.base_runner, "run_gallery_args", return_value=0
+            ) as run:
+                status = runner.main(
+                    [
+                        "--archive-x-legacy-telemetry",
+                        str(legacy_path),
+                        "--archive-x-legacy-request-limit",
+                        "6",
+                        "--archive-x-legacy-empty-tail-pages",
+                        "2",
+                        "--archive-x-request-telemetry",
+                        str(request_path),
+                        "--archive-x-operation",
+                        "legacy_walk",
+                        "--version",
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            run.assert_called_once_with(
+                ["--version"], request_path, "legacy_walk"
+            )
+            self.assertTrue(legacy_path.is_file())
 
     def test_profile_identity_is_extracted_without_profile_content(self):
         response = {
@@ -224,6 +288,8 @@ class LegacyFetcherTests(unittest.TestCase):
                 request_delay="4-8",
                 include_reposts=False,
                 empty_tail_pages=2,
+                descriptor_artifact=root / "descriptors.jsonl.partial",
+                descriptor_operation_id="run:legacy-walk-a",
             )
             twitter = config["extractor"]["twitter"]
             self.assertNotIn("archive", twitter)
@@ -231,20 +297,29 @@ class LegacyFetcherTests(unittest.TestCase):
             self.assertEqual(twitter["search-pagination"], "cursor")
             self.assertEqual(twitter["search-stop"], 1)
             self.assertFalse(twitter["quoted"])
+            self.assertTrue(twitter["videos"])
             self.assertNotIn("post-filter", twitter)
+            self.assertEqual(
+                twitter["postprocessors"][0]["name"],
+                "archive_x_descriptor",
+            )
             command = legacy.legacy_gallery_command(
                 REPO,
                 root / "config.json",
                 root / "telemetry.json",
+                root / "requests.json",
                 request_limit=6,
                 empty_tail_pages=2,
                 retries=1,
                 http_timeout=60,
+                requested_user_id="12345",
                 url="https://x.com/search?q=test",
             )
             self.assertTrue(command[1].endswith("gallery_dl_x_legacy_runner.py"))
             self.assertIn("--no-download", command)
             self.assertNotIn("--post-range", command)
+            self.assertIn("--archive-x-request-telemetry", command)
+            self.assertIn("--archive-x-operation", command)
 
     def test_raw_validation_uses_returned_dates_and_numeric_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -328,6 +403,33 @@ class LegacyFetcherTests(unittest.TestCase):
             ),
             telemetry,
         )
+        with self.assertRaisesRegex(
+            archive_x.ArchiveError, "repeated profile resolution"
+        ):
+            legacy.validate_walk_telemetry(
+                telemetry,
+                expected_query=query,
+                request_limit=6,
+                empty_tail_pages=2,
+                exit_code=0,
+                expected_user_id="12345",
+                require_bound_identity=True,
+            )
+        bound = json.loads(json.dumps(telemetry))
+        bound["identity_source"] = "bound_numeric_id"
+        bound["profile_requests"] = 0
+        self.assertIs(
+            legacy.validate_walk_telemetry(
+                bound,
+                expected_query=query,
+                request_limit=6,
+                empty_tail_pages=2,
+                exit_code=0,
+                expected_user_id="12345",
+                require_bound_identity=True,
+            ),
+            bound,
+        )
         changed = json.loads(json.dumps(telemetry))
         changed["pages"][0]["query_sha256"] = "0" * 64
         with self.assertRaisesRegex(archive_x.ArchiveError, "query changed"):
@@ -401,6 +503,8 @@ class LegacyFetcherTests(unittest.TestCase):
                             }
                         ],
                         "profile_user_ids": ["12345"],
+                        "profile_requests": 0,
+                        "identity_source": "bound_numeric_id",
                         "opaque_cursor_values_persisted": False,
                     },
                 )
