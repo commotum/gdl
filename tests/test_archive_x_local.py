@@ -529,6 +529,43 @@ class LocalStateTests(unittest.TestCase):
             "jobs": 0,
         })
 
+    def test_historical_captured_context_request_with_zero_assets_migrates(self):
+        captured = metadata("200", author_id="2")
+        self.assertEqual(captured["count"], 0)
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            database.capture(
+                "200",
+                captured,
+                source_kind="x:focal",
+                target_user_id="1",
+                max_depth=100,
+            )
+            database.connection.execute(
+                "UPDATE targets SET media_state='captured' WHERE post_id='200'"
+            )
+
+        self.assertEqual(
+            local_x.reconcile_context_media_jobs(self.db_path),
+            {"targets": 1, "jobs": 0},
+        )
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM asset_jobs"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertIsNotNone(
+                database.connection.execute(
+                    "SELECT 1 FROM current_pointers "
+                    "WHERE pointer_name='context_media_jobs_reconciled'"
+                ).fetchone()
+            )
+        self.assertEqual(
+            local_x.reconcile_context_media_jobs(self.db_path),
+            {"targets": 0, "jobs": 0},
+        )
+
     def test_checkpoint_defers_tiny_delta_until_forced_without_view_rewrite(self):
         self.ingest(self.source([metadata("100")]))
         initial = local_x.checkpoint_exports(self.user_dir, self.db_path)

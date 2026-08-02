@@ -1566,7 +1566,12 @@ def reconcile_context_media_jobs(
                     "historical context media metadata is invalid"
                 ) from exc
             count = metadata.get("count") if isinstance(metadata, dict) else None
-            if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            # The pre-v3 media lane can legitimately mark a context request as
+            # captured even when the focal post has no attached assets.  Those
+            # observations carry an explicit ``count: 0`` and need no asset
+            # jobs; only an absent or otherwise invalid count is unsafe to
+            # migrate.
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
                 raise LocalStateError(
                     "historical context media metadata lacks an asset count"
                 )
