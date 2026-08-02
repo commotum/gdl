@@ -5102,6 +5102,7 @@ def build_context_config(
         extractor_delay="0",
         include_reposts=True,
         checksums=media,
+        download_media=media,
         cursor=None,
         descriptor_artifact=descriptor_path,
         descriptor_operation_id=operation_id,

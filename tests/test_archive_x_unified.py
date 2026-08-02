@@ -1584,7 +1584,7 @@ class UnifiedOrchestrationTests(unittest.TestCase):
             self.assertEqual(saved["results"][0]["status"], "success")
             self.assertEqual(saved["status"], "success")
 
-    def test_main_completes_every_modern_target_before_backlog_scheduler(self):
+    def test_main_completes_each_account_end_to_end_before_the_next(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             calls = []
@@ -1597,13 +1597,23 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                 calls.append(f"modern:{handle}")
                 return {"run_id": f"modern-{handle}", "status": "success"}
 
-            def followups(args, repo_dir, archive_root, version, modern_results, **kwargs):
-                calls.append("backlogs")
-                self.assertEqual(list(modern_results), ["alice", "bob"])
+            def followups(
+                args, repo_dir, archive_root, version, modern_results, **kwargs
+            ):
+                handle = next(iter(modern_results))
+                self.assertEqual(list(modern_results), [handle])
+                calls.append(f"followups:{handle}")
                 return {
-                    handle: {"modern": value, "status": "success"}
+                    handle: {
+                        "modern": value,
+                        "context_export": {"status": "complete"},
+                        "status": "success",
+                    }
                     for handle, value in modern_results.items()
                 }
+
+            def delay(*args, **kwargs):
+                calls.append("inter-user-delay")
 
             with mock.patch.object(
                 archive_x, "validate_cookie_file", return_value={"x.com"}
@@ -1614,7 +1624,7 @@ class UnifiedOrchestrationTests(unittest.TestCase):
             ), mock.patch.object(
                 archive_x, "exclusive_lock", side_effect=fake_lock
             ), mock.patch.object(
-                archive_x, "sleep_random", return_value=0
+                archive_x, "sleep_random", side_effect=delay
             ), mock.patch.object(
                 archive_x, "archive_user", side_effect=modern
             ), mock.patch.object(
@@ -1632,7 +1642,25 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                 )
 
             self.assertEqual(status, 0)
-            self.assertEqual(calls, ["modern:alice", "modern:bob", "backlogs"])
+            self.assertEqual(
+                calls,
+                [
+                    "modern:alice",
+                    "followups:alice",
+                    "inter-user-delay",
+                    "modern:bob",
+                    "followups:bob",
+                ],
+            )
+            invocation = next((root / "runs").glob("*.json"))
+            saved = json.loads(invocation.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [
+                    result["phases"]["context_export"]["status"]
+                    for result in saved["results"]
+                ],
+                ["complete", "complete"],
+            )
 
     def test_main_interrupt_during_modern_finalizes_invocation(self):
         with tempfile.TemporaryDirectory() as directory:

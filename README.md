@@ -53,7 +53,9 @@ The input file accepts one bare handle, `@handle`, or `x.com`/`twitter.com`
 profile URL per line. Blank lines and lines beginning with `#` are ignored,
 and duplicate handles are removed. The file is parsed by the wrapper rather
 than passed to gallery-dl, so entries cannot act as gallery-dl command-line
-directives.
+directives. Batch order is end-to-end: each account completes its modern,
+legacy, media, reply-context, and export phases before the inter-user delay
+and the next line begins.
 
 The default is deliberately restrained and fail-closed:
 

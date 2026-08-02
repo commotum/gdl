@@ -1291,6 +1291,7 @@ def build_legacy_gallery_config(
         extractor_delay="0",
         include_reposts=include_reposts,
         checksums=False,
+        download_media=False,
         cursor=None,
         descriptor_artifact=descriptor_artifact,
         descriptor_operation_id=descriptor_operation_id,

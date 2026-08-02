@@ -212,6 +212,40 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(processors[0]["event"], "prepare")
         self.assertEqual(processors[1]["name"], "hash")
 
+    def test_descriptor_only_timeline_omits_file_event_processors(self):
+        config = archive_x.build_gallery_config(
+            handle="tszzl",
+            endpoint="timeline",
+            archive_root=Path("/archive"),
+            user_dir=Path("/archive/users/tszzl"),
+            raw_partial=Path(
+                "/archive/users/tszzl/runs/run/raw/timeline.posts.jsonl.partial"
+            ),
+            cookie_file=Path("/cookies/x.txt"),
+            archive_run_id="run",
+            archived_at="2026-07-14T01:02:03Z",
+            request_delay="4-8",
+            download_delay="1-3",
+            extractor_delay="2-5",
+            include_reposts=True,
+            checksums=True,
+            cursor=None,
+            download_media=False,
+            descriptor_artifact=Path(
+                "/archive/users/tszzl/runs/run/raw/"
+                "timeline.descriptors.jsonl.partial"
+            ),
+            descriptor_operation_id="run:timeline",
+            descriptor_source_kind="modern",
+            descriptor_source_operation="modern",
+        )
+
+        processors = config["extractor"]["twitter"]["postprocessors"]
+        self.assertEqual(
+            [(processor["name"], processor["event"]) for processor in processors],
+            [("archive_x_descriptor", "prepare"), ("metadata", "post")],
+        )
+
     def test_actual_request_scheduler_replaces_runner_retry_sleeps(self):
         pacing = importlib.import_module("archive_x_pacing")
         options = pacing.SchedulerOptions(

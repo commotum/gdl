@@ -5,6 +5,7 @@ import re
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from gallery_dl.extractor.common import Extractor, Message
@@ -15,6 +16,8 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
+import archive_x
+import archive_x_descriptors as descriptor_capture
 import archive_x_request_telemetry as request_telemetry
 
 
@@ -51,6 +54,81 @@ class DescriptorFixtureExtractor(Extractor):
 
 
 class DescriptorCaptureMechanismTests(unittest.TestCase):
+    def test_descriptor_only_timeline_does_not_stat_missing_media_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = (
+                root
+                / "users/alice/runs/run/raw/timeline.posts.jsonl.partial"
+            )
+            artifact = raw.with_name("timeline.descriptors.jsonl.partial")
+            raw.parent.mkdir(parents=True)
+            descriptor_capture.prepare_artifact(artifact)
+            descriptor_capture.install_postprocessor()
+            config = archive_x.build_gallery_config(
+                handle="alice",
+                endpoint="timeline",
+                archive_root=root,
+                user_dir=root / "users/alice",
+                raw_partial=raw,
+                cookie_file=root / "unused-cookies",
+                archive_run_id="run",
+                archived_at="2026-08-02T20:38:18Z",
+                request_delay="0",
+                download_delay="0",
+                extractor_delay="0",
+                include_reposts=True,
+                checksums=True,
+                cursor=None,
+                download_media=False,
+                descriptor_artifact=artifact,
+                descriptor_operation_id="run:timeline",
+                descriptor_source_kind="modern",
+                descriptor_source_operation="modern",
+            )
+            options = dict(config["extractor"]["twitter"])
+            options["base-directory"] = str(root)
+            options["download"] = False
+            options.pop("cookies", None)
+            options.pop("cookies-update", None)
+            records = [
+                (
+                    {
+                        "tweet_id": "2083994559462146301",
+                        "conversation_id": "2083994559462146301",
+                        "date": datetime(
+                            2026, 8, 2, 19, 13, 16, tzinfo=timezone.utc
+                        ),
+                        "author": {"id": "1", "name": "amramleifer"},
+                        "archived_at": "2026-08-02T20:38:18Z",
+                    },
+                    [{
+                        "url": (
+                            "https://pbs.twimg.com/media/example.jpg?name=orig"
+                        ),
+                        "extension": "jpg",
+                        "filename": "example",
+                        "type": "photo",
+                        "width": 100,
+                        "height": 100,
+                    }],
+                )
+            ]
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = DownloadJob(
+                    DescriptorFixtureExtractor(records, options)
+                ).run()
+
+            self.assertEqual(status, 0)
+            self.assertEqual(len(artifact.read_text().splitlines()), 1)
+            missing_media = (
+                root
+                / "users/alice/media/2026/08/"
+                "2026-08-02T19-13-16_2083994559462146301_1_amramleifer.jpg"
+            )
+            self.assertFalse(missing_media.exists())
+
     def test_prepare_event_retains_all_file_fields_without_downloading(self):
         accepted = {"100", "101", "102"}
         records = [

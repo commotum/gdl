@@ -1106,6 +1106,7 @@ def build_gallery_config(
     include_reposts: bool,
     checksums: bool,
     cursor: str | None,
+    download_media: bool = True,
     descriptor_artifact: Path | None = None,
     descriptor_operation_id: str | None = None,
     descriptor_source_kind: str | None = None,
@@ -1133,28 +1134,29 @@ def build_gallery_config(
                 owner_kind=descriptor_owner_kind,
             )
         )
-    if checksums:
+    if download_media:
+        if checksums:
+            postprocessors.append(
+                {"name": "hash", "mode": "sha256", "event": "file"}
+            )
         postprocessors.append(
-            {"name": "hash", "mode": "sha256", "event": "file"}
-        )
-    postprocessors.extend(
-        (
             {
                 "name": "metadata",
                 "event": "file",
                 "mtime": True,
                 "sort": True,
-            },
-            {
-                "name": "metadata",
-                "mode": "jsonl",
-                "event": "post",
-                "base-directory": str(raw_partial.parent),
-                "filename": raw_partial.name,
-                "exclude": ["local_path", "media_url"],
-                "sort": True,
-            },
+            }
         )
+    postprocessors.append(
+        {
+            "name": "metadata",
+            "mode": "jsonl",
+            "event": "post",
+            "base-directory": str(raw_partial.parent),
+            "filename": raw_partial.name,
+            "exclude": ["local_path", "media_url"],
+            "sort": True,
+        }
     )
 
     relation_filter = "author.get('id') == user.get('id')"
@@ -1738,6 +1740,11 @@ def archive_endpoint(
     ) = descriptor_scope_for_endpoint(endpoint)
     descriptor_operation_id = f"{archive_run_id}:{endpoint}"
     descriptor_x.prepare_artifact(descriptor_partial)
+    should_download_media = (
+        endpoint != "timeline"
+        if download_media is None
+        else download_media
+    )
     config = build_gallery_config(
         handle=handle,
         endpoint=endpoint,
@@ -1756,6 +1763,7 @@ def archive_endpoint(
             else include_reposts
         ),
         checksums=not args.no_checksums,
+        download_media=should_download_media,
         cursor=cursor,
         descriptor_artifact=descriptor_partial,
         descriptor_operation_id=descriptor_operation_id,
@@ -1783,11 +1791,7 @@ def archive_endpoint(
         url=url,
         request_telemetry_path=request_path,
         request_operation=request_operation,
-        download=(
-            endpoint != "timeline"
-            if download_media is None
-            else download_media
-        ),
+        download=should_download_media,
         scheduler_options=scheduler_options,
     )
     print(f"Archiving {handle}: {endpoint} ({url})")
@@ -3981,15 +3985,16 @@ def main(argv: list[str] | None = None) -> int:
                         finalized_invocations
                     )
                     checkpoint_invocation()
+                unified = importlib.import_module("archive_x_unified")
                 for index, handle in enumerate(targets):
+                    if index:
+                        sleep_random(args.user_delay, f"before user {handle}")
                     current_handle = handle
                     progress.event(
                         handle, phase="modern", phase_status="running",
                         activity="archiving authored timeline", force=True,
                         active=True,
                     )
-                    if index:
-                        sleep_random(args.user_delay, f"before user {handle}")
                     try:
                         result = archive_user(
                             args, repo_dir, archive_root, handle, version
@@ -4007,8 +4012,7 @@ def main(argv: list[str] | None = None) -> int:
                         activity="authored timeline checkpointed",
                         progress=True, force=True,
                     )
-                    current_handle = None
-                    checkpoint_invocation()
+                    checkpoint_invocation(combined)
                     if result["status"] not in {
                         "success",
                         "complete_with_unavailable_media",
@@ -4020,16 +4024,25 @@ def main(argv: list[str] | None = None) -> int:
                             f"Modern archive phase for {handle} ended with status "
                             f"{result['status']}."
                         )
-                unified = importlib.import_module("archive_x_unified")
-                combined = unified.run_unified_followups(
-                    args,
-                    repo_dir,
-                    archive_root,
-                    version,
-                    modern_results,
-                    checkpoint=checkpoint_invocation,
-                    progress=progress,
-                )
+
+                    def checkpoint_account(
+                        account_results: dict[str, dict[str, Any]],
+                    ) -> None:
+                        combined.update(account_results)
+                        checkpoint_invocation(combined)
+
+                    account_result = unified.run_unified_followups(
+                        args,
+                        repo_dir,
+                        archive_root,
+                        version,
+                        {handle: result},
+                        checkpoint=checkpoint_account,
+                        progress=progress,
+                    )
+                    combined.update(account_result)
+                    checkpoint_invocation(combined)
+                    current_handle = None
         except KeyboardInterrupt:
             if current_handle and current_handle not in modern_results:
                 modern_results[current_handle] = {
