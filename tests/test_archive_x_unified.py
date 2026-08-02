@@ -1069,6 +1069,7 @@ class UnifiedOrchestrationTests(unittest.TestCase):
         self.assertEqual(reporter.event.call_args.args, ("alice",))
         self.assertTrue(reporter.event.call_args.kwargs["progress"])
         self.assertTrue(reporter.event.call_args.kwargs["force"])
+        self.assertTrue(reporter.event.call_args.kwargs["active"])
         self.assertIn("+7 posts", reporter.event.call_args.kwargs["activity"])
 
     def test_legacy_failure_isolated_to_one_user(self):

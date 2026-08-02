@@ -156,6 +156,7 @@ def _run_legacy_scheduler_impl(
                     activity=activity,
                     progress=name == "window_committed",
                     force=name == "window_committed",
+                    active=True,
                 )
 
             kwargs["progress_callback"] = report
@@ -483,6 +484,19 @@ def run_context_worker(
     runner: Any | None = None,
 ) -> dict[str, Any]:
     user_dir, db_path = context_x.user_paths(archive_root, handle)
+    if progress is not None:
+        progress.event(
+            handle,
+            phase="context_media" if media else "context_metadata",
+            phase_status="running",
+            activity=(
+                "processing context media"
+                if media
+                else "fetching reply-parent context"
+            ),
+            active=True,
+            force=True,
+        )
     counts = context_x.run_worker(
         repo_dir=repo_dir,
         archive_root=archive_root,
@@ -505,6 +519,7 @@ def run_context_worker(
                 handle,
                 activity=f"{state} {post_id}",
                 progress=durable,
+                active=True,
             )
         ),
         runner=runner,
@@ -691,12 +706,20 @@ def run_unified_followups(
         if checkpoint is not None:
             checkpoint(combined)
 
-    def phase(handle: str, name: str, status: str, activity: str) -> None:
+    def phase(
+        handle: str,
+        name: str,
+        status: str,
+        activity: str,
+        *,
+        active: bool = False,
+    ) -> None:
         if progress is not None:
             progress.event(
                 handle, phase=name, phase_status=status,
                 activity=activity, progress=status not in {"running", "pending"},
                 force=status not in {"running", "pending"},
+                active=active,
             )
 
     eligible: list[str] = []
@@ -751,6 +774,13 @@ def run_unified_followups(
     # modern/profile phase itself finishes without rewriting the hash-bound
     # stopped source manifest.
     for handle in newly_initialized:
+        phase(
+            handle,
+            "modern",
+            "running",
+            "archiving modern head after legacy handoff",
+            active=True,
+        )
         try:
             head = archive_x.archive_user(
                 args, repo_dir, archive_root, handle, version
@@ -790,7 +820,10 @@ def run_unified_followups(
             emit()
 
     for handle in eligible:
-        phase(handle, "shared_media", "running", "checking authored media")
+        phase(
+            handle, "shared_media", "running", "checking authored media",
+            active=True,
+        )
         try:
             combined[handle]["shared_media"] = retry_shared_media(
                 args, repo_dir, archive_root, handle, version
@@ -816,7 +849,10 @@ def run_unified_followups(
     else:
         context_handles = []
         for handle in eligible:
-            phase(handle, "context_seed", "running", "discovering reply parents")
+            phase(
+                handle, "context_seed", "running", "discovering reply parents",
+                active=True,
+            )
             try:
                 user_dir, db_path = context_x.user_paths(archive_root, handle)
                 combined[handle]["context_seed"] = {
@@ -866,6 +902,7 @@ def run_unified_followups(
             "context_media",
             "running",
             "downloading saved media descriptors",
+            active=True,
         )
         try:
             media[handle] = run_media_pipeline(
@@ -886,7 +923,10 @@ def run_unified_followups(
             str(combined[handle]["context_media"].get("status", "complete")),
             "context media checked",
         )
-        phase(handle, "context_export", "running", "checking export checkpoint")
+        phase(
+            handle, "context_export", "running", "checking export checkpoint",
+            active=True,
+        )
         try:
             user_dir, db_path = context_x.user_paths(archive_root, handle)
             with context_x.ContextDB(db_path, create=False) as database:

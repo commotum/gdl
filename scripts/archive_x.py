@@ -3986,6 +3986,7 @@ def main(argv: list[str] | None = None) -> int:
                     progress.event(
                         handle, phase="modern", phase_status="running",
                         activity="archiving authored timeline", force=True,
+                        active=True,
                     )
                     if index:
                         sleep_random(args.user_delay, f"before user {handle}")

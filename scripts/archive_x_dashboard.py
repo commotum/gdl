@@ -49,7 +49,7 @@ def wait_label(value: str | None, now: float) -> str | None:
 
 def render_user(
     user: dict[str, Any], *, started_at: str, width: int,
-    now: float, unicode: bool,
+    now: float, unicode: bool, batch_position: tuple[int, int] | None = None,
 ) -> list[str]:
     separator = " · " if unicode else " | "
     totals, delta = user["totals"], user["delta"]
@@ -99,9 +99,14 @@ def render_user(
     now_text = wait_label(user.get("wait_until"), now) or (
         f"progress {age(user.get('last_progress_at'), now)}"
     )
+    batch_text = (
+        f"{separator}{batch_position[0]}/{batch_position[1]}"
+        if batch_position is not None
+        else ""
+    )
     lines = [
         f"@{user['handle']}  {phase}{separator}{health}"
-        f"{separator}{progress.human_duration(now - started)}",
+        f"{separator}{progress.human_duration(now - started)}{batch_text}",
         f"Timeline   {progress.human_number(totals['archive_posts'])} posts"
         f"{separator}{progress.human_number(totals['archive_media_files'])} media"
         f"{separator}{progress.human_bytes(totals['archive_media_bytes'])}",
@@ -158,9 +163,34 @@ def render_user(
     return [clip(line, width, unicode) for line in lines]
 
 
+def active_user_index(snapshot: dict[str, Any]) -> int:
+    """Choose one live card without mistaking queued users for active work."""
+    users = snapshot["users"]
+    if not users:
+        raise progress.ProgressError("dashboard snapshot has no users")
+    active_handle = snapshot.get("active_handle")
+    if active_handle is not None:
+        for index, user in enumerate(users):
+            if user["handle"] == active_handle:
+                return index
+    active_statuses = {"active", "running", "retrying", "retryable"}
+    for index, user in enumerate(users):
+        phase = str(user["phase"])
+        if (
+            phase != "starting"
+            and user["phases"].get(phase, "running") in active_statuses
+        ):
+            return index
+    for index, user in enumerate(users):
+        if user["phase"] != "starting":
+            return index
+    return 0
+
+
 def render(
     snapshot: dict[str, Any], *, width: int = 80,
     now: float | None = None, unicode: bool = True,
+    active_only: bool = False,
 ) -> str:
     progress.validate_snapshot(snapshot)
     current = time.time() if now is None else now
@@ -177,12 +207,17 @@ def render(
             user["health"] = "stale"
             user["activity"] = "no telemetry update"
         users.append(user)
+    indexed_users = list(enumerate(users, 1))
+    if active_only and len(indexed_users) > 1:
+        selected = active_user_index({**snapshot, "users": users})
+        indexed_users = [indexed_users[selected]]
     blocks = [
         render_user(
             user, started_at=snapshot["started_at"], width=max(40, width),
             now=current, unicode=unicode,
+            batch_position=(index, len(users)) if active_only and len(users) > 1 else None,
         )
-        for user in users
+        for index, user in indexed_users
     ]
     return "\n\n".join("\n".join(block) for block in blocks)
 
@@ -240,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
                 output = render(
                     snapshot, width=width,
                     unicode=(sys.stdout.encoding or "").lower().startswith("utf"),
+                    active_only=args.watch,
                 )
             except (OSError, json.JSONDecodeError, progress.ProgressError) as exc:
                 output = f"Archive dashboard unavailable: {exc}"

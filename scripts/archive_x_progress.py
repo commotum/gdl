@@ -49,7 +49,7 @@ SECRET_KEY = re.compile(
 )
 ALLOWED_TOP = {
     "schema", "schema_version", "invocation_id", "started_at", "updated_at",
-    "status", "users",
+    "status", "users", "active_handle",
 }
 ALLOWED_USER = {
     "handle", "phase", "health", "activity", "last_progress_at", "wait_until",
@@ -988,6 +988,12 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
         raise ProgressError("unsupported progress schema")
     if not isinstance(snapshot.get("users"), list):
         raise ProgressError("users must be a list")
+    active_handle = snapshot.get("active_handle")
+    if active_handle is not None and (
+        not isinstance(active_handle, str)
+        or not re.fullmatch(r"[A-Za-z0-9_]{1,50}", active_handle)
+    ):
+        raise ProgressError("active handle is invalid")
     for user in snapshot["users"]:
         if not isinstance(user, dict):
             raise ProgressError("user must be an object")
@@ -1289,6 +1295,7 @@ class ProgressTracker:
     # slow-cadence; the renderer can reread the resulting JSON every second.
     refresh_seconds: float = 300
     status: str = "running"
+    active_handle: str | None = None
     users: dict[str, dict[str, Any]] = field(default_factory=dict)
     _last_refresh: float = 0
 
@@ -1327,9 +1334,11 @@ class ProgressTracker:
         self, handle: str, *, phase: str | None = None,
         phase_status: str | None = None, activity: str | None = None,
         progress: bool = False, wait_until: str | None = None,
-        force: bool = False,
+        force: bool = False, active: bool = False,
     ) -> None:
         user = self.users[handle]
+        if active:
+            self.active_handle = handle
         previous_phase = user["phase"]
         if phase:
             user["phase"] = phase
@@ -1447,6 +1456,7 @@ class ProgressTracker:
             "schema": SCHEMA, "schema_version": SCHEMA_VERSION,
             "invocation_id": self.invocation_id, "started_at": self.started_at,
             "updated_at": utc_now(), "status": self.status,
+            "active_handle": self.active_handle,
             "users": [self.users[handle] for handle in self.handles],
         }
 

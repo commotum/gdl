@@ -481,6 +481,15 @@ class ProgressSignalsTests(unittest.TestCase):
             progress.validate_snapshot(saved)
             self.assertEqual(saved["users"][0]["baseline"]["archive_posts"], 2)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            tracker.event(
+                "alice",
+                phase="modern",
+                phase_status="running",
+                activity="archiving authored timeline",
+                active=True,
+            )
+            active = json.loads(path.read_text())
+            self.assertEqual(active["active_handle"], "alice")
 
     def test_renderer_is_compact_width_bounded_and_plain(self):
         totals = progress.empty_totals()
@@ -529,6 +538,108 @@ class ProgressSignalsTests(unittest.TestCase):
             "users": [user],
         }, width=80, now=1767229200, unicode=False)
         self.assertIn("Export     durable 12 | published 9 | 2 views pending", dirty_output)
+
+    def test_watch_renderer_shows_explicit_active_user_and_batch_position(self):
+        def user(handle, phase, activity):
+            totals = progress.empty_totals()
+            return {
+                "handle": handle,
+                "phase": phase,
+                "health": "healthy",
+                "activity": activity,
+                "last_progress_at": "2026-01-01T00:00:00Z",
+                "wait_until": None,
+                "phases": {} if phase == "starting" else {phase: "running"},
+                "totals": totals,
+                "baseline": dict(totals),
+                "delta": progress.empty_totals(),
+                "samples": [],
+                "rate": None,
+                "estimate": {
+                    "seconds": None,
+                    "label": None,
+                    "confidence": "none",
+                    "qualifier": "collecting samples",
+                    "known_remaining": 0,
+                },
+                "action_required": 0,
+            }
+
+        users = [
+            user("alice", "legacy", "committed a legacy window"),
+            user("bob", "legacy", "verifying a legacy window"),
+            user("charlie", "starting", "validating archive state"),
+        ]
+        output = dashboard.render({
+            "schema": progress.SCHEMA,
+            "schema_version": 1,
+            "invocation_id": "run",
+            "started_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "status": "running",
+            "active_handle": "bob",
+            "users": users,
+        }, width=100, now=1767229200, unicode=False, active_only=True)
+
+        self.assertEqual(len(output.splitlines()), 7)
+        self.assertIn("@bob", output)
+        self.assertIn("| 2/3", output.splitlines()[0])
+        self.assertNotIn("@alice", output)
+        self.assertNotIn("@charlie", output)
+
+    def test_watch_renderer_fallback_ignores_last_queued_user(self):
+        totals = progress.empty_totals()
+
+        def user(handle, phase, phases, activity):
+            return {
+                "handle": handle,
+                "phase": phase,
+                "health": "healthy",
+                "activity": activity,
+                "last_progress_at": "2026-01-01T00:00:00Z",
+                "wait_until": None,
+                "phases": phases,
+                "totals": dict(totals),
+                "baseline": dict(totals),
+                "delta": dict(totals),
+                "samples": [],
+                "rate": None,
+                "estimate": {
+                    "seconds": None,
+                    "label": None,
+                    "confidence": "none",
+                    "qualifier": "collecting samples",
+                    "known_remaining": 0,
+                },
+                "action_required": 0,
+            }
+
+        output = dashboard.render({
+            "schema": progress.SCHEMA,
+            "schema_version": 1,
+            "invocation_id": "run",
+            "started_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "status": "running",
+            "users": [
+                user(
+                    "daviddeutschoxf",
+                    "modern",
+                    {"modern": "running"},
+                    "archiving authored timeline",
+                ),
+                user(
+                    "schmidhuberai",
+                    "starting",
+                    {},
+                    "validating archive state",
+                ),
+            ],
+        }, width=100, now=1767229200, unicode=False, active_only=True)
+
+        self.assertIn("@daviddeutschoxf", output)
+        self.assertIn("| 1/2", output.splitlines()[0])
+        self.assertNotIn("@schmidhuberai", output)
 
     def test_tmux_adapter_is_optional_and_uses_argument_vectors(self):
         calls = []
