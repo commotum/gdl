@@ -227,6 +227,10 @@ class ContextLocalExecutionError(ContextError):
     """A lookup failed locally before any external request was attempted."""
 
 
+class AssetIndexConflict(ContextError):
+    """One logical media asset conflicts with a different indexed file row."""
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -373,6 +377,34 @@ def _upsert_portable_asset(
     generation: int,
     captured_at: str,
 ) -> None:
+    indexed = connection.execute(
+        """SELECT media_path,sidecar_path,owner_kind,owner_id,media_ordinal,
+                  asset_id FROM archive_media WHERE asset_id=?""",
+        (asset_id,),
+    ).fetchone()
+    if indexed is not None and indexed["media_path"] != prepared["media_path"]:
+        raise AssetIndexConflict(
+            "logical media asset is already indexed at a different path"
+        )
+    path_owner = connection.execute(
+        """SELECT asset_id FROM archive_media WHERE media_path=?""",
+        (prepared["media_path"],),
+    ).fetchone()
+    if path_owner is not None and path_owner["asset_id"] not in (None, asset_id):
+        raise AssetIndexConflict(
+            "portable media path belongs to a different logical asset"
+        )
+    sidecar_owner = connection.execute(
+        """SELECT asset_id,media_path FROM archive_media WHERE sidecar_path=?""",
+        (prepared["sidecar_path"],),
+    ).fetchone()
+    if sidecar_owner is not None and (
+        sidecar_owner["media_path"] != prepared["media_path"]
+        or sidecar_owner["asset_id"] not in (None, asset_id)
+    ):
+        raise AssetIndexConflict(
+            "portable media sidecar belongs to a different logical asset"
+        )
     cursor = connection.execute(
         """INSERT INTO archive_media(
                media_path,sidecar_path,owner_kind,owner_id,media_ordinal,
@@ -415,7 +447,9 @@ def _upsert_portable_asset(
         ),
     )
     if cursor.rowcount != 1:
-        raise ContextError("portable asset identity conflicts with indexed media")
+        raise AssetIndexConflict(
+            "portable asset identity conflicts with indexed media"
+        )
 
 
 def positive_float(value: str) -> float:
@@ -2886,18 +2920,38 @@ class ContextDB:
             if not profile_changed:
                 return False, False
             state = "needs_refresh"
-        if state == "captured" and not path_changed:
+        indexed = None
+        if state == "captured" and row["owner_kind"] == "post":
+            indexed = self.connection.execute(
+                """SELECT owner_kind,owner_id,media_ordinal,final_sha256,
+                          final_bytes FROM archive_media WHERE asset_id=?""",
+                (current["asset_id"],),
+            ).fetchone()
+        indexed_capture = bool(
+            indexed is not None
+            and indexed["owner_kind"] == current["owner_kind"]
+            and indexed["owner_id"] == current["owner_id"]
+            and int(indexed["media_ordinal"]) == int(current["media_ordinal"])
+            and indexed["final_sha256"] == current["final_sha256"]
+            and int(indexed["final_bytes"]) == int(current["final_bytes"])
+        )
+        if state == "captured" and (not path_changed or indexed_capture):
             self.connection.execute(
-                """UPDATE asset_jobs SET descriptor_id=?,
-                       destination_scope=?,transfer_priority=?,
-                       expected_relative_path=?,updated_at=?
+                """UPDATE asset_jobs SET descriptor_id=?,compatibility_job=0,
+                       destination_scope=CASE WHEN ? THEN destination_scope
+                                              ELSE ? END,
+                       transfer_priority=?,
+                       expected_relative_path=CASE WHEN ?
+                           THEN expected_relative_path ELSE ? END,updated_at=?
                      WHERE asset_id=?""",
                 (
                     descriptor_id,
+                    int(indexed_capture),
                     descriptor_destination_scope(row),
                     asset_transfer_priority(
                         row["owner_kind"], row["media_type"]
                     ),
+                    int(indexed_capture),
                     row["relative_path"],
                     now,
                     current["asset_id"],

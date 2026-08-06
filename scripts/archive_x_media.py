@@ -240,6 +240,325 @@ def verify_existing(
     )
 
 
+def _verified_indexed_evidence(
+    archive_root: Path,
+    user_dir: Path,
+    job: dict[str, Any],
+    indexed: dict[str, Any],
+    *,
+    requested_handle: str,
+) -> TransferEvidence | None:
+    """Return durable evidence for an already-indexed copy of this asset."""
+    if (
+        indexed.get("owner_kind") != job.get("owner_kind")
+        or indexed.get("owner_id") != job.get("owner_id")
+        or int(indexed.get("media_ordinal") or 0)
+        != int(job.get("media_ordinal") or 0)
+    ):
+        return None
+    media_relative = Path(str(indexed.get("media_path") or ""))
+    sidecar_relative = Path(str(indexed.get("sidecar_path") or ""))
+    if (
+        not media_relative.parts
+        or media_relative.parts[0] != "media"
+        or media_relative.is_absolute()
+        or ".." in media_relative.parts
+        or sidecar_relative.as_posix() != media_relative.as_posix() + ".json"
+    ):
+        return None
+    media_root = (user_dir / "media").resolve()
+    final_path = (user_dir / media_relative).resolve()
+    sidecar_path = (user_dir / sidecar_relative).resolve()
+    if media_root != final_path.parent and media_root not in final_path.parents:
+        return None
+    if media_root != sidecar_path.parent and media_root not in sidecar_path.parents:
+        return None
+    if not final_path.is_file() or not sidecar_path.is_file():
+        return None
+    stat_result = final_path.stat()
+    digest = str(indexed.get("final_sha256") or "")
+    byte_count = int(indexed.get("final_bytes") or 0)
+    normalized_json = str(indexed.get("normalized_json") or "")
+    if (
+        not descriptor_x.SHA256_RE.fullmatch(digest)
+        or byte_count < 1
+        or stat_result.st_size != byte_count
+        or int(indexed.get("stat_size") or -1) != byte_count
+        or hashlib.sha256(normalized_json.encode("utf-8")).hexdigest()
+        != indexed.get("normalized_sha256")
+        or archive_x.sha256_file(final_path) != digest
+    ):
+        return None
+    metadata = archive_x.load_json(sidecar_path, None)
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("sha256") != digest
+        or not _sidecar_matches_job(metadata, job)
+    ):
+        return None
+    portable_record = local_x.portable_media_record(
+        metadata,
+        user_dir=user_dir,
+        requested_handle=requested_handle,
+        asset_path=final_path,
+        sidecar_path=sidecar_path,
+    )
+    try:
+        relative_path = final_path.relative_to(archive_root.resolve()).as_posix()
+        prepared = context_x._prepare_portable_asset_record(  # noqa: SLF001
+            portable_record,
+            final_relative_path=relative_path,
+            sha256=digest,
+            byte_count=byte_count,
+            stat_result=stat_result,
+        )
+    except (ValueError, context_x.ContextError):
+        return None
+    if prepared is None or any(
+        prepared[key] != indexed[key]
+        for key in (
+            "media_path",
+            "sidecar_path",
+            "owner_kind",
+            "owner_id",
+            "media_ordinal",
+            "final_sha256",
+            "final_bytes",
+        )
+    ):
+        return None
+    return TransferEvidence(
+        relative_path=relative_path,
+        sha256=digest,
+        byte_count=byte_count,
+        stat_result=stat_result,
+        network_used=False,
+        portable_record=portable_record,
+    )
+
+
+def reconcile_indexed_assets(
+    database: context_x.ContextDB,
+    *,
+    archive_root: Path,
+    user_dir: Path,
+    account_id: str,
+    account_handle: str,
+    now: float,
+    lease_seconds: float,
+    limit: int | None = None,
+    apply: bool = True,
+) -> dict[str, Any]:
+    """Settle reopened post assets from their verified canonical archive copy."""
+    cutoff = now - lease_seconds
+    parameters: list[Any] = [cutoff]
+    limit_sql = ""
+    if limit is not None:
+        if limit < 1:
+            return {
+                "candidates": 0,
+                "reused": 0,
+                "bytes": 0,
+                "ledger_updated": 0,
+            }
+        limit_sql = " LIMIT ?"
+        parameters.append(limit)
+    rows = list(
+        database.connection.execute(
+            """SELECT a.*,d.retweet_id
+                 FROM asset_jobs a
+                 JOIN descriptor_generations d
+                   ON d.descriptor_id=a.descriptor_id AND d.state='active'
+                WHERE a.owner_kind='post'
+                  AND (a.state IN ('pending','retryable') OR
+                       (a.state='leased' AND a.lease_started_at < ?))
+                  AND EXISTS (
+                      SELECT 1 FROM archive_media m
+                       WHERE m.asset_id=a.asset_id
+                  )
+                ORDER BY a.transfer_priority,a.next_attempt_at,a.asset_id"""
+            + limit_sql,
+            parameters,
+        )
+    )
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        job = dict(row)
+        indexed_row = database.connection.execute(
+            "SELECT * FROM archive_media WHERE asset_id=?",
+            (job["asset_id"],),
+        ).fetchone()
+        if indexed_row is None:
+            continue
+        indexed = dict(indexed_row)
+        evidence = _verified_indexed_evidence(
+            archive_root,
+            user_dir,
+            job,
+            indexed,
+            requested_handle=account_handle,
+        )
+        if evidence is None:
+            continue
+        before = dict(
+            database.connection.execute(
+                "SELECT * FROM asset_jobs WHERE asset_id=?",
+                (job["asset_id"],),
+            ).fetchone()
+        )
+        candidates.append(
+            {
+                "job": before,
+                "ledger_job": job,
+                "indexed": {
+                    key: indexed[key]
+                    for key in (
+                        "media_path",
+                        "sidecar_path",
+                        "owner_kind",
+                        "owner_id",
+                        "media_ordinal",
+                        "asset_id",
+                        "normalized_sha256",
+                        "final_sha256",
+                        "final_bytes",
+                    )
+                },
+                "evidence": evidence,
+            }
+        )
+    if not candidates:
+        return {
+            "candidates": 0,
+            "reused": 0,
+            "bytes": 0,
+            "ledger_updated": 0,
+        }
+
+    backup_rows = [
+        {
+            "asset_job_before": item["job"],
+            "indexed_media": item["indexed"],
+            "verified": {
+                "relative_path": item["evidence"].relative_path,
+                "sha256": item["evidence"].sha256,
+                "bytes": item["evidence"].byte_count,
+            },
+        }
+        for item in candidates
+    ]
+    canonical = json.dumps(
+        backup_rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    candidate_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    verified_bytes = sum(
+        item["evidence"].byte_count for item in candidates
+    )
+    if not apply:
+        return {
+            "candidates": len(candidates),
+            "reused": 0,
+            "bytes": verified_bytes,
+            "ledger_updated": 0,
+            "candidate_sha256": candidate_sha256,
+        }
+    backup_path = (
+        user_dir
+        / "_state"
+        / "backups"
+        / f"indexed-media-reuse-{candidate_sha256[:12]}.json"
+    )
+    backup_payload = {
+        "schema": "gdl-x-indexed-media-reuse",
+        "schema_version": 1,
+        "created_at": context_x.iso_now(),
+        "database": str(database.path.relative_to(user_dir)),
+        "candidate_sha256": candidate_sha256,
+        "rows": backup_rows,
+    }
+    if backup_path.exists():
+        previous = archive_x.load_json(backup_path, {})
+        if (
+            previous.get("candidate_sha256") != candidate_sha256
+            or previous.get("rows") != backup_rows
+        ):
+            raise context_x.ContextError("indexed-media reuse backup changed")
+    else:
+        archive_x.atomic_write_json(backup_path, backup_payload)
+        if os.name == "posix":
+            os.chmod(backup_path, 0o600)
+
+    for item in candidates:
+        _require_download_archive(
+            user_dir, item["ledger_job"], account_id=account_id
+        )
+
+    completed_at = context_x.iso_now()
+    with context_x.transaction(database.connection):
+        for item in candidates:
+            before = item["job"]
+            current_row = database.connection.execute(
+                "SELECT * FROM asset_jobs WHERE asset_id=?",
+                (before["asset_id"],),
+            ).fetchone()
+            if current_row is None or dict(current_row) != before:
+                raise context_x.ContextError(
+                    "indexed-media reuse target changed during guarded update"
+                )
+            evidence = item["evidence"]
+            indexed = item["indexed"]
+            scope = (
+                "context"
+                if Path(str(indexed["media_path"])).parts[:2]
+                == ("media", "context")
+                else "main"
+            )
+            cursor = database.connection.execute(
+                """UPDATE asset_jobs SET state='captured',compatibility_job=0,
+                       destination_scope=?,expected_relative_path=?,
+                       final_relative_path=?,final_sha256=?,final_bytes=?,
+                       verified_device=?,verified_inode=?,verified_size=?,
+                       verified_mtime_ns=?,next_attempt_at=0,lease_token=NULL,
+                       lease_started_at=NULL,last_error_class=NULL,
+                       last_error_detail=NULL,completed_at=?,updated_at=?
+                     WHERE asset_id=?""",
+                (
+                    scope,
+                    indexed["media_path"],
+                    indexed["media_path"],
+                    evidence.sha256,
+                    evidence.byte_count,
+                    evidence.stat_result.st_dev,
+                    evidence.stat_result.st_ino,
+                    evidence.stat_result.st_size,
+                    evidence.stat_result.st_mtime_ns,
+                    completed_at,
+                    completed_at,
+                    before["asset_id"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise context_x.ContextError(
+                    "indexed-media reuse commit changed"
+                )
+            database._update_post_asset_rollup(  # noqa: SLF001
+                str(before["owner_kind"]), str(before["owner_id"])
+            )
+        database.advance_archive_generation(
+            ("context_status",), observed_at=completed_at
+        )
+    errors = database.integrity_errors()
+    if errors:
+        raise context_x.ContextError("; ".join(errors))
+    return {
+        "candidates": len(candidates),
+        "reused": len(candidates),
+        "bytes": verified_bytes,
+        "ledger_updated": len(candidates),
+        "backup": str(backup_path.relative_to(user_dir)),
+    }
+
+
 def _integer_id(value: Any) -> int:
     normalized = archive_x.id_string(value)
     return int(normalized) if normalized and normalized.isdecimal() else 0
@@ -740,6 +1059,7 @@ def run_direct_media_worker(
         "attempted": 0,
         "captured": 0,
         "existing": 0,
+        "reused_indexed": 0,
         "downloaded": 0,
         "recovered_partial": 0,
         "resumed": 0,
@@ -757,6 +1077,24 @@ def run_direct_media_worker(
                 session.trust_env = False
             with context_x.ContextDB(db_path, create=False) as database:
                 database.bind_identity(account_id, account_handle)
+                reused = reconcile_indexed_assets(
+                    database,
+                    archive_root=archive_root,
+                    user_dir=user_dir,
+                    account_id=account_id,
+                    account_handle=account_handle,
+                    now=clock(),
+                    lease_seconds=lease_seconds,
+                    limit=max_assets,
+                )
+                counts["attempted"] += int(reused["reused"])
+                counts["captured"] += int(reused["reused"])
+                counts["existing"] += int(reused["reused"])
+                counts["reused_indexed"] += int(reused["reused"])
+                counts["bytes"] += int(reused["bytes"])
+                counts["ledger_updated"] += int(reused["ledger_updated"])
+                if reused.get("backup"):
+                    counts["indexed_reuse_backup"] = reused["backup"]
                 while max_assets is None or counts["attempted"] < max_assets:
                     now = clock()
                     job = database.claim_asset(
@@ -827,6 +1165,16 @@ def run_direct_media_worker(
                             count_attempt=False,
                         )
                         raise
+                    except context_x.AssetIndexConflict:
+                        database.asset_failed(
+                            asset_id=int(job["asset_id"]),
+                            lease_token=str(job["lease_token"]),
+                            descriptor_id=int(job["descriptor_id"]),
+                            state="manual_review",
+                            error_class="indexed_asset_conflict",
+                            detail="verified media conflicts with an indexed asset path",
+                        )
+                        counts["manual_review"] += 1
                     except DirectMediaError as exc:
                         if exc.error_class == "download_ledger_write_failed":
                             counts["ledger_errors"] += 1

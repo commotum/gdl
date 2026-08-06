@@ -20,6 +20,7 @@ archive_x = importlib.import_module("archive_x")
 context_x = importlib.import_module("archive_x_context")
 descriptor_x = importlib.import_module("archive_x_descriptors")
 local_x = importlib.import_module("archive_x_local")
+progress_x = importlib.import_module("archive_x_progress")
 unified_x = importlib.import_module("archive_x_unified")
 
 
@@ -1739,6 +1740,43 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                 saved["results"][0]["phases"]["legacy"]["status"], "complete"
             )
 
+    def test_unexpected_followup_failure_finalizes_invocation_and_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            @contextmanager
+            def fake_lock(path):
+                del path
+                yield
+
+            modern = {"run_id": "modern-run", "status": "success"}
+            with mock.patch.object(
+                archive_x, "validate_cookie_file", return_value={"x.com"}
+            ), mock.patch.object(
+                archive_x, "gallery_dl_version", return_value="1.32.4"
+            ), mock.patch.object(
+                archive_x, "verify_gallery_dl_x_runner", return_value=None
+            ), mock.patch.object(
+                archive_x, "exclusive_lock", side_effect=fake_lock
+            ), mock.patch.object(
+                archive_x, "archive_user", return_value=modern
+            ), mock.patch.object(
+                unified_x,
+                "run_unified_followups",
+                side_effect=RuntimeError("injected media commit fault"),
+            ), self.assertRaisesRegex(RuntimeError, "media commit fault"):
+                archive_x.main(
+                    ["--user", "alice", "--output-root", str(root)]
+                )
+
+            invocation_path = next((root / "runs").glob("*.json"))
+            invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+            self.assertEqual(invocation["status"], "failed")
+            self.assertIn("RuntimeError: injected media commit fault", invocation["error"])
+            progress_path = next((root / "_state" / "progress").glob("*.json"))
+            snapshot = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(snapshot["status"], "failed")
+
     def test_next_start_finalizes_abandoned_root_invocation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1768,6 +1806,14 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                     "results": [],
                 },
             )
+            old_progress = root / "_state" / "progress" / "old-run.json"
+            progress_x.ProgressTracker(
+                old_progress,
+                root,
+                "old-run",
+                ["alice"],
+                "2026-07-22T11:00:00Z",
+            )
 
             finalized = archive_x.finalize_abandoned_invocations(
                 root,
@@ -1784,6 +1830,9 @@ class UnifiedOrchestrationTests(unittest.TestCase):
                 "process_ended_before_invocation_finalization",
             )
             self.assertTrue(saved["finalized_on_later_startup"])
+            self.assertEqual(
+                archive_x.load_json(old_progress, {})["status"], "interrupted"
+            )
             self.assertEqual(
                 archive_x.load_json(newer, {})["status"], "running"
             )

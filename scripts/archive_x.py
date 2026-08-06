@@ -2713,6 +2713,18 @@ def finalize_abandoned_invocations(
         invocation["updated_at"] = recovered_at
         invocation["finalized_on_later_startup"] = True
         atomic_write_json(path, invocation)
+        progress_path = (
+            archive_root / "_state" / "progress" / f"{invocation_id}.json"
+        )
+        progress_snapshot = load_json(progress_path, None)
+        if (
+            isinstance(progress_snapshot, dict)
+            and progress_snapshot.get("invocation_id") == invocation_id
+            and progress_snapshot.get("status") == "running"
+        ):
+            progress_snapshot["status"] = "interrupted"
+            progress_snapshot["updated_at"] = recovered_at
+            atomic_write_json(progress_path, progress_snapshot)
         finalized.append(invocation_id)
     return finalized
 
@@ -4072,6 +4084,18 @@ def main(argv: list[str] | None = None) -> int:
                 latest_combined or None,
                 status="failed",
                 error=str(exc),
+            )
+            raise
+        except Exception as exc:
+            # Preserve the original traceback for unexpected programming or
+            # dependency failures, but never leave the durable invocation and
+            # its --exit-when-final dashboard claiming the worker is running.
+            progress.finalize("failed")
+            invocation["progress"] = progress.snapshot()
+            checkpoint_invocation(
+                latest_combined or None,
+                status="failed",
+                error=f"{exc.__class__.__name__}: {exc}",
             )
             raise
 

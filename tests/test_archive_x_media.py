@@ -22,6 +22,7 @@ if str(SCRIPTS) not in sys.path:
 import archive_x
 import archive_x_context as context_x
 import archive_x_descriptors as descriptor_x
+import archive_x_local as local_x
 import archive_x_media as media_x
 
 
@@ -228,6 +229,41 @@ class DirectMediaTests(unittest.TestCase):
             ).fetchone()
             return dict(row)
 
+    def index_main_copy(self, post_id="100", payload=b"timeline-copy"):
+        job = self.job(post_id)
+        filename = Path(str(job["expected_relative_path"])).name
+        final = self.user_dir / "media" / "2026" / "01" / filename
+        final.parent.mkdir(parents=True, exist_ok=True)
+        final.write_bytes(payload)
+        digest = archive_x.sha256_file(final)
+        sidecar = media_x.build_sidecar(
+            job,
+            account_id="1",
+            account_handle="alice",
+            final_path=final,
+            digest=digest,
+            byte_count=len(payload),
+        )
+        archive_x.atomic_write_json(Path(str(final) + ".json"), sidecar)
+        portable = local_x.portable_media_record(
+            sidecar,
+            user_dir=self.user_dir,
+            requested_handle="alice",
+            asset_path=final,
+            sidecar_path=Path(str(final) + ".json"),
+        )
+        archive_x.atomic_write_jsonl(
+            self.user_dir / "dataset" / "media.jsonl", (portable,)
+        )
+        result = local_x.reconcile_media_index(
+            self.user_dir,
+            self.db_path,
+            requested_handle="alice",
+            disk_free=lambda _path: 10**12,
+        )
+        self.assertEqual(result["files"], 1)
+        return final
+
     def run_worker(self, **overrides):
         options = {
             "archive_root": self.root,
@@ -389,6 +425,130 @@ class DirectMediaTests(unittest.TestCase):
         self.assertEqual(result["request_telemetry"]["actual_requests"], 0)
         self.assertEqual(session.calls, [])
         self.assertEqual(self.job()["state"], "captured")
+
+    def test_context_descriptor_does_not_reopen_verified_timeline_asset(self):
+        self.add_post()
+        main_path = self.index_main_copy()
+        before = self.job()
+        self.assertEqual(before["state"], "captured")
+        self.assertEqual(before["destination_scope"], "main")
+
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            result = database.persist_descriptor_batches(
+                (batch(descriptor("100", 1)),),
+                (post("100", 1),),
+            )
+            after = dict(
+                database.connection.execute(
+                    "SELECT * FROM asset_jobs WHERE asset_id=?",
+                    (before["asset_id"],),
+                ).fetchone()
+            )
+
+        self.assertEqual(result["jobs_reopened"], 0)
+        self.assertEqual(after["state"], "captured")
+        self.assertEqual(after["destination_scope"], "main")
+        self.assertEqual(after["expected_relative_path"], before["expected_relative_path"])
+        self.assertEqual(after["final_sha256"], archive_x.sha256_file(main_path))
+
+    def test_reopened_context_job_reuses_indexed_timeline_copy_without_network(self):
+        self.add_post()
+        main_path = self.index_main_copy(payload=b"same-durable-bytes")
+        before = self.job()
+        context_relative = descriptor("100", 1)["relative_path"]
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            database.connection.execute(
+                """UPDATE asset_jobs SET state='pending',destination_scope='context',
+                       expected_relative_path=?,final_relative_path=NULL,
+                       final_sha256=NULL,final_bytes=NULL,verified_device=NULL,
+                       verified_inode=NULL,verified_size=NULL,
+                       verified_mtime_ns=NULL,completed_at=NULL
+                     WHERE asset_id=?""",
+                (context_relative, before["asset_id"]),
+            )
+
+        session = FakeSession([])
+        result = self.run_worker(
+            session=session,
+            max_assets=1,
+            clock=lambda: 100,
+        )
+
+        self.assertEqual(result["attempted"], 1)
+        self.assertEqual(result["captured"], 1)
+        self.assertEqual(result["existing"], 1)
+        self.assertEqual(result["reused_indexed"], 1)
+        self.assertEqual(result["request_telemetry"]["actual_requests"], 0)
+        self.assertEqual(session.calls, [])
+        repaired = self.job()
+        self.assertEqual(repaired["state"], "captured")
+        self.assertEqual(repaired["destination_scope"], "main")
+        self.assertEqual(
+            repaired["expected_relative_path"],
+            main_path.relative_to(self.user_dir).as_posix(),
+        )
+        backup = self.user_dir / str(result["indexed_reuse_backup"])
+        self.assertTrue(backup.is_file())
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            self.assertEqual(database.integrity_errors(), [])
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM archive_media WHERE asset_id=?",
+                    (before["asset_id"],),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_unverified_index_collision_becomes_manual_review_not_process_crash(self):
+        self.add_post()
+        main_path = self.index_main_copy(payload=b"canonical")
+        before = self.job()
+        Path(str(main_path) + ".json").unlink()
+        replacement = (
+            self.user_dir
+            / "media"
+            / "context"
+            / "2026"
+            / "01"
+            / main_path.name
+        )
+        replacement.parent.mkdir(parents=True, exist_ok=True)
+        replacement.write_bytes(b"different")
+        replacement_digest = archive_x.sha256_file(replacement)
+        replacement_sidecar = media_x.build_sidecar(
+            before,
+            account_id="1",
+            account_handle="alice",
+            final_path=replacement,
+            digest=replacement_digest,
+            byte_count=replacement.stat().st_size,
+        )
+        archive_x.atomic_write_json(
+            Path(str(replacement) + ".json"), replacement_sidecar
+        )
+        replacement_relative = replacement.relative_to(self.root).as_posix()
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            database.connection.execute(
+                """UPDATE asset_jobs SET state='pending',destination_scope='context',
+                       expected_relative_path=?,final_relative_path=NULL,
+                       final_sha256=NULL,final_bytes=NULL,verified_device=NULL,
+                       verified_inode=NULL,verified_size=NULL,
+                       verified_mtime_ns=NULL,completed_at=NULL
+                     WHERE asset_id=?""",
+                (replacement_relative, before["asset_id"]),
+            )
+
+        result = self.run_worker(session=FakeSession([]), max_assets=1)
+
+        self.assertEqual(result["manual_review"], 1)
+        self.assertEqual(self.job()["state"], "manual_review")
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            indexed = database.connection.execute(
+                "SELECT media_path,final_sha256 FROM archive_media WHERE asset_id=?",
+                (before["asset_id"],),
+            ).fetchone()
+        self.assertEqual(indexed["media_path"], main_path.relative_to(self.user_dir).as_posix())
+        self.assertEqual(indexed["final_sha256"], archive_x.sha256_file(main_path))
 
     def test_allowed_redirect_is_counted_and_external_redirect_is_not_followed(self):
         self.add_post()
