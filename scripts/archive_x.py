@@ -24,7 +24,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1363,6 +1363,8 @@ def run_gallery_dl(
     stalled_rate_limit_cycles: int = 0,
     runner: Any | None = None,
     control_lease_token: str | None = None,
+    checkpoint_callback: Callable[[str], None] | None = None,
+    planned_path_output: bool = False,
 ) -> tuple[
     int,
     str | None,
@@ -1384,12 +1386,23 @@ def run_gallery_dl(
         progress_path, stalled_rate_limit_cycles
     )
 
+    def display(line: str) -> None:
+        stripped = line.lstrip()
+        if planned_path_output and (
+            stripped.startswith("/") or stripped.startswith("# /")
+        ):
+            indentation = line[: len(line) - len(stripped)]
+            line = f"{indentation}planned output: {stripped}"
+        print(f"[{prefix}] {line}", end="")
+
     def observe(line: str) -> None:
         nonlocal resume_cursor, checkpoint_cursor, other_error_count
         if match := CURSOR_RE.search(line):
             resume_cursor = match.group(1).strip()
         elif match := CHECKPOINT_CURSOR_RE.search(line):
             checkpoint_cursor = match.group(1).strip()
+            if checkpoint_callback is not None:
+                checkpoint_callback(checkpoint_cursor)
         failure = download_failure_from_line(line)
         if failure:
             failed_downloads.append(failure)
@@ -1421,7 +1434,7 @@ def run_gallery_dl(
 
     def record_remainder(remainder: str) -> None:
         for line in remainder.splitlines(keepends=True):
-            print(f"[{prefix}] {line}", end="")
+            display(line)
             log.write(line)
             observe(line)
 
@@ -1437,7 +1450,7 @@ def run_gallery_dl(
 
             def controlled_output(line: str) -> None:
                 nonlocal stalled
-                print(f"[{prefix}] {line}", end="")
+                display(line)
                 log.write(line)
                 log.flush()
                 observe(line)
@@ -1498,7 +1511,7 @@ def run_gallery_dl(
             assert process.stdout is not None
             try:
                 for line in process.stdout:
-                    print(f"[{prefix}] {line}", end="")
+                    display(line)
                     log.write(line)
                     log.flush()
                     observe(line)
@@ -1736,6 +1749,7 @@ def archive_endpoint(
     download_media: bool | None = None,
     scheduler_options: Any | None = None,
     runner: Any | None = None,
+    timeline_checkpoint_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     raw_partial = run_dir / "raw" / f"{endpoint}.posts.jsonl.partial"
     descriptor_partial = (
@@ -1831,6 +1845,10 @@ def archive_endpoint(
             else 0
         ),
         runner=runner,
+        checkpoint_callback=(
+            timeline_checkpoint_callback if endpoint == "timeline" else None
+        ),
+        planned_path_output=(endpoint == "timeline" and not should_download_media),
     )
     synthetic_cursor = False
     if stalled:
@@ -2917,6 +2935,7 @@ def archive_user(
     # state queue, or indexed archive truth may change until the live info
     # response proves this handle still belongs to the bound numeric account.
     finalized_abandoned_runs: list[str] = []
+    recovered_streaming_runs: list[dict[str, Any]] = []
     recovered_stalled_runs: list[str] = []
     recovered_runs: list[str] = []
     newly_unavailable_media = 0
@@ -2950,6 +2969,7 @@ def archive_user(
         "limited_run": bool(timeline_post_limit),
         "retry_failed_only": bool(args.retry_failed_only),
         "finalized_abandoned_runs": finalized_abandoned_runs,
+        "recovered_streaming_runs": [],
         "recovered_stalled_runs": recovered_stalled_runs,
         "recovered_download_only_runs": recovered_runs,
         "newly_unavailable_media": newly_unavailable_media,
@@ -3050,6 +3070,53 @@ def archive_user(
             recovered_at=iso_utc(started),
             manifest_paths=recovery_manifests,
         )
+        recovered_streaming_runs = (
+            local_module.recover_abandoned_streaming_sources(
+                user_dir,
+                context_db_path,
+                requested_handle=canonical_handle or handle,
+                target_user_id=observed_user_id,
+                max_depth=1000,
+            )
+        )
+        for recovered_stream in recovered_streaming_runs:
+            checkpoint = str(
+                recovered_stream.get("checkpoint_cursor") or ""
+            )
+            prior_run_id = str(recovered_stream.get("run_id") or "")
+            prior_manifest = load_json(
+                user_dir / "runs" / prior_run_id / "manifest.json", {}
+            )
+            if (
+                not checkpoint
+                or recovered_stream.get("status") != "recovered"
+                or not isinstance(prior_manifest, dict)
+                or prior_manifest.get("limited_run")
+                or (
+                    prior_manifest.get("timeline_mode") == "modern_head"
+                ) != modern_head_mode
+            ):
+                continue
+            try:
+                prior_date_after = (
+                    parse_datetime(str(prior_manifest["date_after"]))
+                    if prior_manifest.get("date_after") else None
+                )
+            except argparse.ArgumentTypeError:
+                prior_date_after = None
+            update_timeline_state(
+                state,
+                limited_run=False,
+                metadata_complete=False,
+                resume_cursor=checkpoint,
+                handle=handle,
+                chain_started_at=str(
+                    prior_manifest.get("started_at") or iso_utc(started)
+                ),
+                date_after=prior_date_after,
+                observed_at=iso_utc(started),
+                modern_head_mode=modern_head_mode,
+            )
         recovered_stalled_runs = recover_stalled_interrupted_runs(
             state,
             user_dir,
@@ -3085,6 +3152,14 @@ def archive_user(
     manifest.update(
         {
             "finalized_abandoned_runs": finalized_abandoned_runs,
+            "recovered_streaming_runs": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != "checkpoint_cursor"
+                }
+                for item in recovered_streaming_runs
+            ],
             "recovered_stalled_runs": recovered_stalled_runs,
             "recovered_download_only_runs": recovered_runs,
             "newly_unavailable_media": newly_unavailable_media,
@@ -3099,6 +3174,16 @@ def archive_user(
         print(
             f"Finalized abandoned run manifest(s) for @{handle}: "
             f"{', '.join(finalized_abandoned_runs)}"
+        )
+    recovered_stream_ids = [
+        str(item.get("run_id"))
+        for item in recovered_streaming_runs
+        if item.get("status") == "recovered"
+    ]
+    if recovered_stream_ids:
+        print(
+            f"Recovered incrementally indexed timeline source(s) for @{handle}: "
+            f"{', '.join(recovered_stream_ids)}"
         )
     if recovered_stalled_runs:
         print(
@@ -3311,6 +3396,94 @@ def archive_user(
     manifest["timeline_stall_watchdog"] = transition_watchdog
     atomic_write_json(manifest_path, manifest)
 
+    timeline_partial = run_dir / "raw" / "timeline.posts.jsonl.partial"
+    timeline_ledger_relative = str(timeline_partial.relative_to(user_dir))
+    timeline_stream_spec = local_module.SourceSpec(
+        path=timeline_partial,
+        source_kind="modern",
+        run_id=current_run_id,
+        operation_id=f"{current_run_id}:timeline",
+        endpoint="timeline",
+    )
+    timeline_stream: dict[str, Any] = {
+        "status": "waiting_for_checkpoint",
+        "checkpoints": 0,
+        "bytes_indexed": 0,
+        "records_indexed": 0,
+        "new_posts": 0,
+        "updated_posts": 0,
+        "cursor_publication_error": None,
+        "error_class": None,
+    }
+
+    def commit_timeline_checkpoint(checkpoint: str) -> None:
+        if timeline_stream["error_class"] is not None:
+            return
+        try:
+            committed = local_module.ingest_streaming_source(
+                user_dir,
+                context_db_path,
+                requested_handle=canonical_handle or handle,
+                target_user_id=observed_user_id,
+                spec=timeline_stream_spec,
+                checkpoint_cursor=checkpoint,
+                max_depth=1000,
+            )
+        except (ArchiveError, OSError, sqlite3.Error) as exc:
+            timeline_stream["status"] = "degraded_to_final_ingest"
+            timeline_stream["error_class"] = exc.__class__.__name__
+            print(
+                "Live timeline indexing paused; raw capture remains active "
+                f"({exc.__class__.__name__})."
+            )
+            return
+        timeline_stream["status"] = "streaming"
+        timeline_stream["checkpoints"] += int(
+            committed.get("checkpoint_committed", False)
+        )
+        timeline_stream["bytes_indexed"] += int(
+            committed.get("bytes_read") or 0
+        )
+        timeline_stream["records_indexed"] += int(
+            committed.get("raw_records") or 0
+        )
+        timeline_stream["new_posts"] += int(
+            committed.get("new_posts") or 0
+        )
+        timeline_stream["updated_posts"] += int(
+            committed.get("updated_posts") or 0
+        )
+        timeline_stream["committed_bytes"] = int(
+            committed.get("committed_bytes") or 0
+        )
+        timeline_stream["frontier_post_id"] = committed.get(
+            "frontier_post_id"
+        )
+        timeline_stream["frontier_posted_at"] = committed.get(
+            "frontier_posted_at"
+        )
+        if not committed.get("checkpoint_committed"):
+            return
+        # SQLite is authoritative and commits first.  Publishing the cursor
+        # second means a crash can only replay an older page, never skip rows.
+        try:
+            update_timeline_state(
+                state,
+                limited_run=bool(timeline_post_limit),
+                metadata_complete=False,
+                resume_cursor=checkpoint,
+                handle=handle,
+                chain_started_at=chain_started_at,
+                date_after=date_after,
+                observed_at=iso_utc(utc_now()),
+                modern_head_mode=modern_head_mode,
+            )
+            atomic_write_json(state_path, state)
+        except (ArchiveError, OSError) as exc:
+            timeline_stream["cursor_publication_error"] = (
+                exc.__class__.__name__
+            )
+
     timeline_result = archive_endpoint(
         args=args,
         repo_dir=repo_dir,
@@ -3325,7 +3498,9 @@ def archive_user(
         cursor=cursor,
         stalled_rate_limit_cycles=transition_watchdog["cycles"],
         scheduler_options=timeline_scheduler,
+        timeline_checkpoint_callback=commit_timeline_checkpoint,
     )
+    timeline_result["incremental_indexing"] = dict(timeline_stream)
     manifest["endpoints"].append(timeline_result)
     atomic_write_json(manifest_path, manifest)
     timeline_raw = user_dir / timeline_result["raw_path"]
@@ -3356,7 +3531,7 @@ def archive_user(
     except (descriptor_x.DescriptorError, OSError) as exc:
         timeline_descriptor_error = exc.__class__.__name__
     try:
-        manifest["post_dataset"] = local_module.ingest_source_once(
+        manifest["post_dataset"] = local_module.finalize_streaming_source(
             user_dir,
             context_db_path,
             requested_handle=canonical_handle or handle,
@@ -3368,6 +3543,9 @@ def archive_user(
                 operation_id=f"{current_run_id}:timeline",
                 endpoint="timeline",
             ),
+            ledger_relative_path=timeline_ledger_relative,
+            timeline_complete=timeline_complete,
+            checkpoint_cursor=timeline_result.get("resume_cursor"),
             max_depth=1000,
             descriptor_batches=timeline_batches,
         )
@@ -3376,6 +3554,16 @@ def archive_user(
             descriptor_x.discard_ephemeral_artifact(batch)
     timeline_result["descriptor_commit"] = dict(
         manifest["post_dataset"].get("descriptor_commit") or {}
+    )
+    timeline_result["incremental_indexing"].update(
+        {
+            "status": "committed",
+            "timeline_complete": timeline_complete,
+            "committed_bytes": int(timeline_raw.stat().st_size),
+            "records_indexed": int(
+                manifest["post_dataset"].get("raw_records") or 0
+            ),
+        }
     )
     if timeline_descriptor_error:
         timeline_result["descriptor_commit"]["artifact_load_errors"] = 1

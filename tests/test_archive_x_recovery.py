@@ -706,6 +706,23 @@ class StallRecoveryTests(unittest.TestCase):
         self.assertEqual(result[0], 0)
         self.assertIsNone(result[1])
 
+    def test_verified_checkpoint_is_delivered_to_live_indexer(self):
+        child = (
+            "print('[twitter][info] Archive checkpoint cursor=3_100/'); "
+            "print('[twitter][info] Archive checkpoint cursor=3_50/')"
+        )
+        observed = []
+        with tempfile.TemporaryDirectory() as directory:
+            result = archive_x.run_gallery_dl(
+                [sys.executable, "-c", child],
+                Path(directory) / "timeline.log",
+                "test:timeline",
+                checkpoint_callback=observed.append,
+            )
+
+        self.assertEqual(result[0], 0)
+        self.assertEqual(observed, ["3_100/", "3_50/"])
+
     def test_api_failure_prefers_advanced_checkpoint_over_stale_cursor(self):
         child = (
             "import sys; "

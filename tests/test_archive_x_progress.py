@@ -145,6 +145,32 @@ class ProgressSignalsTests(unittest.TestCase):
         self.assertEqual(result["archive_media_files"], 5)
         self.assertEqual(result["archive_media_bytes"], 900)
 
+    def test_live_timeline_stream_metrics_expose_frontier_without_cursor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE archive_sources(
+                  source_id INTEGER PRIMARY KEY,record_count INTEGER,
+                  committed_bytes INTEGER,timeline_complete INTEGER,
+                  frontier_post_id TEXT,frontier_posted_at TEXT,
+                  processed_at TEXT,status TEXT);
+                INSERT INTO archive_sources VALUES(
+                  1,1234,567890,0,'100','2020-09-02 04:09:54',
+                  '2026-08-15T21:54:00Z','ingesting');
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            result = progress.collect_timeline_stream_metrics(path)
+
+        self.assertEqual(result["record_count"], 1234)
+        self.assertEqual(result["committed_bytes"], 567890)
+        self.assertEqual(result["frontier_posted_at"], "2020-09-02 04:09:54")
+        self.assertNotIn("checkpoint_cursor", result)
+
     def test_export_generations_are_live_constant_size_dashboard_truth(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "context.sqlite3"
@@ -569,6 +595,38 @@ class ProgressSignalsTests(unittest.TestCase):
             export_output,
         )
         self.assertIn("Phase 7/7: Context export", export_output)
+
+    def test_modern_card_uses_account_elapsed_and_live_index_rate(self):
+        totals = progress.empty_totals()
+        totals["archive_posts"] = 3600
+        user = {
+            "handle": "alice", "phase": "modern", "health": "healthy",
+            "activity": "indexing authored timeline through 2020-09-02",
+            "last_progress_at": "1970-01-01T01:59:55Z",
+            "started_at": "1970-01-01T01:00:00Z", "wait_until": None,
+            "phases": {"modern": "running"}, "totals": totals,
+            "baseline": progress.empty_totals(), "delta": dict(totals),
+            "samples": [], "rate": None,
+            "estimate": {
+                "seconds": None, "label": None, "confidence": "none",
+                "qualifier": "collecting samples", "known_remaining": 0,
+            },
+            "action_required": 0,
+        }
+        output = dashboard.render({
+            "schema": progress.SCHEMA, "schema_version": 1,
+            "invocation_id": "run",
+            "started_at": "1970-01-01T00:00:00Z",
+            "updated_at": "1970-01-01T02:00:00Z", "status": "running",
+            "users": [user],
+        }, width=120, now=7200, unicode=False)
+
+        self.assertIn("1h 0m elapsed", output.splitlines()[0])
+        self.assertNotIn("2h 0m elapsed", output.splitlines()[0])
+        self.assertIn(
+            "This run   +3,600 posts | 3,600 posts/hour | indexed durably",
+            output,
+        )
 
     def test_metadata_card_explains_zero_success_instead_of_warming_forever(self):
         totals = progress.empty_totals()

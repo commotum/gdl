@@ -212,6 +212,188 @@ class LocalStateTests(unittest.TestCase):
         replayed = self.ingest(path)
         self.assertEqual(replayed["new_posts"], 2)
 
+    def test_live_timeline_prefix_is_queryable_before_completion(self):
+        partial = self.run_dir / "timeline.posts.jsonl.partial"
+        first = json.dumps(metadata("100"), sort_keys=True) + "\n"
+        second = json.dumps(metadata("101", reply_id="100"), sort_keys=True)
+        partial.write_bytes((first + second).encode("utf-8"))
+        spec = self.spec(partial)
+
+        indexed = local_x.ingest_streaming_source(
+            self.user_dir,
+            self.db_path,
+            requested_handle="alice",
+            target_user_id="1",
+            spec=spec,
+            checkpoint_cursor="3_100/",
+        )
+
+        self.assertEqual(indexed["raw_records"], 1)
+        self.assertFalse(indexed["checkpoint_committed"])
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM archive_posts"
+                ).fetchone()[0],
+                1,
+            )
+            source = database.connection.execute(
+                "SELECT * FROM archive_sources WHERE timeline_complete=0"
+            ).fetchone()
+            self.assertEqual(source["status"], "ingesting")
+            self.assertEqual(source["committed_bytes"], len(first.encode("utf-8")))
+            self.assertIsNone(source["checkpoint_cursor"])
+
+        with partial.open("ab") as stream:
+            stream.write(b"\n")
+        checkpointed = local_x.ingest_streaming_source(
+            self.user_dir,
+            self.db_path,
+            requested_handle="alice",
+            target_user_id="1",
+            spec=spec,
+            checkpoint_cursor="3_100/",
+        )
+        self.assertTrue(checkpointed["checkpoint_committed"])
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            source = database.connection.execute(
+                "SELECT * FROM archive_sources WHERE timeline_complete=0"
+            ).fetchone()
+            self.assertEqual(source["record_count"], 2)
+            self.assertEqual(source["checkpoint_cursor"], "3_100/")
+
+    def test_live_timeline_finalization_promotes_without_replaying_rows(self):
+        partial = self.run_dir / "timeline.posts.jsonl.partial"
+        archive_x.atomic_write_jsonl(
+            partial, [metadata("100"), metadata("101", reply_id="100")]
+        )
+        indexed = local_x.ingest_streaming_source(
+            self.user_dir,
+            self.db_path,
+            requested_handle="alice",
+            target_user_id="1",
+            spec=self.spec(partial),
+            checkpoint_cursor="3_100/",
+        )
+        self.assertEqual(indexed["new_posts"], 2)
+        ledger_relative = str(partial.relative_to(self.user_dir))
+        final = partial.with_name("timeline.posts.jsonl")
+        partial.rename(final)
+
+        finalized = local_x.finalize_streaming_source(
+            self.user_dir,
+            self.db_path,
+            requested_handle="alice",
+            target_user_id="1",
+            spec=self.spec(final),
+            ledger_relative_path=ledger_relative,
+            timeline_complete=True,
+            checkpoint_cursor=None,
+        )
+
+        self.assertEqual(finalized["status"], "committed")
+        self.assertTrue(finalized["timeline_complete"])
+        self.assertEqual(finalized["raw_records"], 2)
+        self.assertEqual(finalized["dataset_posts"], 2)
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            source = database.connection.execute(
+                "SELECT * FROM archive_sources WHERE timeline_complete=1"
+            ).fetchone()
+            self.assertEqual(source["relative_path"], str(final.relative_to(self.user_dir)))
+            self.assertEqual(source["status"], "committed")
+            self.assertEqual(source["committed_bytes"], final.stat().st_size)
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT MAX(capture_count) FROM archive_posts"
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_live_timeline_deduplicates_a_post_repeated_across_checkpoints(self):
+        partial = self.run_dir / "timeline.posts.jsonl.partial"
+        archive_x.atomic_write_jsonl(partial, [metadata("100")])
+        spec = self.spec(partial)
+        local_x.ingest_streaming_source(
+            self.user_dir,
+            self.db_path,
+            requested_handle="alice",
+            target_user_id="1",
+            spec=spec,
+            checkpoint_cursor="3_100/",
+        )
+        repeated = metadata("100")
+        repeated["favorite_count"] = 10
+        with partial.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(repeated, sort_keys=True) + "\n")
+
+        indexed = local_x.ingest_streaming_source(
+            self.user_dir,
+            self.db_path,
+            requested_handle="alice",
+            target_user_id="1",
+            spec=spec,
+            checkpoint_cursor="3_99/",
+        )
+
+        self.assertTrue(indexed["checkpoint_committed"])
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            source = database.connection.execute(
+                "SELECT record_count FROM archive_sources"
+            ).fetchone()
+            post = database.connection.execute(
+                "SELECT normalized_json FROM archive_posts WHERE post_id='100'"
+            ).fetchone()
+            self.assertEqual(source["record_count"], 2)
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM post_provenance"
+                ).fetchone()[0],
+                1,
+            )
+            normalized = json.loads(post["normalized_json"])
+            self.assertEqual(normalized["capture_count"], 1)
+            self.assertEqual(normalized["metrics"]["likes"], 10)
+
+    def test_hard_exit_recovery_indexes_tail_and_promotes_partial_source(self):
+        partial = self.run_dir / "timeline.posts.jsonl.partial"
+        archive_x.atomic_write_jsonl(partial, [metadata("100")])
+        local_x.ingest_streaming_source(
+            self.user_dir,
+            self.db_path,
+            requested_handle="alice",
+            target_user_id="1",
+            spec=self.spec(partial),
+            checkpoint_cursor="3_100/",
+        )
+        with partial.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(metadata("101"), sort_keys=True) + "\n")
+
+        recovered = local_x.recover_abandoned_streaming_sources(
+            self.user_dir,
+            self.db_path,
+            requested_handle="alice",
+            target_user_id="1",
+        )
+
+        self.assertEqual(recovered[0]["status"], "recovered")
+        self.assertEqual(recovered[0]["checkpoint_cursor"], "3_100/")
+        final = self.run_dir / "timeline.posts.incomplete.jsonl"
+        self.assertTrue(final.is_file())
+        self.assertFalse(partial.exists())
+        with context_x.ContextDB(self.db_path, create=False) as database:
+            source = database.connection.execute(
+                "SELECT * FROM archive_sources WHERE timeline_complete=0"
+            ).fetchone()
+            self.assertEqual(source["status"], "committed")
+            self.assertEqual(source["relative_path"], str(final.relative_to(self.user_dir)))
+            self.assertEqual(source["record_count"], 2)
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM archive_posts"
+                ).fetchone()[0],
+                2,
+            )
+
     def test_committed_source_rejects_provenance_alias(self):
         path = self.source([metadata("100")])
         self.ingest(path)

@@ -54,7 +54,7 @@ ALLOWED_TOP = {
 ALLOWED_USER = {
     "handle", "phase", "health", "activity", "last_progress_at", "wait_until",
     "phases", "totals", "baseline", "delta", "samples", "rate", "estimate",
-    "action_required", "legacy",
+    "action_required", "legacy", "started_at",
 }
 ALLOWED_TOTALS = {
     "archive_posts", "archive_media_files", "archive_media_bytes",
@@ -534,7 +534,12 @@ def collect_archive_metrics(
                 "SELECT 1 FROM current_pointers "
                 "WHERE pointer_name='local_history_reconciled'"
             ).fetchone()
-            if counters is not None and ready is not None:
+            live_timeline = connection.execute(
+                """SELECT 1 FROM archive_sources
+                     WHERE timeline_complete IS NOT NULL
+                       AND status='ingesting' LIMIT 1"""
+            ).fetchone()
+            if counters is not None and (ready is not None or live_timeline is not None):
                 indexed = {
                     "archive_posts": counters.get("archive_posts_total", 0),
                     "archive_media_files": counters.get("archive_media_files", 0),
@@ -597,6 +602,34 @@ def collect_archive_metrics(
         "archive_posts": maximum(datasets, DATASET_COUNT_KEYS),
         "archive_media_files": maximum(media_sets, MEDIA_FILE_KEYS),
         "archive_media_bytes": maximum(media_sets, MEDIA_BYTE_KEYS),
+    }
+
+
+def collect_timeline_stream_metrics(db_path: Path) -> dict[str, Any] | None:
+    """Return constant-size live timeline prefix state, never a cursor."""
+    connection = _open_context(db_path)
+    try:
+        row = connection.execute(
+            """SELECT record_count,committed_bytes,timeline_complete,
+                      frontier_post_id,frontier_posted_at,processed_at,status
+                 FROM archive_sources
+                WHERE timeline_complete IS NOT NULL
+                ORDER BY (status='ingesting') DESC,source_id DESC LIMIT 1"""
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    if row is None:
+        return None
+    return {
+        "record_count": int(row["record_count"] or 0),
+        "committed_bytes": int(row["committed_bytes"] or 0),
+        "timeline_complete": bool(row["timeline_complete"]),
+        "frontier_post_id": str(row["frontier_post_id"] or "") or None,
+        "frontier_posted_at": str(row["frontier_posted_at"] or "") or None,
+        "updated_at": str(row["processed_at"] or "") or None,
+        "status": str(row["status"]),
     }
 
 
@@ -1157,6 +1190,26 @@ class LiveProgressReader:
                 totals.update(collect_export_metrics(db_path))
                 totals.update(collect_context_fast_metrics(db_path))
                 context_activity = self._context_activity(db_path)
+                if str(source.get("phase")) == "modern":
+                    timeline = collect_timeline_stream_metrics(db_path)
+                    if timeline is not None:
+                        frontier = str(timeline.get("frontier_posted_at") or "")
+                        if frontier:
+                            source = copy.deepcopy(source)
+                            source["activity"] = (
+                                "indexing authored timeline through "
+                                f"{frontier[:10]}"
+                            )
+                        stream_activity = timeline.get("updated_at")
+                        if (
+                            parse_time(stream_activity) is not None
+                            and (
+                                parse_time(context_activity) is None
+                                or parse_time(stream_activity)
+                                > parse_time(context_activity)
+                            )
+                        ):
+                            context_activity = str(stream_activity)
                 if handle not in self._closure:
                     self._closure[handle] = {
                         key: int(source["totals"].get(key) or 0)
@@ -1359,6 +1412,8 @@ class ProgressTracker:
         user = self.users[handle]
         if active:
             self.active_handle = handle
+            if not user.get("started_at"):
+                user["started_at"] = utc_now()
         previous_phase = user["phase"]
         if phase:
             user["phase"] = phase

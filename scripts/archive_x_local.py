@@ -23,6 +23,7 @@ import archive_x_descriptors as descriptor_x
 EXPORT_SCHEMA = "gdl-x-portable-export"
 EXPORT_SCHEMA_VERSION = 1
 SOURCE_BATCH_SIZE = 1_000
+STREAM_MAX_LINE_BYTES = 16 * 1024 * 1024
 LOCAL_MIN_HEADROOM = 512 * 1024 * 1024
 EXPORT_MIN_HEADROOM = 256 * 1024 * 1024
 EXPORT_VIEW_FILES = {
@@ -433,6 +434,771 @@ def _stream_source_to_stage(
     }
 
 
+def _streaming_source_row(
+    database: context_x.ContextDB,
+    *,
+    spec: SourceSpec,
+    ledger_relative_path: str | None = None,
+) -> sqlite3.Row | None:
+    if ledger_relative_path is not None:
+        return database.connection.execute(
+            "SELECT * FROM archive_sources WHERE relative_path=?",
+            (ledger_relative_path,),
+        ).fetchone()
+    return database.connection.execute(
+        """SELECT * FROM archive_sources
+             WHERE run_id=? AND operation_id=? AND source_kind=?
+               AND timeline_complete IS NOT NULL
+             ORDER BY source_id DESC LIMIT 1""",
+        (spec.run_id, spec.operation_id, spec.source_kind),
+    ).fetchone()
+
+
+def _register_streaming_source(
+    database: context_x.ContextDB,
+    *,
+    user_dir: Path,
+    spec: SourceSpec,
+    stat: os.stat_result,
+    observed_at: str,
+    ledger_relative_path: str | None = None,
+) -> sqlite3.Row:
+    actual_relative = _safe_relative(user_dir, spec.path, parent="runs")
+    relative = ledger_relative_path or actual_relative
+    if Path(relative).is_absolute() or ".." in Path(relative).parts:
+        raise LocalStateError("streaming source ledger path is invalid")
+    row = _streaming_source_row(
+        database, spec=spec, ledger_relative_path=ledger_relative_path
+    )
+    if row is None:
+        with context_x.transaction(database.connection):
+            database.connection.execute(
+                """INSERT INTO archive_sources(
+                       relative_path,source_kind,run_id,operation_id,
+                       stat_device,stat_inode,stat_size,stat_mtime_ns,status,
+                       ingest_generation,registered_at,processed_at,
+                       record_count,edge_count,committed_bytes,
+                       timeline_complete
+                   ) VALUES (?,?,?,?,?,?,?,?,'ingesting',0,?,?,0,0,0,0)""",
+                (
+                    relative,
+                    spec.source_kind,
+                    spec.run_id,
+                    spec.operation_id,
+                    int(stat.st_dev),
+                    int(stat.st_ino),
+                    int(stat.st_size),
+                    int(stat.st_mtime_ns),
+                    observed_at,
+                    observed_at,
+                ),
+            )
+        row = _streaming_source_row(database, spec=spec)
+    if row is None:
+        raise LocalStateError("streaming source registration failed")
+    if (
+        row["source_kind"] != spec.source_kind
+        or row["run_id"] != spec.run_id
+        or row["operation_id"] != spec.operation_id
+    ):
+        raise LocalStateError("streaming source provenance changed")
+    if row["timeline_complete"] is None:
+        raise LocalStateError("streaming source completion state is absent")
+    if row["status"] not in {"ingesting", "committed"}:
+        raise LocalStateError("streaming source is not writable")
+    previous_device = row["stat_device"]
+    previous_inode = row["stat_inode"]
+    if previous_device is not None and int(previous_device) != int(stat.st_dev):
+        raise LocalStateError("streaming source device changed")
+    if previous_inode is not None and int(previous_inode) != int(stat.st_ino):
+        raise LocalStateError("streaming source inode changed")
+    if int(row["committed_bytes"] or 0) > int(stat.st_size):
+        raise LocalStateError("streaming source was truncated")
+    return row
+
+
+def _stage_streaming_prefix(
+    database: context_x.ContextDB,
+    *,
+    spec: SourceSpec,
+    requested_handle: str,
+    target_user_id: str,
+    start_offset: int,
+    snapshot_size: int,
+    starting_record: int,
+) -> dict[str, Any]:
+    _prepare_stage(database)
+    raw_count = 0
+    normalized_count = 0
+    committed_bytes = start_offset
+    frontier_post_id: str | None = None
+    frontier_posted_at: str | None = None
+    staged: list[tuple[Any, ...]] = []
+    try:
+        with spec.path.open("rb") as stream:
+            stream.seek(start_offset)
+            while stream.tell() < snapshot_size:
+                raw_line = stream.readline(STREAM_MAX_LINE_BYTES + 1)
+                if not raw_line:
+                    break
+                end_offset = stream.tell()
+                if len(raw_line) > STREAM_MAX_LINE_BYTES:
+                    raise LocalStateError("streaming source record is too large")
+                if end_offset > snapshot_size or not raw_line.endswith(b"\n"):
+                    break
+                committed_bytes = end_offset
+                if not raw_line.strip():
+                    continue
+                raw_count += 1
+                line_number = starting_record + raw_count
+                try:
+                    metadata = json.loads(raw_line.decode("utf-8", errors="strict"))
+                except (UnicodeError, json.JSONDecodeError) as exc:
+                    raise LocalStateError(
+                        "streaming source contains invalid JSON at line "
+                        f"{line_number}"
+                    ) from exc
+                if not isinstance(metadata, dict):
+                    raise LocalStateError("streaming source record is not an object")
+                normalized = archive_x.normalize_post(
+                    metadata, requested_handle, spec.endpoint
+                )
+                if normalized is None:
+                    raise LocalStateError("streaming source record has no post ID")
+                post_id = str(normalized["post_id"])
+                relationship = str(normalized.get("relationship") or "")
+                if (
+                    relationship not in {"post", "reply", "repost"}
+                    or str(normalized.get("requested_user_id") or "")
+                    != target_user_id
+                ):
+                    raise LocalStateError(
+                        "streaming source record failed numeric archive scope"
+                    )
+                raw_json = _canonical_json(metadata)
+                normalized_json = _canonical_json(normalized)
+                richness = archive_x.record_richness(normalized)
+                staged.append(
+                    (
+                        post_id,
+                        normalized_json,
+                        _sha256(normalized_json.encode("utf-8")),
+                        raw_json,
+                        _sha256(raw_json.encode("utf-8")),
+                        str(metadata.get("archived_at") or context_x.iso_now()),
+                        archive_x.id_string((metadata.get("author") or {}).get("id")),
+                        relationship,
+                        archive_x.id_string(metadata.get("reply_id")),
+                        archive_x.id_string(metadata.get("conversation_id")),
+                        int(richness[0]),
+                        int(richness[1]),
+                    )
+                )
+                normalized_count += 1
+                frontier_post_id = post_id
+                posted_at = metadata.get("date")
+                frontier_posted_at = str(posted_at) if posted_at else None
+                if len(staged) >= SOURCE_BATCH_SIZE:
+                    _stage_batch(database, staged)
+                    staged.clear()
+    except OSError as exc:
+        raise LocalStateError("streaming source could not be read") from exc
+    _stage_batch(database, staged)
+    return {
+        "bytes_read": committed_bytes - start_offset,
+        "committed_bytes": committed_bytes,
+        "raw_records": raw_count,
+        "normalized_records": normalized_count,
+        "unique_posts": int(
+            database.connection.execute(
+                "SELECT COUNT(*) FROM goal5_source_stage"
+            ).fetchone()[0]
+        ),
+        "frontier_post_id": frontier_post_id,
+        "frontier_posted_at": frontier_posted_at,
+    }
+
+
+def _merge_streaming_stage(
+    database: context_x.ContextDB,
+    *,
+    source_id: int,
+    spec: SourceSpec,
+    relative_path: str,
+    target_user_id: str,
+    max_depth: int,
+    streamed: dict[str, Any],
+    observed_at: str,
+    previous_offset: int,
+    stat: os.stat_result,
+    checkpoint_cursor: str | None,
+) -> dict[str, Any]:
+    new_posts = 0
+    updated_posts = 0
+    new_edges = 0
+    local_parents = 0
+    with context_x.transaction(database.connection):
+        relationships = {
+            str(row[0])
+            for row in database.connection.execute(
+                "SELECT DISTINCT relationship FROM goal5_source_stage"
+            )
+        }
+        dirty_views: set[str] = set()
+        if relationships:
+            dirty_views.add("posts")
+        if relationships & {"post", "reply"}:
+            dirty_views.add("authored_posts")
+        if "repost" in relationships:
+            dirty_views.add("reposts")
+        generation = _next_generation(
+            database, observed_at=observed_at, dirty_views=dirty_views
+        ) if relationships else int(
+            database.connection.execute(
+                "SELECT current_generation FROM archive_generation WHERE singleton=1"
+            ).fetchone()[0]
+        )
+        for row in database.connection.execute(
+            "SELECT * FROM goal5_source_stage ORDER BY post_id"
+        ):
+            record = json.loads(str(row["normalized_json"]))
+            post_id = str(row["post_id"])
+            same_source = database.connection.execute(
+                "SELECT 1 FROM post_provenance WHERE post_id=? AND source_id=?",
+                (post_id, source_id),
+            ).fetchone()
+            previous = database.connection.execute(
+                "SELECT normalized_json FROM archive_posts WHERE post_id=?",
+                (post_id,),
+            ).fetchone()
+            if previous is None:
+                merged = record
+                new_posts += 1
+            else:
+                previous_record = json.loads(str(previous[0]))
+                merged = archive_x.merge_post_records(
+                    previous_record, record
+                )
+                # Pagination can repeat a post on opposite sides of two
+                # checkpoints.  It is still one observation from this source,
+                # even when the later copy happens to contain richer fields.
+                if same_source is not None:
+                    merged["capture_count"] = int(
+                        previous_record.get("capture_count") or 1
+                    )
+                updated_posts += 1
+            normalized_json = _canonical_json(merged)
+            database.connection.execute(
+                """INSERT INTO archive_posts(
+                       post_id,requested_user_id,author_id,relationship,
+                       posted_at,normalized_json,normalized_sha256,
+                       first_captured_at,last_captured_at,capture_count,
+                       durable_generation
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(post_id) DO UPDATE SET
+                       author_id=excluded.author_id,
+                       relationship=excluded.relationship,
+                       posted_at=excluded.posted_at,
+                       normalized_json=excluded.normalized_json,
+                       normalized_sha256=excluded.normalized_sha256,
+                       first_captured_at=excluded.first_captured_at,
+                       last_captured_at=excluded.last_captured_at,
+                       capture_count=excluded.capture_count,
+                       durable_generation=excluded.durable_generation""",
+                (
+                    post_id,
+                    target_user_id,
+                    archive_x.id_string(merged.get("author_id")),
+                    str(merged["relationship"]),
+                    str(merged.get("posted_at") or "") or None,
+                    normalized_json,
+                    _sha256(normalized_json.encode("utf-8")),
+                    str(merged.get("first_captured_at") or observed_at),
+                    str(merged.get("last_captured_at") or observed_at),
+                    int(merged.get("capture_count") or 1),
+                    generation,
+                ),
+            )
+            database.connection.execute(
+                """INSERT INTO post_provenance(
+                       post_id,source_id,record_sha256,source_endpoint,observed_at
+                   ) VALUES (?,?,?,?,?)
+                   ON CONFLICT(post_id,source_id) DO UPDATE SET
+                       record_sha256=excluded.record_sha256,
+                       source_endpoint=excluded.source_endpoint,
+                       observed_at=excluded.observed_at""",
+                (
+                    post_id,
+                    source_id,
+                    str(row["raw_sha256"]),
+                    spec.endpoint,
+                    str(row["observed_at"]),
+                ),
+            )
+            if str(row["author_id"] or "") == target_user_id:
+                database.connection.execute(
+                    """INSERT INTO local_posts(
+                           post_id,raw_json,sha256,relative_path,source_kind,
+                           run_id,observed_at
+                       ) VALUES (?,?,?,?,?,?,?)
+                       ON CONFLICT(post_id) DO UPDATE SET
+                           raw_json=excluded.raw_json,sha256=excluded.sha256,
+                           relative_path=excluded.relative_path,
+                           source_kind=excluded.source_kind,run_id=excluded.run_id,
+                           observed_at=excluded.observed_at
+                       WHERE excluded.observed_at>=local_posts.observed_at""",
+                    (
+                        post_id,
+                        str(row["raw_json"]),
+                        str(row["raw_sha256"]),
+                        relative_path,
+                        spec.source_kind,
+                        spec.run_id,
+                        str(row["observed_at"]),
+                    ),
+                )
+            if row["relationship"] == "reply" and row["reply_id"]:
+                new_edges += int(
+                    database.add_edge(
+                        post_id,
+                        str(row["reply_id"]),
+                        conversation_id=(
+                            str(row["conversation_id"])
+                            if row["conversation_id"] else None
+                        ),
+                        depth=0,
+                        run_id=spec.run_id,
+                        observed_at=str(row["observed_at"]),
+                        max_depth=max_depth,
+                    )
+                )
+        local_candidates = list(
+            database.connection.execute(
+                """SELECT t.post_id,l.raw_json,l.source_kind,l.run_id
+                     FROM targets t JOIN local_posts l ON l.post_id=t.post_id
+                    WHERE t.state<>'captured' AND t.post_id IN (
+                          SELECT post_id FROM goal5_source_stage
+                          UNION
+                          SELECT reply_id FROM goal5_source_stage
+                           WHERE reply_id IS NOT NULL)
+                    ORDER BY t.depth_min,t.post_id"""
+            )
+        )
+        for row in local_candidates:
+            database._capture_record(
+                str(row["post_id"]),
+                json.loads(str(row["raw_json"])),
+                source_kind=f"timeline:{row['source_kind']}:{row['run_id']}",
+                target_user_id=target_user_id,
+                max_depth=max_depth,
+            )
+            local_parents += 1
+        if new_edges or local_parents:
+            placeholders = ("context_posts", "reply_edges", "context_status")
+            marks = ",".join("?" for _ in placeholders)
+            database.connection.execute(
+                f"""UPDATE export_views SET durable_generation=?,status='dirty',
+                           updated_at=? WHERE view_name IN ({marks})""",
+                (generation, observed_at, *placeholders),
+            )
+        cursor = database.connection.execute(
+            """UPDATE archive_sources SET stat_device=?,stat_inode=?,
+                   stat_size=?,stat_mtime_ns=?,ingest_generation=?,
+                   processed_at=?,record_count=COALESCE(record_count,0)+?,
+                   edge_count=COALESCE(edge_count,0)+?,committed_bytes=?,
+                   checkpoint_cursor=COALESCE(?,checkpoint_cursor),
+                   frontier_post_id=COALESCE(?,frontier_post_id),
+                   frontier_posted_at=COALESCE(?,frontier_posted_at)
+                 WHERE source_id=? AND status='ingesting'
+                   AND committed_bytes=? AND timeline_complete=0""",
+            (
+                int(stat.st_dev),
+                int(stat.st_ino),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+                generation,
+                observed_at,
+                int(streamed["raw_records"]),
+                new_edges,
+                int(streamed["committed_bytes"]),
+                checkpoint_cursor,
+                streamed.get("frontier_post_id"),
+                streamed.get("frontier_posted_at"),
+                source_id,
+                previous_offset,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise LocalStateError("streaming source commit state changed")
+    return {
+        "status": "streaming",
+        "generation": generation,
+        "new_posts": new_posts,
+        "updated_posts": updated_posts,
+        "new_edges": new_edges,
+        "local_parents": local_parents,
+        "checkpoint_committed": bool(checkpoint_cursor),
+        **streamed,
+    }
+
+
+def ingest_streaming_source(
+    user_dir: Path,
+    db_path: Path,
+    *,
+    requested_handle: str,
+    target_user_id: str,
+    spec: SourceSpec,
+    checkpoint_cursor: str | None = None,
+    ledger_relative_path: str | None = None,
+    max_depth: int = 1_000,
+    disk_free: Callable[[Path], int] = lambda path: shutil.disk_usage(path).free,
+) -> dict[str, Any]:
+    """Commit every complete line in an append-only timeline prefix."""
+    if spec.source_kind != "modern" or spec.endpoint != "timeline":
+        raise LocalStateError("streaming source must be a modern timeline")
+    if not target_user_id.isdecimal() or int(target_user_id) < 1:
+        raise LocalStateError("streaming source account identity is invalid")
+    observed_at = context_x.iso_now()
+    initial_stat = spec.path.stat()
+    with context_x.ContextDB(db_path) as database:
+        database.bind_identity(target_user_id, requested_handle)
+        row = _register_streaming_source(
+            database,
+            user_dir=user_dir,
+            spec=spec,
+            stat=initial_stat,
+            observed_at=observed_at,
+            ledger_relative_path=ledger_relative_path,
+        )
+        if row["status"] == "committed":
+            return {
+                "status": "finalized",
+                "bytes_read": 0,
+                "raw_records": 0,
+                "normalized_records": 0,
+                "unique_posts": 0,
+                "new_posts": 0,
+                "updated_posts": 0,
+                "new_edges": 0,
+                "local_parents": 0,
+                "checkpoint_committed": False,
+                "committed_bytes": int(row["committed_bytes"] or 0),
+            }
+        previous_offset = int(row["committed_bytes"] or 0)
+        growth = int(initial_stat.st_size) - previous_offset
+        required = max(LOCAL_MIN_HEADROOM, max(0, growth) * 4)
+        if disk_free(db_path.parent) < required:
+            raise LocalStateError("insufficient free space for streaming source")
+        streamed = _stage_streaming_prefix(
+            database,
+            spec=spec,
+            requested_handle=requested_handle,
+            target_user_id=target_user_id,
+            start_offset=previous_offset,
+            snapshot_size=int(initial_stat.st_size),
+            starting_record=int(row["record_count"] or 0),
+        )
+        final_stat = spec.path.stat()
+        if (
+            int(final_stat.st_dev) != int(initial_stat.st_dev)
+            or int(final_stat.st_ino) != int(initial_stat.st_ino)
+            or int(final_stat.st_size) < int(initial_stat.st_size)
+        ):
+            raise LocalStateError("streaming source changed non-append-only")
+        effective_cursor = (
+            checkpoint_cursor
+            if int(streamed["committed_bytes"]) == int(initial_stat.st_size)
+            else None
+        )
+        return _merge_streaming_stage(
+            database,
+            source_id=int(row["source_id"]),
+            spec=spec,
+            relative_path=str(row["relative_path"]),
+            target_user_id=target_user_id,
+            max_depth=max_depth,
+            streamed=streamed,
+            observed_at=observed_at,
+            previous_offset=previous_offset,
+            stat=final_stat,
+            checkpoint_cursor=effective_cursor,
+        )
+
+
+def finalize_streaming_source(
+    user_dir: Path,
+    db_path: Path,
+    *,
+    requested_handle: str,
+    target_user_id: str,
+    spec: SourceSpec,
+    ledger_relative_path: str,
+    timeline_complete: bool,
+    checkpoint_cursor: str | None,
+    descriptor_batches: Iterable[descriptor_x.DescriptorBatch] = (),
+    max_depth: int = 1_000,
+) -> dict[str, Any]:
+    """Promote one fully indexed prefix without replaying its committed rows."""
+    streamed = ingest_streaming_source(
+        user_dir,
+        db_path,
+        requested_handle=requested_handle,
+        target_user_id=target_user_id,
+        spec=spec,
+        checkpoint_cursor=checkpoint_cursor,
+        ledger_relative_path=ledger_relative_path,
+        max_depth=max_depth,
+    )
+    initial_stat = spec.path.stat()
+    digest = archive_x.sha256_file(spec.path)
+    final_stat = spec.path.stat()
+    if _stat_identity(final_stat) != _stat_identity(initial_stat):
+        raise LocalStateError("streaming source changed during final audit")
+    final_relative = _safe_relative(user_dir, spec.path, parent="runs")
+    selected_batches = tuple(descriptor_batches)
+    observed_at = context_x.iso_now()
+    with context_x.ContextDB(db_path, create=False) as database:
+        database.bind_identity(target_user_id, requested_handle)
+        row = _streaming_source_row(
+            database, spec=spec, ledger_relative_path=ledger_relative_path
+        )
+        if row is None:
+            raise LocalStateError("streaming source ledger disappeared")
+        if int(row["committed_bytes"] or 0) != int(final_stat.st_size):
+            raise LocalStateError("streaming source has an uncommitted final record")
+        with context_x.transaction(database.connection):
+            accepted_records = (
+                json.loads(str(item[0])).get("gallery_dl") or {}
+                for item in database.connection.execute(
+                    """SELECT p.normalized_json
+                         FROM post_provenance v
+                         JOIN archive_posts p ON p.post_id=v.post_id
+                        WHERE v.source_id=? ORDER BY p.post_id""",
+                    (int(row["source_id"]),),
+                )
+            )
+            descriptor_commit = database.persist_descriptor_batches(
+                selected_batches, accepted_records
+            )
+            database.connection.execute(
+                """INSERT INTO seed_sources(
+                       relative_path,sha256,source_kind,run_id,processed_at,
+                       record_count,edge_count
+                   ) VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(relative_path) DO UPDATE SET
+                       sha256=excluded.sha256,processed_at=excluded.processed_at,
+                       record_count=excluded.record_count,
+                       edge_count=excluded.edge_count
+                   WHERE seed_sources.sha256=excluded.sha256""",
+                (
+                    final_relative,
+                    digest,
+                    spec.source_kind,
+                    spec.run_id,
+                    observed_at,
+                    int(row["record_count"] or 0),
+                    int(row["edge_count"] or 0),
+                ),
+            )
+            database.connection.execute(
+                """UPDATE local_posts SET relative_path=?
+                     WHERE relative_path=? AND source_kind=? AND run_id=?""",
+                (
+                    final_relative,
+                    ledger_relative_path,
+                    spec.source_kind,
+                    spec.run_id,
+                ),
+            )
+            cursor = database.connection.execute(
+                """UPDATE archive_sources SET relative_path=?,
+                       expected_sha256=?,stat_device=?,stat_inode=?,stat_size=?,
+                       stat_mtime_ns=?,status='committed',processed_at=?,
+                       committed_bytes=?,timeline_complete=?,
+                       checkpoint_cursor=COALESCE(?,checkpoint_cursor)
+                     WHERE source_id=? AND status='ingesting'
+                       AND relative_path=? AND committed_bytes=?""",
+                (
+                    final_relative,
+                    digest,
+                    int(final_stat.st_dev),
+                    int(final_stat.st_ino),
+                    int(final_stat.st_size),
+                    int(final_stat.st_mtime_ns),
+                    observed_at,
+                    int(final_stat.st_size),
+                    int(timeline_complete),
+                    checkpoint_cursor,
+                    int(row["source_id"]),
+                    ledger_relative_path,
+                    int(final_stat.st_size),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LocalStateError("streaming source finalization state changed")
+            total_posts = int(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM archive_posts"
+                ).fetchone()[0]
+            )
+            unique_posts = int(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM post_provenance WHERE source_id=?",
+                    (int(row["source_id"]),),
+                ).fetchone()[0]
+            )
+    return {
+        **streamed,
+        "status": "committed",
+        "sha256": digest,
+        "bytes_read": int(streamed.get("bytes_read") or 0),
+        "raw_records": int(row["record_count"] or 0),
+        "normalized_records": int(row["record_count"] or 0),
+        "unique_posts": unique_posts,
+        "dataset_posts": total_posts,
+        "timeline_complete": bool(timeline_complete),
+        "descriptor_commit": descriptor_commit,
+    }
+
+
+def recover_abandoned_streaming_sources(
+    user_dir: Path,
+    db_path: Path,
+    *,
+    requested_handle: str,
+    target_user_id: str,
+    max_depth: int = 1_000,
+) -> list[dict[str, Any]]:
+    """Finalize identity-authorized append-only sources left by a hard exit."""
+    with context_x.ContextDB(db_path) as database:
+        database.bind_identity(target_user_id, requested_handle)
+        rows = [
+            dict(row)
+            for row in database.connection.execute(
+                """SELECT * FROM archive_sources
+                     WHERE status='ingesting' AND timeline_complete=0
+                       AND source_kind='modern'
+                     ORDER BY source_id"""
+            )
+        ]
+    recovered: list[dict[str, Any]] = []
+    for row in rows:
+        ledger_relative = str(row["relative_path"])
+        ledger_path = user_dir / ledger_relative
+        incomplete = ledger_path
+        if ledger_path.name.endswith(".partial"):
+            base = ledger_path.name.removesuffix(".partial")
+            if base.endswith(".jsonl"):
+                base = base[:-6]
+            incomplete = ledger_path.with_name(base + ".incomplete.jsonl")
+        if ledger_path.is_file():
+            actual = ledger_path
+        elif incomplete.is_file():
+            actual = incomplete
+        else:
+            recovered.append(
+                {
+                    "run_id": str(row["run_id"]),
+                    "status": "missing_raw_artifact",
+                    "checkpoint_cursor": row.get("checkpoint_cursor"),
+                }
+            )
+            continue
+        spec = SourceSpec(
+            path=actual,
+            source_kind="modern",
+            run_id=str(row["run_id"]),
+            operation_id=str(row["operation_id"]),
+            endpoint="timeline",
+        )
+        indexed = ingest_streaming_source(
+            user_dir,
+            db_path,
+            requested_handle=requested_handle,
+            target_user_id=target_user_id,
+            spec=spec,
+            checkpoint_cursor=None,
+            ledger_relative_path=ledger_relative,
+            max_depth=max_depth,
+        )
+        if int(indexed["committed_bytes"]) != int(actual.stat().st_size):
+            recovered.append(
+                {
+                    "run_id": str(row["run_id"]),
+                    "status": "incomplete_trailing_record",
+                    "checkpoint_cursor": row.get("checkpoint_cursor"),
+                }
+            )
+            continue
+        if actual == ledger_path and ledger_path.name.endswith(".partial"):
+            actual = archive_x.finalize_raw_file(ledger_path, False)
+            spec = SourceSpec(
+                path=actual,
+                source_kind="modern",
+                run_id=str(row["run_id"]),
+                operation_id=str(row["operation_id"]),
+                endpoint="timeline",
+            )
+
+        descriptor_batches: tuple[descriptor_x.DescriptorBatch, ...] = ()
+        descriptor_error: str | None = None
+        descriptor_partial = (
+            user_dir
+            / ledger_relative.replace(
+                "timeline.posts.jsonl.partial",
+                "timeline.descriptors.jsonl.partial",
+            )
+        )
+        descriptor_final = descriptor_partial.with_name(
+            "timeline.descriptors.incomplete.jsonl"
+        )
+        try:
+            if descriptor_partial.is_file():
+                descriptor_final = descriptor_x.finalize_artifact(
+                    descriptor_partial, complete=False
+                )
+            if descriptor_final.is_file():
+                descriptor_batches = (
+                    descriptor_x.load_artifact(
+                        descriptor_final,
+                        user_dir=user_dir,
+                        operation_id=str(row["operation_id"]),
+                        run_id=str(row["run_id"]),
+                        source_kind="modern",
+                        source_operation="modern",
+                    ),
+                )
+        except (descriptor_x.DescriptorError, OSError) as exc:
+            descriptor_error = exc.__class__.__name__
+
+        finalized = finalize_streaming_source(
+            user_dir,
+            db_path,
+            requested_handle=requested_handle,
+            target_user_id=target_user_id,
+            spec=spec,
+            ledger_relative_path=ledger_relative,
+            timeline_complete=False,
+            checkpoint_cursor=(
+                str(row["checkpoint_cursor"])
+                if row.get("checkpoint_cursor") else None
+            ),
+            descriptor_batches=descriptor_batches,
+            max_depth=max_depth,
+        )
+        recovered.append(
+            {
+                "run_id": str(row["run_id"]),
+                "status": "recovered",
+                "checkpoint_cursor": row.get("checkpoint_cursor"),
+                "records": int(finalized.get("raw_records") or 0),
+                "descriptor_error_class": descriptor_error,
+            }
+        )
+    return recovered
+
+
 def _merge_staged_source(
     database: context_x.ContextDB,
     *,
@@ -641,7 +1407,10 @@ def _merge_staged_source(
         cursor = database.connection.execute(
             """UPDATE archive_sources SET expected_sha256=?,stat_device=?,
                    stat_inode=?,stat_size=?,stat_mtime_ns=?,status='committed',
-                   ingest_generation=?,processed_at=?,record_count=?,edge_count=?
+                   ingest_generation=?,processed_at=?,record_count=?,edge_count=?,
+                   committed_bytes=?,timeline_complete=CASE
+                       WHEN source_kind='modern' AND ?='timeline' THEN ?
+                       ELSE timeline_complete END
                  WHERE source_id=? AND status='ingesting'""",
             (
                 digest,
@@ -653,6 +1422,11 @@ def _merge_staged_source(
                 observed_at,
                 int(streamed["raw_records"]),
                 new_edges,
+                int(stat.st_size),
+                spec.endpoint,
+                int(
+                    not spec.path.name.endswith(".incomplete.jsonl")
+                ),
                 source_id,
             ),
         )

@@ -64,7 +64,7 @@ def render_user(
 ) -> list[str]:
     separator = " · " if unicode else " | "
     totals, delta = user["totals"], user["delta"]
-    started = progress.parse_time(started_at) or now
+    started = progress.parse_time(user.get("started_at") or started_at) or now
     active_phase = str(user["phase"])
     phase_name = active_phase.replace("_", " ")
     phase_display = phase_name.capitalize()
@@ -95,6 +95,14 @@ def render_user(
         )
     else:
         rate_text = "rate warming up"
+    if active_phase == "modern":
+        indexed_this_run = max(0, int(delta.get("archive_posts") or 0))
+        elapsed = max(1.0, now - started)
+        if indexed_this_run and elapsed >= 60:
+            rate_text = (
+                f"{progress.human_number(round(indexed_this_run / elapsed * 3600))} "
+                "posts/hour"
+            )
     estimate = user["estimate"]
     if estimate.get("seconds") is not None:
         if active_phase == "legacy":
@@ -209,6 +217,12 @@ def render_user(
             f"This phase +{progress.human_number(max(0, delta['context_parents_saved']))} parents"
             f"{separator}+{progress.human_number(max(0, delta['context_unavailable']))} boundaries"
             f"{separator}{rate_text}"
+        )
+    elif active_phase == "modern":
+        lines[4] = (
+            f"This run   +{progress.human_number(max(0, delta['archive_posts']))} posts"
+            f"{separator}{rate_text}"
+            f"{separator}indexed durably"
         )
     durable_generation = int(totals.get("archive_durable_generation") or 0)
     exported_generation = int(totals.get("archive_exported_generation") or 0)

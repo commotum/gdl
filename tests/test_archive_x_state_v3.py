@@ -353,6 +353,32 @@ class V3MigrationTests(unittest.TestCase):
                     0,
                 )
 
+    def test_streaming_addendum_never_rebuilds_existing_context_rollups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.sqlite3"
+            with context_x.ContextDB(path):
+                pass
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version=?",
+                (context_x.V3_STREAMING_ADDENDUM_VERSION,),
+            )
+            connection.commit()
+            connection.close()
+
+            with mock.patch.object(
+                context_x.ContextDB,
+                "_create_v3_objects",
+                side_effect=AssertionError("full v3 rebuild was invoked"),
+            ):
+                with context_x.ContextDB(path, create=False) as database:
+                    self.assertIsNotNone(
+                        database.connection.execute(
+                            "SELECT 1 FROM schema_migrations WHERE version=?",
+                            (context_x.V3_STREAMING_ADDENDUM_VERSION,),
+                        ).fetchone()
+                    )
+
     def test_write_capable_open_tightens_database_permissions(self):
         if os.name != "posix":
             self.skipTest("POSIX mode test")

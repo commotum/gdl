@@ -88,7 +88,10 @@ The default is deliberately restrained and fail-closed:
   48-hour overlap, with pinned-item injection disabled so an old pin cannot
   silently terminate the incremental scan;
 - interrupted timeline cursors are recorded for a later resume when provided
-  by gallery-dl, together with the original date cutoff; a legacy terminal
+  by gallery-dl, together with the original date cutoff; each verified modern
+  checkpoint first commits every newline-complete raw record through that
+  point into SQLite, and only then publishes the resume cursor, so a crash can
+  replay a safe overlap but cannot skip unindexed posts; a legacy terminal
   rate-limit loop that omitted its cursor is recovered conservatively from the
   oldest saved post rather than restarting the full historical crawl;
 - reposts are included by default, retain the original author, and are marked
@@ -321,6 +324,14 @@ portable-export state is shown only during the final export phase. `known
 remaining` is the currently discovered actionable context queue, not a promise
 that discovery is finished.
 
+During a long modern crawl, the timeline row and this-run rate come from the
+durable SQLite prefix rather than waiting for the endpoint to finish. The
+account elapsed clock starts when that account becomes active, not when an
+earlier account in the input file began. `timeline_complete` remains false
+until gallery-dl reaches a successful terminal boundary; stopping safely or a
+hard exit retains the indexed prefix and append-only raw provenance for the
+next identity-guarded resume.
+
 The displayed ETA is for the current phase, not the whole account or input
 file. It appears after at least five minutes and 20 successful resolutions,
 once the known queue has begun shrinking. Before that the dashboard says what
@@ -365,8 +376,10 @@ store
 `first_captured_at` and `last_captured_at`, because engagement counts describe
 the crawl time rather than a permanent historical total. Raw run snapshots
 remain immutable provenance. Indexed SQLite truth advances transactionally as
-small deltas; `dataset/*.jsonl` are reproducible portable views published as
-atomic generations. The initial generation, a forced checkpoint, 1,000
+small deltas—including newline-complete prefixes of an active modern timeline—
+while source completion is tracked independently; `dataset/*.jsonl` are
+reproducible portable views published as atomic generations. The initial
+generation, a forced checkpoint, 1,000
 generations of accumulated change, or 24 hours of dirty age triggers
 publication. Until then the dashboard and final summary explicitly show
 durable versus published generations rather than rewriting large JSONL files

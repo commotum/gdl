@@ -29,6 +29,7 @@ import archive_x_pacing as pacing_x
 BASE_SCHEMA_VERSION = 2
 SCHEMA_VERSION = 3
 V3_LOCAL_ADDENDUM_VERSION = 3009
+V3_STREAMING_ADDENDUM_VERSION = 3010
 MIN_CONTEXT_MEDIA_FREE_BYTES = 5 * 1024 * 1024 * 1024
 VALID_STATES = (
     "pending",
@@ -163,6 +164,13 @@ V3_REQUIRED_DESCRIPTOR_COLUMNS = {
     "retweet_id",
 }
 V3_REQUIRED_ASSET_COLUMNS = {"transfer_priority", "destination_scope"}
+V3_REQUIRED_ARCHIVE_SOURCE_COLUMNS = {
+    "committed_bytes",
+    "timeline_complete",
+    "checkpoint_cursor",
+    "frontier_post_id",
+    "frontier_posted_at",
+}
 V3_REQUIRED_INDEXES = {
     "archive_media_export",
     "archive_posts_export",
@@ -715,6 +723,7 @@ class ContextDB:
                 f"unsupported context schema {version}; expected {SCHEMA_VERSION}"
             )
         self._migrate_v3_local_addendum()
+        self._migrate_v3_streaming_addendum()
         self._validate_v3_schema()
 
     def _validate_v3_schema(self) -> None:
@@ -762,6 +771,13 @@ class ContextDB:
                 V3_REQUIRED_ASSET_COLUMNS - self._table_columns("asset_jobs")
             )
         )
+        missing.extend(
+            f"archive_sources.column:{name}"
+            for name in sorted(
+                V3_REQUIRED_ARCHIVE_SOURCE_COLUMNS
+                - self._table_columns("archive_sources")
+            )
+        )
         migration = self.connection.execute(
             "SELECT 1 FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
         ).fetchone() if "schema_migrations" in names["table"] else None
@@ -773,6 +789,12 @@ class ContextDB:
         ).fetchone() if "schema_migrations" in names["table"] else None
         if addendum is None:
             missing.append(f"migration:{V3_LOCAL_ADDENDUM_VERSION}")
+        streaming_addendum = self.connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?",
+            (V3_STREAMING_ADDENDUM_VERSION,),
+        ).fetchone() if "schema_migrations" in names["table"] else None
+        if streaming_addendum is None:
+            missing.append(f"migration:{V3_STREAMING_ADDENDUM_VERSION}")
         if missing:
             raise ContextError(
                 "context schema v3 is incomplete: " + ", ".join(missing)
@@ -825,6 +847,42 @@ class ContextDB:
         name = definition.partition(" ")[0]
         if name not in self._table_columns(table):
             self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+    def _create_streaming_source_columns(self) -> None:
+        # A growing modern timeline is durable before it is complete.  Keep
+        # the byte prefix and crawl boundary on the source ledger so live
+        # indexing never has to conflate "committed so far" with "finished".
+        self._add_column(
+            "archive_sources",
+            "committed_bytes INTEGER NOT NULL DEFAULT 0 "
+            "CHECK(committed_bytes >= 0)",
+        )
+        self._add_column(
+            "archive_sources",
+            "timeline_complete INTEGER "
+            "CHECK(timeline_complete IS NULL OR timeline_complete IN (0,1))",
+        )
+        self._add_column("archive_sources", "checkpoint_cursor TEXT")
+        self._add_column(
+            "archive_sources",
+            "frontier_post_id TEXT CHECK(frontier_post_id IS NULL OR "
+            "(frontier_post_id <> '' AND "
+            "frontier_post_id NOT GLOB '*[^0-9]*'))",
+        )
+        self._add_column("archive_sources", "frontier_posted_at TEXT")
+        self.connection.execute(
+            """UPDATE archive_sources
+                  SET committed_bytes=COALESCE(stat_size,committed_bytes)
+                WHERE status='committed' AND committed_bytes=0"""
+        )
+        self.connection.execute(
+            """UPDATE archive_sources SET timeline_complete=CASE
+                       WHEN relative_path LIKE '%/timeline.posts.jsonl' THEN 1
+                       WHEN relative_path LIKE
+                            '%/timeline.posts.incomplete.jsonl' THEN 0
+                       ELSE timeline_complete END
+                WHERE source_kind='modern' AND timeline_complete IS NULL"""
+        )
 
     def _create_v3_objects(self) -> None:
         self._add_column(
@@ -1294,6 +1352,8 @@ class ContextDB:
         )
         for statement in statements:
             self.connection.execute(statement)
+
+        self._create_streaming_source_columns()
 
         self.connection.execute(
             "INSERT OR IGNORE INTO archive_generation(singleton) VALUES (1)"
@@ -2139,6 +2199,19 @@ class ContextDB:
                     "goal-5 incremental local truth addendum",
                 ),
             )
+            self.connection.execute(
+                """INSERT INTO schema_migrations(
+                       version,applied_at,description
+                   ) VALUES (?,?,?)
+                   ON CONFLICT(version) DO UPDATE SET
+                       applied_at=excluded.applied_at,
+                       description=excluded.description""",
+                (
+                    V3_STREAMING_ADDENDUM_VERSION,
+                    iso_now(),
+                    "live timeline prefix indexing addendum",
+                ),
+            )
             cursor = self.connection.execute(
                 """UPDATE context_meta SET value=?
                      WHERE key='schema_version' AND value=?""",
@@ -2170,6 +2243,32 @@ class ContextDB:
                     V3_LOCAL_ADDENDUM_VERSION,
                     iso_now(),
                     "goal-5 incremental local truth addendum",
+                ),
+            )
+        except BaseException:
+            self.connection.rollback()
+            raise
+        else:
+            self.connection.commit()
+
+    def _migrate_v3_streaming_addendum(self) -> None:
+        applied = self.connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?",
+            (V3_STREAMING_ADDENDUM_VERSION,),
+        ).fetchone()
+        if applied is not None:
+            return
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._create_streaming_source_columns()
+            self.connection.execute(
+                """INSERT INTO schema_migrations(
+                       version,applied_at,description
+                   ) VALUES (?,?,?)""",
+                (
+                    V3_STREAMING_ADDENDUM_VERSION,
+                    iso_now(),
+                    "live timeline prefix indexing addendum",
                 ),
             )
         except BaseException:
