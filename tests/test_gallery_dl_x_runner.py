@@ -325,12 +325,12 @@ class EmptyTweetResultTests(unittest.TestCase):
             "UPSTREAM_TWEET_RESULT_BY_REST_ID",
             return_value=direct,
         ):
-            result = runner.empty_result_safe_tweet_result(api, "100")
+            result = runner.empty_result_terminal_tweet_result(api, "100")
 
         self.assertIs(result, direct)
         self.assertEqual(api.detail_calls, [])
 
-    def test_empty_result_recovers_matching_focal_tweet_once(self):
+    def test_empty_result_is_terminal_without_detail_confirmation(self):
         focal = {"rest_id": "100"}
         api = FallbackAPI(({"rest_id": "other"}, focal))
         with mock.patch.object(
@@ -338,31 +338,27 @@ class EmptyTweetResultTests(unittest.TestCase):
             "UPSTREAM_TWEET_RESULT_BY_REST_ID",
             side_effect=KeyError("result"),
         ):
-            result = runner.empty_result_safe_tweet_result(api, "100")
+            with self.assertRaisesRegex(FallbackAbort, "EmptyResult"):
+                runner.empty_result_terminal_tweet_result(api, "100")
 
-        self.assertIs(result, focal)
-        self.assertEqual(api.detail_calls, ["100"])
+        self.assertEqual(api.detail_calls, [])
         self.assertIn(
             ("info", "Archive empty TweetResult for 100; "
-                     "confirming once with TweetDetail"),
-            api.events,
-        )
-        self.assertIn(
-            ("info", "Archive recovered 100 through TweetDetail"),
+                     "treating as unavailable without confirmation"),
             api.events,
         )
 
-    def test_empty_result_without_focal_tweet_is_explicitly_deleted(self):
+    def test_empty_result_without_focal_tweet_is_explicitly_unavailable(self):
         api = FallbackAPI(({"rest_id": "other"},))
         with mock.patch.object(
             runner,
             "UPSTREAM_TWEET_RESULT_BY_REST_ID",
             side_effect=KeyError("result"),
         ):
-            with self.assertRaisesRegex(FallbackAbort, "Deleted"):
-                runner.empty_result_safe_tweet_result(api, "100")
+            with self.assertRaisesRegex(FallbackAbort, "EmptyResult"):
+                runner.empty_result_terminal_tweet_result(api, "100")
 
-        self.assertEqual(api.detail_calls, ["100"])
+        self.assertEqual(api.detail_calls, [])
 
     def test_unrelated_key_error_is_not_reclassified(self):
         api = FallbackAPI()
@@ -372,7 +368,7 @@ class EmptyTweetResultTests(unittest.TestCase):
             side_effect=KeyError("different"),
         ):
             with self.assertRaisesRegex(KeyError, "different"):
-                runner.empty_result_safe_tweet_result(api, "100")
+                runner.empty_result_terminal_tweet_result(api, "100")
 
         self.assertEqual(api.detail_calls, [])
 
@@ -406,7 +402,7 @@ class CompatibilityTestsContinued(unittest.TestCase):
             self.assertIs(runner.TwitterAPI._call, runner.rate_limit_safe_call)
             self.assertIs(
                 runner.TwitterAPI.tweet_result_by_rest_id,
-                runner.empty_result_safe_tweet_result,
+                runner.empty_result_terminal_tweet_result,
             )
         finally:
             runner.TwitterAPI._call = original

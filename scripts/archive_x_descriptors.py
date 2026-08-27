@@ -22,6 +22,8 @@ from urllib.parse import urlsplit
 
 SCHEMA = "gdl-x-media-descriptor"
 SCHEMA_VERSION = 1
+NON_MEDIA_SCHEMA = "gdl-x-non-media-event"
+NON_MEDIA_SCHEMA_VERSION = 1
 POSTPROCESSOR_NAME = "archive_x_descriptor"
 ALLOWED_HOSTS = {"pbs.twimg.com", "video.twimg.com", "ton.twimg.com"}
 ALLOWED_OPERATIONS = {
@@ -61,6 +63,16 @@ class DescriptorError(ValueError):
     """A sanitized descriptor artifact or ownership error."""
 
 
+class ExternalMediaEvent(DescriptorError):
+    """A gallery-dl URL event that is deliberately outside X media scope."""
+
+    def __init__(self, reason: str):
+        if reason not in {"external_url", "non_file_url"}:
+            raise ValueError("non-media event reason is invalid")
+        super().__init__("gallery event is outside X media scope")
+        self.reason = reason
+
+
 @dataclass
 class DescriptorBatch:
     operation_id: str
@@ -68,6 +80,7 @@ class DescriptorBatch:
     source_kind: str
     source_operation: str
     rows: tuple[dict[str, Any], ...]
+    non_media_events: tuple[dict[str, Any], ...] = ()
     errors: tuple[str, ...] = ()
     source_relative_path: str | None = None
     source_sha256: str | None = None
@@ -82,6 +95,7 @@ class DescriptorBatch:
                 self.operation_id.encode("utf-8")
             ).hexdigest(),
             "rows": len(self.rows),
+            "non_media_events": len(self.non_media_events),
             "errors": len(self.errors),
             "source_registered": bool(self.source_relative_path),
             "ephemeral": self.ephemeral,
@@ -176,12 +190,13 @@ def _private_url(value: Any) -> tuple[str, str, str]:
         parsed.scheme != "https"
         or parsed.username is not None
         or parsed.password is not None
-        or host not in ALLOWED_HOSTS
         or port not in (None, 443)
         or not parsed.path
         or bool(parsed.fragment)
     ):
         raise DescriptorError("descriptor URL origin is not allowed")
+    if host not in ALLOWED_HOSTS:
+        raise ExternalMediaEvent("external_url")
     return value, host, sha256_bytes(value.encode("utf-8"))
 
 
@@ -311,6 +326,91 @@ def descriptor_payload(row: dict[str, Any]) -> dict[str, Any]:
             "retweet_id",
         )
     }
+
+
+def non_media_event_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: row.get(key)
+        for key in (
+            "operation_id",
+            "run_id",
+            "source_kind",
+            "source_operation",
+            "owner_kind",
+            "owner_id",
+            "post_id",
+            "media_ordinal",
+            "reason",
+            "captured_at",
+        )
+    }
+
+
+def normalize_non_media_event(
+    value: Any,
+    *,
+    expected_operation_id: str | None = None,
+    expected_run_id: str | None = None,
+    expected_source_operation: str | None = None,
+    expected_source_kind: str | None = None,
+) -> dict[str, Any]:
+    """Validate a sanitized external-card observation without retaining its URL."""
+    if not isinstance(value, dict):
+        raise DescriptorError("non-media event row is not an object")
+    if (
+        value.get("schema") != NON_MEDIA_SCHEMA
+        or value.get("schema_version") != NON_MEDIA_SCHEMA_VERSION
+    ):
+        raise DescriptorError("non-media event schema is invalid")
+    operation_id = str(value.get("operation_id") or "")
+    run_id = str(value.get("run_id") or "")
+    source_operation = str(value.get("source_operation") or "")
+    source_kind = str(value.get("source_kind") or "")
+    if not operation_id or len(operation_id) > 256 or not run_id or len(run_id) > 256:
+        raise DescriptorError("non-media event operation binding is invalid")
+    if source_operation not in ALLOWED_OPERATIONS:
+        raise DescriptorError("non-media event source operation is invalid")
+    if source_kind not in ALLOWED_SOURCE_KINDS:
+        raise DescriptorError("non-media event source kind is invalid")
+    for observed, expected, label in (
+        (operation_id, expected_operation_id, "operation"),
+        (run_id, expected_run_id, "run"),
+        (source_operation, expected_source_operation, "source operation"),
+        (source_kind, expected_source_kind, "source kind"),
+    ):
+        if expected is not None and observed != expected:
+            raise DescriptorError(f"non-media event {label} binding changed")
+    if value.get("owner_kind") != "post":
+        raise DescriptorError("non-media event owner kind is invalid")
+    post_id = _positive_id(value.get("post_id"), "post ID")
+    if str(value.get("owner_id") or "") != post_id:
+        raise DescriptorError("non-media event owner is invalid")
+    reason = str(value.get("reason") or "")
+    if reason not in {"external_url", "non_file_url"}:
+        raise DescriptorError("non-media event reason is invalid")
+    row = {
+        "schema": NON_MEDIA_SCHEMA,
+        "schema_version": NON_MEDIA_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "run_id": run_id,
+        "source_kind": source_kind,
+        "source_operation": source_operation,
+        "owner_kind": "post",
+        "owner_id": post_id,
+        "post_id": post_id,
+        "media_ordinal": _positive_int(
+            value.get("media_ordinal"), "media ordinal"
+        ),
+        "reason": reason,
+        "captured_at": _capture_time(value.get("captured_at")),
+    }
+    expected_digest = sha256_bytes(
+        canonical_json(non_media_event_payload(row)).encode("utf-8")
+    )
+    if str(value.get("event_sha256") or "") != expected_digest:
+        raise DescriptorError("non-media event digest is invalid")
+    row["event_sha256"] = expected_digest
+    return row
 
 
 def normalize_record(
@@ -478,8 +578,10 @@ def load_artifact(
         os.chmod(path, 0o600)
     digest = sha256_file(path)
     rows: list[dict[str, Any]] = []
+    non_media_events: list[dict[str, Any]] = []
     errors: list[str] = []
     seen: set[tuple[str, str, int, str]] = set()
+    seen_non_media: set[tuple[str, int, str]] = set()
     with path.open("rb") as stream:
         for line_number, raw_line in enumerate(stream, 1):
             if not raw_line.strip():
@@ -487,6 +589,23 @@ def load_artifact(
             try:
                 line = raw_line.decode("utf-8", errors="strict")
                 value = json.loads(line)
+                if isinstance(value, dict) and value.get("schema") == NON_MEDIA_SCHEMA:
+                    event = normalize_non_media_event(
+                        value,
+                        expected_operation_id=operation_id,
+                        expected_run_id=run_id,
+                        expected_source_operation=source_operation,
+                        expected_source_kind=source_kind,
+                    )
+                    event_key = (
+                        event["owner_id"],
+                        event["media_ordinal"],
+                        event["event_sha256"],
+                    )
+                    if event_key not in seen_non_media:
+                        seen_non_media.add(event_key)
+                        non_media_events.append(event)
+                    continue
                 row = normalize_record(
                     value,
                     expected_operation_id=operation_id,
@@ -512,10 +631,11 @@ def load_artifact(
         source_kind=source_kind,
         source_operation=source_operation,
         rows=tuple(rows),
+        non_media_events=tuple(non_media_events),
         errors=tuple(errors),
         source_relative_path=None if ephemeral else relative,
         source_sha256=digest,
-        source_record_count=len(rows) + len(errors),
+        source_record_count=len(rows) + len(non_media_events) + len(errors),
         artifact_path=path,
         ephemeral=ephemeral,
     )
@@ -559,6 +679,37 @@ def postprocessor_config(
     }
 
 
+def _non_media_event_record(
+    pathfmt: Any,
+    options: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    kwdict = pathfmt.kwdict
+    post_id = _positive_id(kwdict.get("tweet_id"), "post ID")
+    row = {
+        "schema": NON_MEDIA_SCHEMA,
+        "schema_version": NON_MEDIA_SCHEMA_VERSION,
+        "operation_id": options["operation-id"],
+        "run_id": options["run-id"],
+        "source_kind": options["source-kind"],
+        "source_operation": options["source-operation"],
+        "owner_kind": "post",
+        "owner_id": post_id,
+        "post_id": post_id,
+        "media_ordinal": _positive_int(kwdict.get("num"), "media ordinal"),
+        "reason": reason,
+        "captured_at": str(
+            kwdict.get("archived_at")
+            or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        ),
+    }
+    row["event_sha256"] = sha256_bytes(
+        canonical_json(non_media_event_payload(row)).encode("utf-8")
+    )
+    return normalize_non_media_event(row)
+
+
 def _event_record(pathfmt: Any, options: dict[str, Any]) -> dict[str, Any]:
     kwdict = pathfmt.kwdict
     author = kwdict.get("author")
@@ -575,6 +726,11 @@ def _event_record(pathfmt: Any, options: dict[str, Any]) -> dict[str, Any]:
         ordinal = 1
 
     extension = str(kwdict.get("extension") or "").lower().lstrip(".")
+    if not extension:
+        # gallery-dl emits external cards and bare article/video links as URL
+        # events with no file extension. Its X-hosted image/video extractors
+        # always assign one before the prepare hook.
+        raise ExternalMediaEvent("non_file_url")
     filename = pathfmt.build_filename(kwdict)
     archive_root = Path(options["archive-root"]).resolve()
     final_path = (Path(pathfmt.realdirectory) / filename).resolve()
@@ -673,11 +829,35 @@ def install_postprocessor() -> None:
         def run(self, pathfmt: Any) -> None:
             try:
                 row = _event_record(pathfmt, self.options)
+            except ExternalMediaEvent as exc:
+                try:
+                    row = _non_media_event_record(
+                        pathfmt,
+                        self.options,
+                        reason=exc.reason,
+                    )
+                except Exception as exc:  # malformed skips remain actionable
+                    if not self.warned:
+                        self.warned = True
+                        self.log.warning(
+                            "Archive descriptor capture skipped an event (%s)",
+                            exc.__class__.__name__,
+                        )
+                    return
+            except Exception as exc:  # descriptor loss cannot fail metadata
+                if not self.warned:
+                    self.warned = True
+                    self.log.warning(
+                        "Archive descriptor capture skipped an event (%s)",
+                        exc.__class__.__name__,
+                    )
+                return
+            try:
                 with self.path.open("a", encoding="utf-8") as stream:
                     stream.write(canonical_json(row) + "\n")
                 if os.name == "posix":
                     os.chmod(self.path, 0o600)
-            except Exception as exc:  # descriptor loss cannot fail metadata
+            except Exception as exc:  # artifact loss cannot fail metadata
                 if not self.warned:
                     self.warned = True
                     self.log.warning(

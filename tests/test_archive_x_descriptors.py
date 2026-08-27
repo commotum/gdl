@@ -109,6 +109,37 @@ def record(
     return descriptor_x.normalize_record(row)
 
 
+def non_media_event(
+    post_id: str,
+    ordinal: int,
+    *,
+    operation: str = "op-1",
+    run_id: str = "run-1",
+    source_kind: str = "context",
+    source_operation: str = "context",
+) -> dict:
+    row = {
+        "schema": descriptor_x.NON_MEDIA_SCHEMA,
+        "schema_version": descriptor_x.NON_MEDIA_SCHEMA_VERSION,
+        "operation_id": operation,
+        "run_id": run_id,
+        "source_kind": source_kind,
+        "source_operation": source_operation,
+        "owner_kind": "post",
+        "owner_id": post_id,
+        "post_id": post_id,
+        "media_ordinal": ordinal,
+        "reason": "external_url",
+        "captured_at": "2026-01-01T00:00:00Z",
+    }
+    row["event_sha256"] = hashlib.sha256(
+        descriptor_x.canonical_json(
+            descriptor_x.non_media_event_payload(row)
+        ).encode()
+    ).hexdigest()
+    return descriptor_x.normalize_non_media_event(row)
+
+
 def batch(*rows: dict, operation: str | None = None, digest: str | None = None):
     operation = operation or (rows[0]["operation_id"] if rows else "empty-op")
     digest = digest or hashlib.sha256(
@@ -261,6 +292,63 @@ class DescriptorPrepareCaptureTests(unittest.TestCase):
             self.assertFalse(any((root / "users").rglob("*.webp")))
             if os.name == "posix":
                 self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
+
+    def test_external_card_is_recorded_as_non_media_without_a_warning(self):
+        descriptor_x.install_postprocessor()
+        records = [
+            (
+                {
+                    "tweet_id": "100",
+                    "date": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "archived_at": "2026-01-02T00:00:00Z",
+                    "author": {"name": "alice"},
+                },
+                [{"url": "https://example.com/article", "extension": ""}],
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "private" / "descriptors.jsonl"
+            descriptor_x.prepare_artifact(artifact)
+            options = {
+                "download": False,
+                "metadata-url": "media_url",
+                "base-directory": str(root),
+                "directory": ["users", "alice", "media"],
+                "filename": "{tweet_id}_{num}.{extension}",
+                "postprocessors": [
+                    descriptor_x.postprocessor_config(
+                        artifact_path=artifact,
+                        archive_root=root,
+                        operation_id="run-1:timeline",
+                        run_id="run-1",
+                        source_kind="modern",
+                        source_operation="modern",
+                    )
+                ],
+            }
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = DownloadJob(FixtureExtractor(records, options)).run()
+
+            self.assertEqual(status, 0)
+            self.assertNotIn("warning", output.getvalue().lower())
+            loaded = descriptor_x.load_artifact(
+                artifact,
+                user_dir=root,
+                operation_id="run-1:timeline",
+                run_id="run-1",
+                source_kind="modern",
+                source_operation="modern",
+            )
+            self.assertEqual(loaded.rows, ())
+            self.assertEqual(len(loaded.non_media_events), 1)
+            event = loaded.non_media_events[0]
+            self.assertEqual(
+                (event["post_id"], event["media_ordinal"], event["reason"]),
+                ("100", 1, "non_file_url"),
+            )
+            self.assertNotIn("example.com", json.dumps(loaded.safe_summary()))
 
     def test_artifact_validation_is_sanitized_and_keeps_valid_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -452,6 +540,40 @@ class DescriptorPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(evidence.persistence["rows_rejected"], 1)
         self.assertEqual(evidence.persistence["needs_refresh_created"], 1)
+
+    def test_external_card_marker_covers_and_repairs_false_missing_media(self):
+        accepted = (post("100", count=1),)
+        missing = batch(operation="missing-op", digest="a" * 64)
+        self.database.persist_descriptor_batches((missing,), accepted)
+        self.database.prepare_descriptor_refreshes()
+        marker = descriptor_x.DescriptorBatch(
+            operation_id="marker-op",
+            run_id="run-1",
+            source_kind="context",
+            source_operation="context",
+            rows=(),
+            non_media_events=(
+                non_media_event("100", 1, operation="marker-op"),
+            ),
+            source_sha256="b" * 64,
+            ephemeral=True,
+        )
+
+        summary = self.database.persist_descriptor_batches((marker,), accepted)
+
+        self.assertEqual(summary["non_media_events_accepted"], 1)
+        self.assertEqual(summary["non_media_jobs_cleared"], 1)
+        self.assertEqual(summary["needs_refresh_created"], 0)
+        self.assertIsNone(
+            self.database.connection.execute(
+                "SELECT 1 FROM asset_jobs WHERE owner_id='100'"
+            ).fetchone()
+        )
+        refresh = self.database.connection.execute(
+            """SELECT state,last_error_class FROM descriptor_refresh_jobs
+                 WHERE owner_id='100'"""
+        ).fetchone()
+        self.assertEqual(tuple(refresh), ("complete", "external_non_media"))
 
     def test_descriptor_failure_never_rolls_back_metadata(self):
         self.database.upsert_target(

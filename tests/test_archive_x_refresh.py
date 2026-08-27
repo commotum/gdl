@@ -81,7 +81,36 @@ def descriptor(post_id: str, ordinal: int, *, scope: str = "context") -> dict:
     return descriptor_x.normalize_record(row)
 
 
-def batch(post_id: str, rows=(), *, source_operation="exact_refresh"):
+def non_media_event(post_id: str, ordinal: int = 1) -> dict:
+    row = {
+        "schema": descriptor_x.NON_MEDIA_SCHEMA,
+        "schema_version": descriptor_x.NON_MEDIA_SCHEMA_VERSION,
+        "operation_id": f"refresh-{post_id}",
+        "run_id": f"refresh-{post_id}",
+        "source_kind": "exact_refresh",
+        "source_operation": "exact_refresh",
+        "owner_kind": "post",
+        "owner_id": post_id,
+        "post_id": post_id,
+        "media_ordinal": ordinal,
+        "reason": "external_url",
+        "captured_at": "2026-01-02T00:00:00Z",
+    }
+    row["event_sha256"] = hashlib.sha256(
+        descriptor_x.canonical_json(
+            descriptor_x.non_media_event_payload(row)
+        ).encode()
+    ).hexdigest()
+    return descriptor_x.normalize_non_media_event(row)
+
+
+def batch(
+    post_id: str,
+    rows=(),
+    *,
+    non_media_events=(),
+    source_operation="exact_refresh",
+):
     return descriptor_x.DescriptorBatch(
         operation_id=f"refresh-{post_id}",
         run_id=f"refresh-{post_id}",
@@ -90,6 +119,7 @@ def batch(post_id: str, rows=(), *, source_operation="exact_refresh"):
         ),
         source_operation=source_operation,
         rows=tuple(rows),
+        non_media_events=tuple(non_media_events),
         source_sha256=hashlib.sha256(
             descriptor_x.canonical_json(tuple(rows)).encode()
         ).hexdigest(),
@@ -102,6 +132,7 @@ def result(
     *,
     count: int | None = 1,
     rows=(),
+    non_media_events=(),
     log: str = "",
     status: int = 0,
     actual_requests: int = 1,
@@ -115,7 +146,9 @@ def result(
         failed_downloads=[],
         rate_reset=None,
         records=(),
-        descriptor_batches=(batch(post_id, rows),),
+        descriptor_batches=(
+            batch(post_id, rows, non_media_events=non_media_events),
+        ),
         request_telemetry={
             "actual_requests": actual_requests,
             "by_category": {"x_api": actual_requests},
@@ -250,6 +283,21 @@ class RefreshFallbackTests(unittest.TestCase):
             all("/media/context/" not in job["expected_relative_path"] for job in self.jobs())
         )
         self.assertEqual(self.refreshes()[0]["state"], "complete")
+
+    def test_external_card_refresh_completes_without_a_media_job(self):
+        self.add_missing()
+
+        observed = self.run_worker(
+            fetcher=lambda **_kwargs: result(
+                "100", non_media_events=(non_media_event("100"),)
+            )
+        )
+
+        self.assertEqual(observed["complete"], 1)
+        self.assertEqual(self.jobs(), [])
+        refresh = self.refreshes()[0]
+        self.assertEqual(refresh["state"], "complete")
+        self.assertEqual(refresh["last_error_class"], "external_non_media")
 
     def test_refresh_uses_claim_token_and_persistent_actual_request_lane(self):
         self.add_missing()

@@ -1392,7 +1392,15 @@ def run_gallery_dl(
             stripped.startswith("/") or stripped.startswith("# /")
         ):
             indentation = line[: len(line) - len(stripped)]
-            line = f"{indentation}planned output: {stripped}"
+            planned = stripped[2:] if stripped.startswith("# ") else stripped
+            if Path(planned.rstrip()).suffix:
+                line = f"{indentation}planned output: {stripped}"
+            else:
+                ending = "\n" if line.endswith("\n") else ""
+                line = (
+                    f"{indentation}external link card "
+                    f"(metadata only; no media file){ending}"
+                )
         print(f"[{prefix}] {line}", end="")
 
     def observe(line: str) -> None:

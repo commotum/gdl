@@ -44,6 +44,7 @@ RATE_RESET_RE = re.compile(
 )
 TERMINAL_PATTERNS = {
     "deleted": ("Tweet unavailable ('Deleted')", "Tweet unavailable ('NotFound')"),
+    "empty_result": ("Tweet unavailable ('EmptyResult')",),
     "private": (
         "Tweet unavailable ('Protected')",
         "Tweets are protected",
@@ -2910,7 +2911,11 @@ class ContextDB:
         now = iso_now()
         source_record_count = batch.source_record_count
         if source_record_count is None:
-            source_record_count = len(batch.rows) + len(batch.errors)
+            source_record_count = (
+                len(batch.rows)
+                + len(batch.non_media_events)
+                + len(batch.errors)
+            )
         if source_record_count < 0:
             raise ContextError("descriptor source record count is invalid")
         self.connection.execute(
@@ -3218,6 +3223,108 @@ class ContextDB:
             )
         return False
 
+    @staticmethod
+    def _validated_non_media_keys(
+        batches: tuple[descriptor_x.DescriptorBatch, ...],
+        records: dict[str, dict[str, Any]],
+    ) -> tuple[set[tuple[str, str, int]], int, int]:
+        keys: set[tuple[str, str, int]] = set()
+        seen = 0
+        rejected = 0
+        for batch in batches:
+            for candidate in batch.non_media_events:
+                seen += 1
+                try:
+                    event = descriptor_x.normalize_non_media_event(
+                        candidate,
+                        expected_operation_id=batch.operation_id,
+                        expected_run_id=batch.run_id,
+                        expected_source_operation=batch.source_operation,
+                        expected_source_kind=batch.source_kind,
+                    )
+                except descriptor_x.DescriptorError:
+                    rejected += 1
+                    continue
+                post_id = str(event["post_id"])
+                metadata = records.get(post_id)
+                count = metadata.get("count") if metadata is not None else None
+                if (
+                    metadata is None
+                    or not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or count < int(event["media_ordinal"])
+                ):
+                    rejected += 1
+                    continue
+                keys.add(("post", post_id, int(event["media_ordinal"])))
+        return keys, seen, rejected
+
+    def _clear_non_media_asset_job(
+        self,
+        key: tuple[str, str, int],
+    ) -> bool:
+        owner_kind, owner_id, ordinal = key
+        current = self.connection.execute(
+            """SELECT * FROM asset_jobs
+                 WHERE owner_kind=? AND owner_id=? AND media_ordinal=?""",
+            key,
+        ).fetchone()
+        if (
+            current is None
+            or owner_kind != "post"
+            or current["descriptor_id"] is not None
+            or int(current["compatibility_job"] or 0)
+            or current["final_relative_path"] is not None
+            or current["state"]
+            not in {"needs_refresh", "manual_review", "unavailable"}
+        ):
+            return False
+        cursor = self.connection.execute(
+            """DELETE FROM asset_jobs WHERE asset_id=?
+                   AND descriptor_id IS NULL AND compatibility_job=0
+                   AND final_relative_path IS NULL
+                   AND state IN ('needs_refresh','manual_review','unavailable')""",
+            (current["asset_id"],),
+        )
+        if cursor.rowcount != 1:
+            raise ContextError("non-media asset repair changed concurrently")
+        unresolved = self.connection.execute(
+            """SELECT 1 FROM asset_jobs WHERE owner_kind='post' AND owner_id=?
+                   AND descriptor_id IS NULL LIMIT 1""",
+            (owner_id,),
+        ).fetchone()
+        if unresolved is None:
+            observed_at = iso_now()
+            self.connection.execute(
+                """UPDATE descriptor_refresh_jobs SET state='complete',
+                       lease_token=NULL,lease_started_at=NULL,next_attempt_at=0,
+                       last_error_class='external_non_media',
+                       last_error_detail=NULL,
+                       completed_at=COALESCE(completed_at,?),updated_at=?
+                     WHERE owner_kind='post' AND owner_id=?
+                       AND state IN
+                           ('pending','retryable','manual_review','unavailable')""",
+                (observed_at, observed_at, owner_id),
+            )
+        remaining = self.connection.execute(
+            """SELECT 1 FROM asset_jobs
+                 WHERE owner_kind='post' AND owner_id=? LIMIT 1""",
+            (owner_id,),
+        ).fetchone()
+        if remaining is None:
+            self.connection.execute(
+                """UPDATE targets SET media_state='none',
+                       media_lease_started_at=NULL,media_lease_token=NULL,
+                       media_next_attempt_at=0,updated_at=?
+                     WHERE post_id=? AND state='captured'
+                       AND media_state IN
+                           ('pending','retryable','unavailable','manual_review')""",
+                (iso_now(), owner_id),
+            )
+        else:
+            self._update_post_asset_rollup(owner_kind, owner_id)
+        return True
+
     def _persist_descriptor_batches(
         self,
         batches: tuple[descriptor_x.DescriptorBatch, ...],
@@ -3226,6 +3333,9 @@ class ContextDB:
         allow_profile: bool,
     ) -> dict[str, Any]:
         missing_scope = batch_destination_scope(batches)
+        non_media_keys, non_media_seen, non_media_rejected = (
+            self._validated_non_media_keys(batches, records)
+        )
         summary = {
             "batches": len(batches),
             "artifact_errors": sum(len(batch.errors) for batch in batches),
@@ -3237,6 +3347,10 @@ class ContextDB:
             "jobs_created": 0,
             "jobs_reopened": 0,
             "needs_refresh_created": 0,
+            "non_media_events_seen": non_media_seen,
+            "non_media_events_accepted": len(non_media_keys),
+            "non_media_events_rejected": non_media_rejected,
+            "non_media_jobs_cleared": 0,
             "status": "complete",
         }
         expected: set[tuple[str, str, int]] = set()
@@ -3300,6 +3414,11 @@ class ContextDB:
                 summary["jobs_created"] += int(created_job)
                 summary["jobs_reopened"] += int(reopened_job)
 
+        for key in sorted(non_media_keys - covered):
+            summary["non_media_jobs_cleared"] += int(
+                self._clear_non_media_asset_job(key)
+            )
+        covered.update(non_media_keys)
         for key in sorted(expected - covered):
             summary["needs_refresh_created"] += int(
                 self._enqueue_missing_descriptor(
@@ -3322,6 +3441,9 @@ class ContextDB:
             for metadata in accepted_records
             if (post_id := id_string(metadata.get("tweet_id"))) is not None
         }
+        non_media_keys, non_media_seen, non_media_rejected = (
+            self._validated_non_media_keys(selected_batches, records)
+        )
         try:
             with savepoint(self.connection, "descriptor_capture"):
                 summary = self._persist_descriptor_batches(
@@ -3343,15 +3465,25 @@ class ContextDB:
                 "jobs_created": 0,
                 "jobs_reopened": 0,
                 "needs_refresh_created": 0,
+                "non_media_events_seen": non_media_seen,
+                "non_media_events_accepted": len(non_media_keys),
+                "non_media_events_rejected": non_media_rejected,
+                "non_media_jobs_cleared": 0,
                 "error_class": exc.__class__.__name__,
             }
             try:
                 with savepoint(self.connection, "descriptor_degraded_queue"):
+                    for key in sorted(non_media_keys):
+                        summary["non_media_jobs_cleared"] += int(
+                            self._clear_non_media_asset_job(key)
+                        )
                     for post_id, metadata in records.items():
                         count = metadata.get("count")
                         if not isinstance(count, int) or isinstance(count, bool):
                             continue
                         for ordinal in range(1, max(0, count) + 1):
+                            if ("post", post_id, ordinal) in non_media_keys:
+                                continue
                             summary["needs_refresh_created"] += int(
                                 self._enqueue_missing_descriptor(
                                     "post",
@@ -4113,7 +4245,13 @@ class ContextDB:
                     (post_id,),
                 )
             ]
-            if not states or "manual_review" in states:
+            if (
+                not states
+                and int(summary.get("non_media_events_accepted") or 0) > 0
+            ):
+                refresh_state = "complete"
+                error_class = "external_non_media"
+            elif not states or "manual_review" in states:
                 refresh_state = "manual_review"
                 error_class = "descriptor_missing_after_refresh"
             elif all(state == "unavailable" for state in states):

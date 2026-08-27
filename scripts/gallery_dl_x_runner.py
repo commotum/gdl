@@ -55,9 +55,10 @@ SUPPORTED_TWEET_RESULT_SHA256 = (
 DEFERRED_RESPONSE_ATTRIBUTE = "_gdl_x_deferred_ratelimit_response"
 RATE_LIMIT_RESET_LOG = "Archive rate-limit reset=%s remaining=%s"
 EMPTY_TWEET_RESULT_LOG = (
-    "Archive empty TweetResult for %s; confirming once with TweetDetail"
+    "Archive empty TweetResult for %s; treating as unavailable without "
+    "confirmation"
 )
-RECOVERED_TWEET_RESULT_LOG = "Archive recovered %s through TweetDetail"
+EMPTY_TWEET_RESULT_ERROR = "Tweet unavailable ('EmptyResult')"
 BOUNDED_CONVERSATION_CONFIG = "archive-conversation-pages"
 BOUNDED_CONVERSATION_LOG = (
     "Archive bounded TweetDetail at one response; skipped continuation cursor"
@@ -94,7 +95,7 @@ def require_supported_gallery_dl() -> str:
             f"supported {SUPPORTED_VERSION} implementation"
         )
     current_tweet_result = TwitterAPI.tweet_result_by_rest_id
-    if current_tweet_result is not empty_result_safe_tweet_result:
+    if current_tweet_result is not empty_result_terminal_tweet_result:
         try:
             tweet_result_fingerprint = _source_sha256(current_tweet_result)
         except (OSError, TypeError) as exc:
@@ -290,10 +291,10 @@ def rate_limit_safe_call(
         )
 
 
-def empty_result_safe_tweet_result(
+def empty_result_terminal_tweet_result(
     self: TwitterAPI, tweet_id: str
 ) -> dict[str, Any]:
-    """Confirm an empty direct result once through the stable detail endpoint."""
+    """Treat an empty direct result as a durable unavailable boundary."""
     try:
         return UPSTREAM_TWEET_RESULT_BY_REST_ID(self, tweet_id)
     except KeyError as exc:
@@ -301,14 +302,7 @@ def empty_result_safe_tweet_result(
             raise
 
     self.log.info(EMPTY_TWEET_RESULT_LOG, tweet_id)
-    for tweet in self.tweet_detail(tweet_id):
-        if (
-            str(tweet.get("rest_id") or "") == str(tweet_id)
-            or str(tweet.get("_retweet_id_str") or "") == str(tweet_id)
-        ):
-            self.log.info(RECOVERED_TWEET_RESULT_LOG, tweet_id)
-            return tweet
-    raise self.exc.AbortExtraction("Tweet unavailable ('Deleted')")
+    raise self.exc.AbortExtraction(EMPTY_TWEET_RESULT_ERROR)
 
 
 def install_patch() -> None:
@@ -319,7 +313,7 @@ def install_patch() -> None:
     current_tweet_result = TwitterAPI.tweet_result_by_rest_id
     if (
         current is rate_limit_safe_call
-        and current_tweet_result is empty_result_safe_tweet_result
+        and current_tweet_result is empty_result_terminal_tweet_result
     ):
         return
 
@@ -336,7 +330,7 @@ def install_patch() -> None:
                 f"{SUPPORTED_VERSION} implementation"
             )
     TwitterAPI._call = rate_limit_safe_call
-    TwitterAPI.tweet_result_by_rest_id = empty_result_safe_tweet_result
+    TwitterAPI.tweet_result_by_rest_id = empty_result_terminal_tweet_result
 
 
 def run_gallery_args(

@@ -819,6 +819,11 @@ class PacingAndFailureTests(unittest.TestCase):
     def test_failure_classification_is_conservative(self):
         cases = {
             "Tweet unavailable ('Deleted')": ("deleted", True, False),
+            "Tweet unavailable ('EmptyResult')": (
+                "empty_result",
+                True,
+                False,
+            ),
             "Tweets are protected": ("private", True, False),
             "AuthRequired: Protected Tweet": ("private", True, False),
             "User has been suspended": ("suspended", True, False),
