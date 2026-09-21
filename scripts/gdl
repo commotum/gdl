@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Follow the launcher symlink installed on PATH back to this checkout.
+script_path="${BASH_SOURCE[0]}"
+while [[ -L "$script_path" ]]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    script_path="$(readlink "$script_path")"
+    [[ "$script_path" = /* ]] || script_path="$script_dir/$script_path"
+done
+repo_dir="$(cd "$(dirname "$script_path")/.." && pwd)"
 cd "$repo_dir"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
@@ -9,6 +16,41 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 if [[ "${VIRTUAL_ENV:-}" != "" && "${VIRTUAL_ENV:-}" != "$repo_dir/.venv" ]]; then
     unset VIRTUAL_ENV
 fi
+
+case "${1:-}" in
+    x|archive)
+        shift
+        explicit_target=false
+        for arg in "$@"; do
+            case "$arg" in
+                --user|--user=*|--input-file|--input-file=*) explicit_target=true ;;
+            esac
+        done
+        if [[ "$explicit_target" = false ]]; then
+            set -- --input-file "$repo_dir/x.txt" "$@"
+        fi
+        exec "$repo_dir/scripts/archive-x" "$@"
+        ;;
+    status)
+        shift
+        exec "$repo_dir/scripts/archive-x-dashboard" "$@"
+        ;;
+    ""|help|-h|--help)
+        cat <<'HELP'
+Usage:
+  gdl x [OPTIONS]                 Archive X accounts from the repo's x.txt
+  gdl x --user HANDLE [OPTIONS]   Archive a specific account
+  gdl x --input-file FILE         Archive accounts from another list
+  gdl archive [OPTIONS]           Alias for gdl x
+  gdl status [--watch]            Show archive progress
+  gdl URL [OPTIONS]               Download with gallery-dl
+
+Run gdl x --help for archive options.
+Relative file paths are resolved from the gdl repo.
+HELP
+        exit 0
+        ;;
+esac
 
 download_mount=""
 download_root=""

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from argparse import Namespace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +58,77 @@ def metadata(
         "archived_at": captured,
         "subcategory": "timeline",
     }
+
+
+class AutomountTests(unittest.TestCase):
+    def test_idle_automount_is_activated_before_selecting_output(self):
+        mounted = False
+        calls = []
+
+        def run(command, **kwargs):
+            nonlocal mounted
+            calls.append(command)
+            if command[0] == "ls":
+                mounted = True
+                return archive_x.subprocess.CompletedProcess(command, 0, "", "")
+            output = ""
+            if "/mnt/Bibliotheque" in command:
+                if command[-1] == "FSTYPE":
+                    output = "autofs\n"
+                else:
+                    output = "/mnt/Bibliotheque ext4 rw,relatime\n" if mounted else "/mnt/Bibliotheque autofs rw,relatime\n"
+            return archive_x.subprocess.CompletedProcess(command, 0, output, "")
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            archive_x.sys, "platform", "linux"
+        ), patch.object(Path, "is_dir", return_value=True), patch.object(
+            archive_x.os, "access", side_effect=lambda *args: mounted
+        ), patch.object(archive_x.subprocess, "run", side_effect=run):
+            self.assertEqual(
+                archive_x.resolve_output_root(None),
+                Path("/mnt/Bibliotheque/gdl/x-archive"),
+            )
+        self.assertEqual(sum(c[0] == "ls" for c in calls), 1)
+
+    def test_placeholder_read_only_and_parent_filesystems_are_rejected(self):
+        for output in (
+            "/mnt/Bibliotheque autofs rw,relatime\n",
+            "/mnt/Bibliotheque ext4 ro,relatime\n",
+            "/ ext4 rw,relatime\n",
+        ):
+            with self.subTest(output=output), patch.object(
+                archive_x.sys, "platform", "linux"
+            ), patch.object(Path, "is_dir", return_value=True), patch.object(
+                archive_x.os, "access", return_value=True
+            ), patch.object(archive_x.subprocess, "run", return_value=
+                archive_x.subprocess.CompletedProcess([], 0, output)
+            ):
+                self.assertFalse(archive_x.exact_mount_is_writable(Path("/mnt/Bibliotheque")))
+
+    def test_dry_run_and_explicit_root_do_not_activate_automount(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            archive_x, "exact_mount_is_writable", return_value=False
+        ), patch.object(archive_x, "trigger_automount") as trigger:
+            self.assertEqual(archive_x.resolve_output_root(None, plan_only=True), Path("/mnt/Bibliotheque/gdl/x-archive"))
+            self.assertEqual(archive_x.resolve_output_root(Path("/tmp/custom")), Path("/tmp/custom"))
+            trigger.assert_not_called()
+
+    def test_failed_activation_never_selects_local_directory(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            archive_x, "exact_mount_is_writable", return_value=False
+        ), patch.object(archive_x, "trigger_automount"):
+            with self.assertRaisesRegex(archive_x.ArchiveError, "after checking automounts"):
+                archive_x.resolve_output_root(None)
+
+    def test_mount_timeout_is_reported(self):
+        with patch.object(archive_x.sys, "platform", "linux"), patch.object(
+            archive_x.subprocess, "run", side_effect=[
+                archive_x.subprocess.CompletedProcess([], 0, "autofs\n"),
+                archive_x.subprocess.TimeoutExpired("ls", 30),
+            ]
+        ):
+            with self.assertRaisesRegex(archive_x.ArchiveError, "automount timed out"):
+                archive_x.trigger_automount(Path("/mnt/Bibliotheque"))
 
 
 class TargetParsingTests(unittest.TestCase):

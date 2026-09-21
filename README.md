@@ -11,6 +11,27 @@ Personal operations repo for `gallery-dl`.
 
 ## Usage
 
+Install the launcher on your PATH once (with `~/.local/bin` on PATH):
+
+```bash
+mkdir -p ~/.local/bin
+ln -s "$PWD/scripts/gdl" ~/.local/bin/gdl
+```
+
+Run these commands from any directory:
+
+```bash
+gdl x                            # archive the accounts in this repo's x.txt
+gdl x --user visakanv             # override the default account list
+gdl x --input-file another.txt    # use another list
+gdl status                       # show archive progress
+gdl status --watch                # watch progress
+```
+
+`gdl archive` is an alias for `gdl x`. Both accept the existing archiver
+options; use `gdl x --help` to see them. Relative file paths resolve from
+the repo directory. The launcher uses the repo's uv environment.
+
 Run downloads through the wrapper so the local config is always used:
 
 ```bash
@@ -439,6 +460,11 @@ scripts/setup-bibliotheque-automount
 
 The script uses sudo to add an `/etc/fstab` entry for the Bibliotheque UUID,
 creates `/mnt/Bibliotheque`, reloads systemd, and starts the automount unit.
+Once configured, `gdl x` (and the direct archiver commands) automatically wakes
+the mount when it is idle, then verifies that the backing filesystem is mounted
+read-write. No separate `ls` or mount command is needed. Dry runs do not explicitly
+activate automounts. A disconnected disk or failed mount produces an error rather
+than writing the archive onto the local disk.
 
 ## Verify
 

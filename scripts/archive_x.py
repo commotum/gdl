@@ -323,7 +323,7 @@ def exact_mount_is_writable(path: Path) -> bool:
         return os.path.ismount(path)
     try:
         proc = subprocess.run(
-            ["findmnt", "-rn", "--target", str(path), "-o", "TARGET"],
+            ["findmnt", "-rn", "--target", str(path), "-o", "TARGET,FSTYPE,OPTIONS"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -331,8 +331,55 @@ def exact_mount_is_writable(path: Path) -> bool:
         )
     except FileNotFoundError:
         return os.path.ismount(path)
-    targets = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
-    return str(path) in targets
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if (
+            len(fields) == 3
+            and fields[0] == str(path)
+            and fields[1] != "autofs"
+            and "rw" in fields[2].split(",")
+        ):
+            return True
+    return False
+
+
+def trigger_automount(path: Path) -> None:
+    """Access an existing Linux automount to wake its backing filesystem."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        mount = subprocess.run(
+            ["findmnt", "-rn", "--mountpoint", str(path), "-o", "FSTYPE"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if "autofs" not in mount.stdout.splitlines():
+        return
+    print(f"archive-x: activating automount at {path}", file=sys.stderr)
+    try:
+        # stat/access on the mountpoint itself can leave autofs asleep.
+        # Opening the directory triggers the configured systemd mount.
+        result = subprocess.run(
+            ["ls", "-U", "--", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ArchiveError(f"Bibliotheque automount timed out at {path}") from exc
+    except OSError as exc:
+        raise ArchiveError(f"cannot activate Bibliotheque automount: {exc}") from exc
+    if result.returncode:
+        raise ArchiveError(
+            f"Bibliotheque automount failed at {path}: {result.stderr.strip()}"
+        )
 
 
 def resolve_output_root(explicit: Path | None, *, plan_only: bool = False) -> Path:
@@ -356,10 +403,15 @@ def resolve_output_root(explicit: Path | None, *, plan_only: bool = False) -> Pa
         # even when the disk is not presently mounted; the real run still
         # performs the fail-closed check above.
         return candidates[0] / "gdl" / "x-archive"
+    for mount in candidates:
+        trigger_automount(mount)
+        if exact_mount_is_writable(mount):
+            return mount / "gdl" / "x-archive"
     raise ArchiveError(
         "Bibliotheque is not mounted read-write at /mnt/Bibliotheque, "
-        "/tmp/Bibliotheque, or /Volumes/Bibliotheque. Mount it first or "
-        "pass --output-root explicitly."
+        "/tmp/Bibliotheque, or /Volumes/Bibliotheque after checking automounts. "
+        "Check that the disk is connected and run scripts/setup-bibliotheque-automount "
+        "if automount is not configured, or pass --output-root explicitly."
     )
 
 
